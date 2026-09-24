@@ -71,8 +71,13 @@ export type RequestableCapability = (typeof REQUESTABLE_CAPABILITIES)[number]
  *
  * Must stay in sync with `HandsService`'s methods in `host/src/hands.ts`; the
  * inventory tests pin that.
+ *
+ * ⚠ `list` is a primitive, not caller policy. An earlier revision omitted it on
+ * the reasoning that enumeration belongs to the brain — which assumes the brain
+ * can reach the filesystem. For a REMOTE shell it cannot, so without `list` a
+ * plugin cannot discover a single filename.
  */
-export const HANDS_PRIMITIVES = ["stat", "read", "write", "watch"] as const
+export const HANDS_PRIMITIVES = ["stat", "read", "write", "watch", "list"] as const
 export type HandsPrimitive = (typeof HANDS_PRIMITIVES)[number]
 
 /**

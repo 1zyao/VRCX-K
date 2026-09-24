@@ -55,9 +55,9 @@ export type ShellSubdomain =
   | "deepLink";
 export type PermissionGrant = boolean | string[];
 /**
- * The file primitives ctx.hands can be granted at, one entry per primitive. PRIMITIVE granularity, not a single boolean and not a path scope: hands is a sharper permission than ctx.shell because it reaches the whole disk, so 'read and stat, never write' must be expressible. Path-scoped grants are deliberately not modelled yet — they need a matcher both sides honour, and the enforcement layer is #13/M4. Keys mirror HANDS_PRIMITIVES in host/src/contracts/capabilityInventory.ts.
+ * The file primitives ctx.hands can be granted at, one entry per primitive. PRIMITIVE granularity, not a single boolean and not a path scope: hands is a sharper permission than ctx.shell because it reaches the whole disk, so 'read and stat, never write' must be expressible. Path-scoped grants are deliberately not modelled yet — they need a matcher both sides honour, and the enforcement layer is #13/M4. Keys mirror HANDS_PRIMITIVES in host/src/contracts/capabilityInventory.ts. `list` enumerates ONE directory (non-recursive, unfiltered); matching, sorting and recursion are caller policy, but enumeration ITSELF is a capability only the shell can perform for a remote node.
  */
-export type HandsPrimitive = "stat" | "read" | "write" | "watch";
+export type HandsPrimitive = "stat" | "read" | "write" | "watch" | "list";
 
 /**
  * Author-owned plugin declaration, read from <plugin-root>/.vrcxk/manifest.json. AUTHORITATIVE for version, dependencies, services and permissions. The marketplace index carries only a display cache of name/description; everything else is read from this file. See docs/plugin-source-and-index-design.md.

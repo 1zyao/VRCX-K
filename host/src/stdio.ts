@@ -65,6 +65,11 @@ export type HostStdioAPI = {
     /** One or more URLs the OS handed to the app (a custom scheme was opened). */
     opened(event: DeepLinkEvent): boolean
   }
+  /** Shell → host identity announcement (sent once per shell process). */
+  hands: {
+    /** Who this shell node is, and its environment. */
+    hello(hello: HandsHelloWire): boolean
+  }
 }
 
 /** Dialog options for message/ask. */
@@ -94,10 +99,19 @@ export type PathKind = "config" | "data" | "cache" | "temp" | "home"
 /**
  * The `hands` file primitives exposed by the shell (Rust).
  *
- * Mirrors `src-tauri/src/hands.rs`. Four primitives only — directory walking,
- * batching and retry are deliberately ABSENT: the per-file cost is a full round
- * trip, so batching belongs on the brain side (`docs/hands-capability-proposal.md`
- * §1, measured in `docs/probes/transport-lab/FINDINGS.md` §6).
+ * Mirrors `src-tauri/src/hands.rs`.
+ *
+ * ⚠ An earlier version of this comment said directory walking was "deliberately
+ * ABSENT: the per-file cost is a full round trip, so batching belongs on the
+ * brain side". That reasoning had a missing premise — it assumed the brain can
+ * reach the filesystem. On a REMOTE hands (the case this whole capability
+ * exists for) it cannot, so without `list` a caller cannot discover a single
+ * filename. `transport-lab/FINDINGS.md` §6 measured batching for files whose
+ * names were ALREADY KNOWN; §7.1 is the remote case.
+ *
+ * The split that holds: **enumerate** is a capability (only the shell can answer
+ * it) and lives here; **match / sort / recurse / batch / retry** are policy, need
+ * no filesystem access, and stay on the brain side.
  */
 export type HandsSysAPI = {
   /** `null` for a missing path — "does not exist" is an answer, not an error. */
@@ -120,6 +134,37 @@ export type HandsSysAPI = {
   ): Promise<HandsWriteResult>
   /** Also a stream reference; yields change records. */
   watch(path: string, opts?: HandsWatchOptions): AsyncIterable<unknown>
+  /**
+   * One directory's entries, as a stream of batches. **Not recursive, no
+   * pattern argument** — see the note above; recursion and matching are the
+   * caller's job.
+   *
+   * Streaming rather than a single reply because a directory's size is not
+   * knowable before reading it, and an unbounded single frame is exactly what
+   * measured as unusable at ≥1 MiB.
+   */
+  list(path: string, opts?: HandsListOptions): AsyncIterable<unknown>
+}
+
+/** One entry as the shell reports it. */
+export type HandsListWire = {
+  name: string
+  /**
+   * `symlink` is separate from `file`/`dir` on purpose: the listing describes
+   * what is IN the directory, so a link is reported as a link rather than as its
+   * target's type (the shell uses `symlink_metadata` for this).
+   */
+  kind: "file" | "dir" | "symlink" | "other"
+  /** 0 for directories; for a symlink, the link's own length. */
+  size: number
+}
+
+export type HandsListOptions = {
+  /**
+   * Entries per streamed batch. Bounded by the shell (1..4096); the default is
+   * small because it is also the `stat` preview size.
+   */
+  batch?: number
 }
 
 /** One file's identity and size. Batch sizing and resume both need it. */
@@ -133,6 +178,26 @@ export type HandsStatWire = {
   id: string
   mtimeMs: number
   kind: "file" | "dir" | "other"
+  /**
+   * A BOUNDED preview of a directory's entries.
+   *
+   * ⚠ Three states, and they are not interchangeable:
+   * - `null` — not a directory (never an empty array; that would merge "a file"
+   *   with "an empty directory")
+   * - `{ items: [], truncated: false }` — an empty directory
+   * - `{ items: [...], error: "..." }` — a directory that could not be read
+   *   (execute-only permission). `stat` itself still succeeds, because size and
+   *   mtime are still true; the failure is reported rather than swallowed.
+   */
+  entries?: HandsStatEntriesWire | null
+}
+
+export type HandsStatEntriesWire = {
+  items: HandsListWire[]
+  /** True when there are more entries than the preview; call `list` for all. */
+  truncated: boolean
+  /** Present only when the entries could not be read. */
+  error?: string
 }
 
 export type HandsReadOptions = {
@@ -184,12 +249,68 @@ export const HANDS_ERROR_CODES = [
   "ENOENT",
   "EACCES",
   "EISDIR",
+  // The mirror of EISDIR, and separate for the same reason: "you asked for file
+  // content on a directory" (read its entries instead) and "you asked for a
+  // listing on a file" (stat it instead) need different fixes.
+  "ENOTDIR",
   "ESTALE",
   "ENOSPC",
   "ECANCEL",
   "EUNSUPPORTED",
 ] as const
 export type HandsErrorCode = (typeof HANDS_ERROR_CODES)[number]
+
+/**
+ * The hands → brain hello (`hands.hello`), sent once per shell process.
+ *
+ * # Why this exists
+ *
+ * The stdio channel used to be one-way in the identity sense: the brain
+ * announced itself (`ready`, carrying the BRAIN's cwd/execPath/runtime) and the
+ * shell said nothing, so every fact read from the shell arrived with no owner.
+ * The brain could not tell which machine — or which process — it was talking to.
+ *
+ * Tagging each payload with a `source` field would be a per-field discipline: it
+ * must be remembered everywhere, and one omission produces a value that looks
+ * local but is not. Announcing identity ONCE binds the whole channel to a node
+ * instead, so later facts belong to it by construction.
+ *
+ * ⚠ `launchId` is per-LAUNCH, not a durable device identity: the shell has no
+ * persistence yet, so a stable id would change anyway. Durable per-device
+ * identity is issue #13's problem (it needs credentials, not a random string).
+ */
+export type HandsHelloWire = {
+  schemaVersion: number
+  node: {
+    /** Per-launch. Distinguishes two runs of the shell on this machine. */
+    launchId: string
+    platform: string
+    arch: string
+    family: string
+    /** The shell build's own version — tells "upgraded" from "misbehaving". */
+    shellVersion: string
+  }
+  /** Absolute path; empty when unavailable (see `cwdError`). */
+  cwd: string
+  /** Set when the cwd could not be read, so "" is not ambiguous. */
+  cwdError: string | null
+  /** The SHELL's home — the right base for expanding `~`, not the brain's. */
+  home: string
+  /**
+   * The shell's environment.
+   *
+   * ⚠ Credential-shaped names are redacted to `"<redacted>"` by name. That
+   * heuristic is partial and is a LOGGING aid, not a security boundary — on one
+   * machine the brain already shares this environment.
+   *
+   * ⚠ This is the NODE's environment. The brain's own `process.env` is a
+   * different thing as soon as the hands are remote, and the two must not be
+   * conflated: same-looking key, different machine.
+   */
+  env: Record<string, string>
+}
+
+export type HandsHelloHandler = (hello: HandsHelloWire) => void
 
 /**
  * Dev-watch event pushed host → shell → face (issue #11 wiring). This is a
@@ -362,12 +483,30 @@ export type ShellStdioBridge = ShellSysAPI & {
   /** Desktop only; the shell registers no such notification on mobile. */
   deepLink: ShellDeepLinkBridge
   /**
+   * Who the shell is, and its environment (`hands.hello`).
+   *
+   * `onHello` fires for every hello (normally once per shell process — a restart
+   * is a new process and therefore a new hello). `currentHello()` returns the one
+   * already received, which is what a LATE subscriber needs: a once-per-process
+   * announcement would otherwise be missed forever by anything registering after
+   * it arrived.
+   */
+  handsHello: ShellHandsHelloBridge
+  /**
    * Whether a write to the shell has already failed (EPIPE). See
    * `withWriteFailureObserver` for why the sending-side signal needs its own
    * detector. Always `false` for a test-supplied transport, which owns its
    * streams and has no real pipe to break.
    */
   sawWriteFailure: () => boolean
+}
+
+/** Local access to the shell's hello (`hands.hello`). */
+export type ShellHandsHelloBridge = {
+  /** Subscribe. Returns an unsubscribe function. */
+  onHello(handler: HandsHelloHandler): () => void
+  /** The most recent hello, or `undefined` if none has arrived yet. */
+  currentHello(): HandsHelloWire | undefined
 }
 
 /**
@@ -513,6 +652,12 @@ export function connectShellStdio(
   const trayActions = fanout<TrayActionEvent>("tray.action")
   const shortcutPresses = fanout<ShortcutPressEvent>("shortcut.pressed")
   const deepLinks = fanout<DeepLinkEvent>("deepLink.opened")
+  // Separate from the others because it is ONCE per shell process, not an event
+  // stream: a late subscriber would otherwise miss it forever. `currentHello`
+  // holds the last one so `onHello` can answer immediately — the same reason
+  // `ShellHandle` remembers the tray snapshot rather than only fanning it out.
+  const hellos = fanout<HandsHelloWire>("hands.hello")
+  let currentHello: HandsHelloWire | undefined
   // #33: EOF on the shell's stdin channel means the shell is gone. Its
   // ProcessTree Job Object would hard-reap us anyway — this turns that into the
   // same graceful teardown the stop RPC uses. Only a peer channel (pipe on
@@ -620,6 +765,22 @@ export function connectShellStdio(
           return true
         },
       },
+      hands: {
+        // `hands.hello` (shell → host): who the shell is, and its environment.
+        // Sent once per shell process, right after the reader starts.
+        //
+        // Registered as a NOTIFICATION target, not a request: the shell does not
+        // wait for an answer, so a brain too old to know this method just logs an
+        // unknown call and carries on. That is what makes the two sides
+        // deployable independently.
+        hello: (hello: HandsHelloWire) => {
+          // Remember before emitting: a subscriber registered later must still be
+          // able to learn who the shell is (see `currentHello`).
+          currentHello = hello
+          hellos.emit(hello)
+          return true
+        },
+      },
     },
   })
   const remote = channel.getAPI()
@@ -634,6 +795,10 @@ export function connectShellStdio(
     // here so `HandsService` has one dependency and plugins never touch the raw
     // wire surface for file access.
     hands: remote.hands,
+    handsHello: {
+      onHello: (handler) => hellos.on(handler),
+      currentHello: () => currentHello,
+    },
     tray: {
       setSnapshot: (snapshot) => remote.shell.tray.setSnapshot(snapshot),
       onAction: (handler) => trayActions.on(handler),

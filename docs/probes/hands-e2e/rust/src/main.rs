@@ -18,6 +18,13 @@ pub mod kkrpc_peer;
 #[path = "../../../../../src-tauri/src/hands.rs"]
 pub mod hands;
 
+// The hello is compiled here too, so the E2E exercises the REAL announcement
+// rather than a hand-written copy of its shape. A copy would be free to drift
+// from what production sends, and the test would keep passing while the wire
+// shape changed underneath it.
+#[path = "../../../../../src-tauri/src/hands_hello.rs"]
+pub mod hands_hello;
+
 use std::io::Write;
 use std::sync::Arc;
 
@@ -39,6 +46,12 @@ fn main() {
 
     peer.start_reader(stdin);
 
+    // Announce identity exactly as production does (`host.rs` sends it right
+    // after the reader starts) so the E2E observes the real ordering: a hello
+    // that arrived before the reader was running would prove nothing about the
+    // production path.
+    hands_hello::send_hello(&peer);
+
     // The reader thread owns the loop, so park this thread. The process ends
     // when the driver closes stdin and the reader sees EOF.
     loop {
@@ -51,4 +64,5 @@ fn main() {
 #[allow(dead_code)]
 fn _surface_is_public(peer: &Arc<kkrpc_peer::Peer>) {
     hands::register_hands_handlers(peer);
+    hands_hello::send_hello(peer);
 }

@@ -26,8 +26,12 @@
 //   (`docs/probes/probe-host-option-a-cost.ts`). Negligible beside a round trip.
 //
 // ⚠ WHAT THIS FILE DOES NOT DO
-//   - No directory walking, batching or retry: those are brain-side policy
-//     (proposal §1). The measured per-file cost is a full RTT.
+//   - No RECURSION, glob matching, sorting or cross-directory batching: those are
+//     brain-side policy (proposal §1). ⚠ But enumeration itself IS here (`list`):
+//     the "walking is the caller's job" rule assumed the caller can reach the
+//     filesystem, which is false for a remote shell. The measured per-file cost
+//     being a full RTT is why BATCHING is the caller's job, not why enumerating
+//     is.
 //   - No hard permission enforcement: `#24` (M2-8) is declare-and-warn only.
 //     This is NOT a security boundary — an in-process plugin can `import fs`.
 
@@ -35,12 +39,15 @@ import { type Context, Service, symbols } from "cordis"
 import type {
   HandsChange,
   HandsErrorCode,
+  HandsListOptions,
+  HandsListWire,
   HandsReadOptions,
   HandsStatWire,
   HandsWriteOptions,
   HandsWriteResult,
   ShellStdioBridge,
 } from "./stdio"
+import { HANDS_ERROR_CODES } from "./stdio"
 
 declare module "cordis" {
   interface Context {
@@ -52,6 +59,19 @@ declare module "cordis" {
 export type HandsChunk = Uint8Array
 
 export type HandsStat = HandsStatWire
+
+/** One entry from `hands.list` / a `stat` directory preview. */
+export type HandsListEntry = HandsListWire
+
+/**
+ * One streamed batch of entries.
+ *
+ * An array, not a page object: the shell streams raw batches and the caller's
+ * own looping code is what accumulates. Keeping paging metadata (offsets, "next
+ * token") out means there is no second, contradictory notion of position to get
+ * out of step with the stream.
+ */
+export type HandsListBatch = HandsListEntry[]
 
 export type HandsAudit = (line: string) => void
 
@@ -83,15 +103,16 @@ export class HandsError extends Error {
   }
 }
 
-const HANDS_ERROR_CODE_SET: ReadonlySet<string> = new Set([
-  "ENOENT",
-  "EACCES",
-  "EISDIR",
-  "ESTALE",
-  "ENOSPC",
-  "ECANCEL",
-  "EUNSUPPORTED",
-])
+/**
+ * The codes `HandsError` will accept.
+ *
+ * ⚠ Derived from `HANDS_ERROR_CODES`, NOT written out again. This used to be a
+ * hand-maintained `Set` literal, and adding `ENOTDIR` to the wire contract
+ * without adding it here produced a `HandsError` whose `message` said `ENOTDIR:`
+ * while `code` was `undefined` — so a caller branching on `.code` silently took
+ * the wrong branch. Deriving makes that class of drift impossible.
+ */
+const HANDS_ERROR_CODE_SET: ReadonlySet<string> = new Set<string>(HANDS_ERROR_CODES)
 
 export type HandsServiceOptions = {
   /** Shell bridge; omit while the shell is not attached. */
@@ -251,6 +272,37 @@ export class HandsService extends Service {
   }
 
   /**
+   * One directory's entries, as a stream of batches.
+   *
+   * # Why this is not "caller policy"
+   *
+   * An earlier revision of this service exposed only `stat`/`read`/`write`/
+   * `watch`, on the reasoning that enumeration is the caller's job. That holds
+   * only when the caller can reach the filesystem — and the case this whole
+   * capability exists for is a REMOTE shell, where the brain cannot see the disk.
+   * Without this, a plugin cannot discover a single filename.
+   *
+   * What stays on the caller's side: recursion, globbing, sorting, batching
+   * ACROSS directories and retry — none of which needs filesystem access.
+   *
+   * # Guards
+   *
+   * ⚠ The caller may **break early**; the drain must then cancel rather than
+   * leave the producer running. That is `guarded()`'s job, same as `read`.
+   *
+   * ⚠ A batch arrives as a JSON **array of entries**, so it is base64-decoded
+   * then parsed — the shell serialises the batch itself, and this is the only
+   * place that knows the encoding (same discipline as `decodeChunk`).
+   */
+  list(path: string, opts?: HandsListOptions): AsyncIterable<HandsListBatch> {
+    this.record(this, "list", JSON.stringify(path))
+    return this.guarded(async () => {
+      const stream = this.api.list(path, opts)
+      return decodeBatches(stream)
+    })
+  }
+
+  /**
    * Wrap a stream factory so its life is bound to the CALLER's fiber.
    *
    * `this.ctx` is the caller's ctx (findings §1.3), which is what makes one
@@ -366,5 +418,54 @@ async function* decodeChanges(stream: AsyncIterable<unknown>): AsyncIterable<Han
   for await (const value of stream) {
     const change = normalizeChange(value)
     if (change) yield change
+  }
+}
+
+/**
+ * Decode one `hands.list` batch.
+ *
+ * The wire value is base64 (the shell serialises the whole batch), so it is
+ * decoded to text and parsed. ⚠ A batch that fails to parse is reported, NOT
+ * skipped: silently dropping a batch would make a directory look like it has
+ * fewer entries than it does, and a caller walking it would conclude the
+ * directory ended early. That is the "silent wrong answer" failure this file
+ * keeps guarding against.
+ */
+function decodeBatch(value: unknown): HandsListBatch {
+  const bytes = decodeChunk(value)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(Buffer.from(bytes).toString("utf8"))
+  } catch (error) {
+    throw new HandsError(
+      `EUNSUPPORTED: hands.list batch is not valid JSON: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
+  }
+  if (!Array.isArray(parsed)) {
+    throw new HandsError("EUNSUPPORTED: hands.list batch is not an array")
+  }
+  return parsed.map(normalizeEntry).filter((entry): entry is HandsListEntry => entry !== undefined)
+}
+
+/** One listing entry, or `undefined` when the shape is not one we recognise. */
+function normalizeEntry(value: unknown): HandsListEntry | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const entry = value as { name?: unknown; kind?: unknown; size?: unknown }
+  if (typeof entry.name !== "string") return undefined
+  const kind =
+    entry.kind === "file" || entry.kind === "dir" || entry.kind === "symlink" ? entry.kind : "other"
+  return {
+    name: entry.name,
+    kind,
+    size: typeof entry.size === "number" ? entry.size : 0,
+  }
+}
+
+/** Decode every batch of a `hands.list` stream. */
+async function* decodeBatches(stream: AsyncIterable<unknown>): AsyncIterable<HandsListBatch> {
+  for await (const value of stream) {
+    yield decodeBatch(value)
   }
 }

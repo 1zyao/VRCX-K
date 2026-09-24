@@ -43,6 +43,7 @@ function serviceWith(hands: Partial<ShellStdioBridge["hands"]>): {
       read: () => emptyStream(),
       write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
       watch: () => emptyStream(),
+      list: () => emptyStream(),
       ...hands,
     },
   } as unknown as ShellStdioBridge)
@@ -275,6 +276,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
         stat: async () => null,
         write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
         watch: () => emptyStream(),
+        list: () => emptyStream(),
       },
     } as unknown as ShellStdioBridge)
 
@@ -334,6 +336,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
         stat: async () => null,
         write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
         watch: () => emptyStream(),
+        list: () => emptyStream(),
       },
     } as unknown as ShellStdioBridge)
 
@@ -360,6 +363,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
         stat: async () => null,
         write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
         watch: () => emptyStream(),
+        list: () => emptyStream(),
       },
     } as unknown as ShellStdioBridge)
 
@@ -391,6 +395,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
         stat: async () => null,
         write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
         watch: () => emptyStream(),
+        list: () => emptyStream(),
       },
     } as unknown as ShellStdioBridge)
 
@@ -435,6 +440,7 @@ describe("attribution plumbing", () => {
         read: () => emptyStream(),
         write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
         watch: () => emptyStream(),
+        list: () => emptyStream(),
       },
     } as unknown as ShellStdioBridge)
 
@@ -442,5 +448,187 @@ describe("attribution plumbing", () => {
       return inner.hands.stat("/tmp/x")
     })
     expect(seen).toEqual(["attrPlugin"])
+  })
+})
+
+// --- hands.list ------------------------------------------------------------
+//
+// `list` is the primitive that makes enumeration possible at all: without it a
+// caller on a REMOTE shell cannot discover a single filename, because `stat` on a
+// directory carries only a bounded preview and `read` refuses a directory.
+
+/** Encode a batch the way the shell does: base64 of the JSON array. */
+function batch(entries: unknown): string {
+  return Buffer.from(JSON.stringify(entries)).toString("base64")
+}
+
+describe("hands.list decodes the wire shape", () => {
+  test("a batch arrives as base64 and becomes entry objects", async () => {
+    const { svc } = serviceWith({
+      list: () =>
+        from([
+          batch([
+            { name: "a.txt", kind: "file", size: 3 },
+            { name: "sub", kind: "dir", size: 0 },
+          ]),
+        ]),
+    })
+    const batches = await collect(svc.list("/tmp/dir"))
+    expect(batches).toEqual([
+      [
+        { name: "a.txt", kind: "file", size: 3 },
+        { name: "sub", kind: "dir", size: 0 },
+      ],
+    ])
+  })
+
+  test("multiple batches stay in order and are not merged", async () => {
+    // Order matters: the shell streams a directory in filesystem order, and a
+    // caller accumulating a listing must receive the same order it would have got
+    // from one call. Merging batches would also hide a paging bug.
+    const { svc } = serviceWith({
+      list: () =>
+        from([
+          batch([{ name: "first", kind: "file", size: 0 }]),
+          batch([{ name: "second", kind: "file", size: 0 }]),
+        ]),
+    })
+    const batches = await collect(svc.list("/tmp/dir"))
+    expect(batches).toEqual([
+      [{ name: "first", kind: "file", size: 0 }],
+      [{ name: "second", kind: "file", size: 0 }],
+    ])
+  })
+
+  test("a symlink keeps its own kind rather than its target's", () => {
+    // The shell uses `symlink_metadata` so a link is reported as a link. If this
+    // were normalised to the target's type, a caller could not tell a link from
+    // the thing it points at — the distinction the shell deliberately preserved.
+    return (async () => {
+      const { svc } = serviceWith({
+        list: () => from([batch([{ name: "link", kind: "symlink", size: 12 }])]),
+      })
+      const batches = await collect(svc.list("/tmp/dir"))
+      expect(batches[0][0].kind).toBe("symlink")
+    })()
+  })
+
+  test("an unknown kind degrades to `other` rather than throwing", async () => {
+    // Forward compatibility: a newer shell may report a kind this brain does not
+    // know. Dropping the entry would silently shorten the listing, so it is kept
+    // with a conservative kind instead.
+    const { svc } = serviceWith({
+      list: () => from([batch([{ name: "weird", kind: "socket", size: 0 }])]),
+    })
+    const batches = await collect(svc.list("/tmp/dir"))
+    expect(batches[0]).toEqual([{ name: "weird", kind: "other", size: 0 }])
+  })
+
+  test("a malformed entry is DROPPED, not guessed at", async () => {
+    const { svc } = serviceWith({
+      list: () => from([batch([{ name: "ok", kind: "file", size: 1 }, { size: 5 }, "nonsense"])]),
+    })
+    const batches = await collect(svc.list("/tmp/dir"))
+    expect(batches[0]).toEqual([{ name: "ok", kind: "file", size: 1 }])
+  })
+
+  test("a batch that is not JSON FAILS rather than being skipped", async () => {
+    // ⚠ The critical one. Skipping a bad batch would make the directory look
+    // SHORTER than it is, and a caller walking it would conclude the directory
+    // ended early — a silent wrong answer, which is worse than a loud failure.
+    const { svc } = serviceWith({
+      list: () => from([Buffer.from("not json at all").toString("base64")]),
+    })
+    await expect(collect(svc.list("/tmp/dir"))).rejects.toThrow(/not valid JSON/)
+  })
+
+  test("a batch that is JSON but not an array FAILS", async () => {
+    const { svc } = serviceWith({
+      list: () => from([Buffer.from(JSON.stringify({ items: [] })).toString("base64")]),
+    })
+    await expect(collect(svc.list("/tmp/dir"))).rejects.toThrow(/not an array/)
+  })
+})
+
+describe("hands.list is audited and guarded like the other primitives", () => {
+  test("the audit line names the primitive and the path", async () => {
+    const { svc, audits } = serviceWith({ list: () => emptyStream() })
+    await collect(svc.list("/tmp/somewhere"))
+    expect(audits.some((line) => line.includes("list") && line.includes("/tmp/somewhere"))).toBe(
+      true,
+    )
+  })
+
+  test("with no shell attached it fails loudly instead of looking empty", async () => {
+    // ⚠ "no shell" and "an empty directory" must not be the same observable.
+    // A service that returned an empty stream here would make every caller
+    // believe the directory is empty.
+    const ctx = new Context()
+    const svc = new HandsService(ctx, {})
+    await expect(collect(svc.list("/tmp/x"))).rejects.toThrow(/no shell attached/)
+  })
+
+  test("unloading the plugin stops an in-flight listing", async () => {
+    // ⚠ This mirrors the `read` leak test above, and it replaced a WEAKER version
+    // that only did `for await (… break)`. That version passed with or without
+    // `guarded()`, because `for await … break` calls `.return()` on the generator
+    // either way — so it proved nothing about the guard. Only unloading the owner
+    // exercises it, which is the real-world case (a plugin disabled while its
+    // listing is still streaming) and the one that measured 16 chunks after unload
+    // for `read`.
+    const ctx = new Context()
+    let produced = 0
+    let stopped = false
+
+    const svc = new HandsService(ctx, {})
+    svc.attachShell({
+      hands: {
+        list: () =>
+          (async function* () {
+            while (!stopped) {
+              produced += 1
+              yield batch([{ name: `f${produced}`, kind: "file", size: 0 }])
+              await new Promise((resolve) => setTimeout(resolve, 5))
+            }
+          })(),
+        stat: async () => null,
+        read: () => emptyStream(),
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        watch: () => emptyStream(),
+      },
+    } as unknown as ShellStdioBridge)
+
+    let started = false
+    const plugin = ctx.plugin(function listingPlugin(inner: Context) {
+      // Fire-and-forget: awaiting an endless stream would block the plugin's own
+      // load (the documented trap from the `read` test).
+      void (async () => {
+        try {
+          for await (const _ of inner.hands.list("/tmp/forever")) {
+            started = true
+          }
+        } finally {
+          stopped = true
+        }
+      })()
+    })
+    await plugin
+
+    const deadline = Date.now() + 5_000
+    while (!started && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(started).toBe(true)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    const before = produced
+    expect(before).toBeGreaterThan(0)
+
+    // Unload: the guard is the only thing that can stop the producer.
+    await plugin.dispose()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const after = produced
+
+    expect(stopped).toBe(true)
+    expect(after).toBeLessThanOrEqual(before + 1)
   })
 })

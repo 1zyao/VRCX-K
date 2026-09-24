@@ -1,6 +1,7 @@
 mod app_lifecycle;
 mod dialog_opts;
 mod hands;
+mod hands_hello;
 mod host;
 mod host_lifecycle;
 mod host_ready;

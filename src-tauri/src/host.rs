@@ -1285,6 +1285,15 @@ fn start_host_process(app: Option<&AppHandle>) -> Result<StartingHost, String> {
     // simply absent would be indistinguishable from a typo'd name at the host.
     crate::hands::register_hands_handlers(&peer);
     peer.start_reader(stdout);
+    // Announce who this node is, and from where.
+    //
+    // Sent AFTER the reader starts so the write cannot interleave with the
+    // reader's own setup, and so the brain sees it as an ordinary method call on
+    // an established channel. It is a notification, not a request: nothing waits
+    // for an answer, and a brain that does not know `hands.hello` yet simply logs
+    // an unknown method — which is why this needs no negotiation to be safe to
+    // deploy on one side first.
+    crate::hands_hello::send_hello(&peer);
     Ok(StartingHost {
         tree,
         peer,

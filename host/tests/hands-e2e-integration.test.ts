@@ -36,14 +36,19 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { type ChildProcess, spawn } from "node:child_process"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Context } from "cordis"
 import { stdioJsonTransport } from "kkrpc/stdio"
 import { StreamingRPCChannel } from "kkrpc/streaming"
 import { HandsService } from "../src/hands"
-import type { ShellStdioBridge } from "../src/stdio"
+import type {
+  HandsHelloHandler,
+  HandsHelloWire,
+  ShellHandsHelloBridge,
+  ShellStdioBridge,
+} from "../src/stdio"
 
 const repoRoot = join(import.meta.dir, "..", "..")
 const BIN = join(
@@ -97,6 +102,26 @@ let child: ChildProcess | undefined
 let work: string
 let svc: HandsService
 let channel: StreamingRPCChannel<object, object> | undefined
+/** Hello announcements received on the wire, and the identity they carried. */
+let helloBridge: ShellHandsHelloBridge
+/**
+ * Every hello DISPATCHED, recorded at dispatch time.
+ *
+ * ⚠ Not the same as a subscriber list. The hello is sent once, immediately after
+ * the peer's reader starts — which is during `beforeAll`'s `connect()`, before any
+ * test can register a listener. So a test that asserted on `onHello` firing saw
+ * nothing and reported a missing announcement that had in fact arrived. Recording
+ * at dispatch is what actually proves the frame came over the wire.
+ */
+let helloLog: HandsHelloWire[]
+let seenLaunchId: string | undefined
+
+/** Drain a stream into an array (the other test files have their own copies). */
+async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
+  const out: T[] = []
+  for await (const value of stream) out.push(value)
+  return out
+}
 
 /**
  * Connect a real `HandsService` to a freshly spawned Rust peer.
@@ -109,6 +134,12 @@ let channel: StreamingRPCChannel<object, object> | undefined
  *
  * The bridge is cast because the peer implements ONLY the `hands.*` routes — it
  * is the capability under test, not a full shell.
+ *
+ * ⚠ `expose` is REQUIRED for the hello. The peer announces identity with a
+ * `notify`, which kkrpc delivers as an ordinary inbound call — so without a
+ * handler the frame is dispatched to nothing and silently disappears (a notify
+ * expects no reply, so no error would ever surface). The production path gets
+ * this from `connectShellStdio`'s `expose`; this harness has to provide it.
  */
 function connect(): HandsService {
   if (!child?.stdout || !child.stdin) {
@@ -119,16 +150,45 @@ function connect(): HandsService {
     writable: child.stdin,
     lifecycle: child.stdout,
   })
-  channel = new StreamingRPCChannel<object, object>(transport as never, {})
+
+  const helloHandlers = new Set<HandsHelloHandler>()
+  helloLog = []
+  let current: HandsHelloWire | undefined
+  helloBridge = {
+    onHello: (handler) => {
+      helloHandlers.add(handler)
+      return () => helloHandlers.delete(handler)
+    },
+    currentHello: () => current,
+  }
+
+  channel = new StreamingRPCChannel<object, object>(transport as never, {
+    expose: {
+      hands: {
+        hello: (hello: HandsHelloWire) => {
+          // Recorded at dispatch, so the wire delivery is provable even though
+          // the test's own subscriber is registered later.
+          helloLog.push(hello)
+          current = hello
+          seenLaunchId = hello.node.launchId
+          for (const handler of [...helloHandlers]) handler(hello)
+          return true
+        },
+      },
+    },
+  })
   // ⚠ `getAPI()` returns the ROOT proxy: the methods live under the `hands`
   // namespace, so the bridge takes `api.hands`, not `api`. Passing the root made
   // every call arrive as `unknown RPC method: stat` — which is what the first run
   // of this test reported.
   const api = channel.getAPI() as { hands: unknown }
-  const bridge = { hands: api.hands }
   const ctx = new Context()
   const service = new HandsService(ctx, {})
-  service.attachShell({ ...(bridge as object), shell: {} } as unknown as ShellStdioBridge)
+  service.attachShell({
+    hands: api.hands,
+    handsHello: helloBridge,
+    shell: {},
+  } as unknown as ShellStdioBridge)
   return service
 }
 
@@ -294,6 +354,184 @@ describe("the host's HandsService drives the real Rust peer", () => {
       expect(caught).toBeDefined()
       // `EISDIR` is the documented code for this case.
       expect((caught as { code?: string }).code).toBe("EISDIR")
+    },
+    30_000,
+  )
+
+  test.skipIf(!binaryAvailable)(
+    "list enumerates a real directory, with kinds, over the real peer",
+    async () => {
+      // The whole point of the primitive: these names are DISCOVERED, not
+      // supplied. Before `list` existed the only way to learn that `a.txt` was
+      // here would have been to guess the name and `stat` it.
+      const dir = join(work, "listing")
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, "a.txt"), "aaa")
+      writeFileSync(join(dir, "b.txt"), "bb")
+      mkdirSync(join(dir, "sub"))
+
+      const entries = (await collect(svc.list(dir))).flat()
+      const byName = new Map(entries.map((entry) => [entry.name, entry]))
+
+      expect([...byName.keys()].sort()).toEqual(["a.txt", "b.txt", "sub"])
+      // Kind and size come back in the SAME call. That is what saves the N
+      // round trips this primitive exists to save: a caller that got only names
+      // would need one `stat` per entry.
+      expect(byName.get("a.txt")?.kind).toBe("file")
+      expect(byName.get("a.txt")?.size).toBe(3)
+      expect(byName.get("sub")?.kind).toBe("dir")
+    },
+    30_000,
+  )
+
+  test.skipIf(!binaryAvailable)(
+    "list batches through the real credit window without losing an entry",
+    async () => {
+      // A batch boundary bug drops entries SILENTLY, and a caller walking a
+      // directory would conclude it ended early. 25 entries at batch 4 forces
+      // several full batches plus a partial one.
+      const dir = join(work, "batched")
+      mkdirSync(dir, { recursive: true })
+      for (let i = 0; i < 25; i++) {
+        writeFileSync(join(dir, `f${String(i).padStart(2, "0")}.txt`), "x")
+      }
+      const batches = await collect(svc.list(dir, { batch: 4 }))
+      const names = batches.flat().map((entry) => entry.name)
+
+      expect(names).toHaveLength(25)
+      expect(new Set(names).size).toBe(25)
+      expect(batches.length).toBeGreaterThan(1)
+      expect(Math.max(...batches.map((batch) => batch.length))).toBeLessThanOrEqual(4)
+    },
+    30_000,
+  )
+
+  test.skipIf(!binaryAvailable)(
+    "stat previews a directory AND flags truncation, so a caller knows to list",
+    async () => {
+      // The preview is the cheap path; `truncated` is what stops a caller from
+      // believing it has seen everything. Without it, a directory with more than
+      // the preview size looks COMPLETE and the extra entries are never read.
+      const small = join(work, "preview-small")
+      mkdirSync(small, { recursive: true })
+      writeFileSync(join(small, "only.txt"), "x")
+      const smallStat = await svc.stat(small)
+      expect(smallStat?.entries?.truncated).toBe(false)
+      expect(smallStat?.entries?.items.map((entry) => entry.name)).toEqual(["only.txt"])
+
+      const big = join(work, "preview-big")
+      mkdirSync(big, { recursive: true })
+      for (let i = 0; i < 40; i++) writeFileSync(join(big, `f${i}.txt`), "x")
+      const bigStat = await svc.stat(big)
+      expect(bigStat?.entries?.truncated).toBe(true)
+
+      // And `list` really does return the rest — the flag is not a dead end.
+      const all = (await collect(svc.list(big))).flat()
+      expect(all).toHaveLength(40)
+    },
+    30_000,
+  )
+
+  test.skipIf(!binaryAvailable)(
+    "stat of a FILE has no preview, which is distinct from an empty directory",
+    async () => {
+      // Three states must stay apart on the wire. Merging them would make "not a
+      // directory" indistinguishable from "a directory with nothing in it".
+      const file = join(work, "not-a-dir.txt")
+      writeFileSync(file, "x")
+      const fileStat = await svc.stat(file)
+      expect(fileStat?.entries ?? null).toBeNull()
+
+      const empty = join(work, "truly-empty")
+      mkdirSync(empty, { recursive: true })
+      const emptyStat = await svc.stat(empty)
+      expect(emptyStat?.entries?.items).toEqual([])
+      expect(emptyStat?.entries?.truncated).toBe(false)
+    },
+    30_000,
+  )
+
+  test.skipIf(!binaryAvailable)(
+    "list on a FILE reports ENOTDIR, not an empty listing",
+    async () => {
+      // ⚠ On Windows `read_dir` on a file SUCCEEDS and yields nothing (measured),
+      // so without the explicit guard a file would look like an EMPTY DIRECTORY —
+      // a silent wrong answer rather than an error.
+      const file = join(work, "not-a-directory.txt")
+      writeFileSync(file, "x")
+      let caught: unknown
+      try {
+        await collect(svc.list(file))
+      } catch (error) {
+        caught = error
+      }
+      expect((caught as { code?: string }).code).toBe("ENOTDIR")
+    },
+    30_000,
+  )
+})
+
+describe("the shell's hello arrives on a real connection", () => {
+  test.skipIf(!binaryAvailable)(
+    "the brain learns the peer's cwd, home and environment without asking",
+    async () => {
+      // ⚠ The hello is sent ONCE, right after the peer's reader starts — i.e.
+      // during `beforeAll`, before this test can register anything. So this
+      // asserts on the DISPATCH LOG; the round trip below only proves the frame
+      // is not still sitting unread in a pipe.
+      await svc.stat(work)
+
+      expect(helloLog.length).toBeGreaterThan(0)
+      const hello = helloLog[0]
+      // `schemaVersion` is what turns a version skew into a named refusal instead
+      // of a pile of undefined fields.
+      expect(hello.schemaVersion).toBe(1)
+      expect(hello.node.launchId.length).toBeGreaterThan(0)
+      // ⚠ DERIVED from the host's own platform, not hardcoded. The peer is a
+      // local process, so `std::env::consts::OS` on the other end must agree with
+      // `process.platform` here — and that agreement is the actual assertion.
+      // Hardcoding "windows" made this test pass locally and FAIL on macOS and
+      // Ubuntu, which is worse than not having it: a green local run said nothing
+      // about the two platforms where it was red.
+      const expectedPlatform =
+        process.platform === "win32"
+          ? "windows"
+          : process.platform === "darwin"
+            ? "macos"
+            : process.platform
+      expect(hello.node.platform).toBe(expectedPlatform)
+      // The peer's OWN cwd — the value the brain previously had no way to obtain,
+      // and the correct base for resolving a relative path.
+      expect(hello.cwd.length).toBeGreaterThan(0)
+      expect(typeof hello.home).toBe("string")
+      // The environment arrives WITH the identity, not via a separate call, so it
+      // cannot be confused with the brain's own `process.env`.
+      expect(Object.keys(hello.env).length).toBeGreaterThan(0)
+    },
+    30_000,
+  )
+
+  test.skipIf(!binaryAvailable)(
+    "a late subscriber still learns the identity, which is once per process",
+    async () => {
+      // ⚠ The hello is sent ONCE. A plain fan-out would mean anything registering
+      // after it arrived (a plugin loaded later, a UI panel opened later) never
+      // learns who the shell is — and would conclude there is no shell identity
+      // rather than that it missed the announcement.
+      const late: HandsHelloWire[] = []
+      const stop = helloBridge.onHello((hello) => late.push(hello))
+      await svc.stat(work)
+      stop()
+
+      const current = helloBridge.currentHello()
+      expect(current).toBeDefined()
+      // It must be the SAME node the earlier test saw, not a fresh/blank object.
+      expect(current?.node.launchId).toBe(seenLaunchId)
+      // And the replay must NOT be a second announcement: the shell sends one per
+      // process, so a late subscriber sees no further dispatch...
+      expect(late).toHaveLength(0)
+      // ...which also pins that only ONE hello crossed the wire.
+      expect(helloLog).toHaveLength(1)
     },
     30_000,
   )

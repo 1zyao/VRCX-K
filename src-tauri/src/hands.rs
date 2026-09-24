@@ -1,20 +1,59 @@
 //! The hands' file capability: `hands.stat` / `hands.read` / `hands.write` /
-//! `hands.watch`.
+//! `hands.watch` / `hands.list`.
 //!
 //! Scope, stated because it is easy to over-read: this is the **transport and
 //! primitive layer** only. It is NOT the plugin-facing SDK — the `ctx.hands`
 //! service, its types and its audit hook live on the brain side and are shaped
 //! by [`../../docs/hands-capability-proposal.md`]. What lands here is the part
-//! the proposal cannot decide on its own: the four primitives, over the wire,
-//! with real backpressure and real cancellation.
+//! the proposal cannot decide on its own: the primitives, over the wire, with
+//! real backpressure and real cancellation.
 //!
-//! # Why four primitives and not more
+//! # Why this set, and not more
 //!
 //! Measured, not chosen: the per-file cost of a remote round trip is a full RTT
-//! (~1 RTT per file; at 5 ms RTT that is 320x slower than batching), so
-//! directory walking, batch sizing and retry belong to the caller. The hands
-//! answer exactly one question each: *what is this*, *give me bytes*, *take
-//! bytes*, *tell me when it changes*. `docs/probes/transport-lab/FINDINGS.md` §6.
+//! (~1 RTT per file; at 5 ms RTT that is 320x slower than batching), so batch
+//! sizing and retry belong to the caller. `docs/probes/transport-lab/FINDINGS.md`
+//! §6.
+//!
+//! ⚠ **That measurement does NOT license "no enumeration primitive", and an
+//! earlier revision of this file wrongly read it that way.** §6 measured
+//! transferring N files whose names were ALREADY KNOWN, and concluded that
+//! walking is caller policy. The premise — the caller can walk — holds only when
+//! the caller can reach the filesystem. §7.1 of the same document is the case
+//! this capability exists for: a REMOTE hands, where the brain cannot see the
+//! disk at all. Without `hands.list` a caller cannot discover a single filename,
+//! so "walking is policy" leaves it with no way to start.
+//!
+//! The split that survives both facts:
+//!
+//! - **Enumerate** — a capability. Only the hands can answer "what is here",
+//!   so it is a primitive.
+//! - **Match / sort / recurse / batch / retry** — policy. None of it needs
+//!   filesystem access, so it stays with the caller.
+//!
+//! `hands.list` therefore lists ONE directory, non-recursively, unfiltered.
+//!
+//! # Path semantics (deliberately not inherited from the platform)
+//!
+//! The hands pass the caller's string to the OS, so the OS decides:
+//!
+//! - **Absolute paths** are the intended form and the only one the SDK
+//!   documents.
+//! - **Relative paths resolve against the hands' own process cwd** (verified).
+//!   That is meaningless on a remote node, where the caller has no idea what the
+//!   hands' cwd is — so callers must not rely on it.
+//! - `..` **is resolved by the OS, and lexically**: `NOSUCHDIR\..\..` resolves
+//!   even though `NOSUCHDIR` does not exist (verified). This is inherited
+//!   behaviour, not a permission boundary.
+//! - `~` and `%VAR%` are **NOT expanded** (verified: they are treated as
+//!   literal names). Expansion is the caller's job, because only the caller
+//!   knows the user's shell conventions — and the hands' environment may belong
+//!   to a different machine.
+//!
+//! There is **no path confinement**: any path the hands process can reach is
+//! reachable. That is a known, accepted property of this layer (the proposal
+//! keeps authorisation coarse and at the primitive level, not the path level),
+//! and it is written down here so no caller mistakes it for a sandbox.
 //!
 //! # Backpressure is not optional
 //!
@@ -53,6 +92,7 @@ pub fn register_hands_handlers(peer: &Arc<Peer>) {
     register_read(peer);
     register_write(peer);
     register_watch(peer);
+    register_list(peer);
 }
 
 // --- error surface ---------------------------------------------------------
@@ -69,6 +109,13 @@ enum Code {
     NotFound,
     Denied,
     IsDir,
+    /// The mirror of `EISDIR`: a directory operation was asked of a non-directory.
+    ///
+    /// Distinct from `EISDIR` because the fix differs: `EISDIR` means "you asked
+    /// for file content on a directory" (read its entries instead), `ENOTDIR`
+    /// means "you asked for a listing on a file" (stat it instead). Collapsing
+    /// them would make one message explain both.
+    NotDir,
     Stale,
     NoSpace,
     Unsupported,
@@ -80,6 +127,7 @@ impl Code {
             Code::NotFound => "ENOENT",
             Code::Denied => "EACCES",
             Code::IsDir => "EISDIR",
+            Code::NotDir => "ENOTDIR",
             Code::Stale => "ESTALE",
             Code::NoSpace => "ENOSPC",
             Code::Unsupported => "EUNSUPPORTED",
@@ -167,12 +215,213 @@ fn stat_path(path: &str) -> std::io::Result<Value> {
         .map(|id| format!("{id:?}"))
         .unwrap_or_default();
 
+    // Listing the entries is BEST-EFFORT, for the same reason identity is: a
+    // directory that can be stat'd but not read is a real state (execute-only
+    // permission), and its size/mtime/kind are still true and still useful. So a
+    // failed listing must not fail the `stat`.
+    //
+    // It must not be SILENT either. `entries` is null for a non-directory, and
+    // an object for a directory — one that carries `error` when the listing
+    // failed. That keeps three states apart that a single null would merge:
+    // "not a directory", "an empty directory", and "a directory I cannot read".
+    let entries = if kind == "dir" {
+        match read_entries(path, STAT_PREVIEW_MAX) {
+            Ok((items, truncated)) => json!({ "items": items, "truncated": truncated }),
+            Err(error) => json!({ "items": [], "truncated": false, "error": error }),
+        }
+    } else {
+        Value::Null
+    };
+
     Ok(json!({
         "size": meta.len(),
         "id": id,
         "mtimeMs": mtime_ms,
         "kind": kind,
+        // A BOUNDED preview, so "is this the directory I meant" is answerable
+        // without a second round trip — the common case. `truncated` says
+        // whether it is the whole story; a caller that needs every entry calls
+        // `hands.list`, which streams and has no size bound.
+        "entries": entries,
     }))
+}
+
+// --- list (producer) -------------------------------------------------------
+
+/// How many entries `stat` may inline as a preview before `list` must be used.
+///
+/// Small on purpose. `stat` is called on hot paths (the read loop re-checks
+/// identity per chunk), so its reply has to stay predictably cheap. A preview
+/// answers "is this the directory I meant" without turning `stat` into a call
+/// whose reply size depends on a directory the caller has not seen yet.
+const STAT_PREVIEW_MAX: usize = 16;
+
+/// One directory entry, as the wire shape.
+fn entry_of(entry: &std::fs::DirEntry) -> Value {
+    let name = entry.file_name().to_string_lossy().to_string();
+    // `symlink_metadata`, not `metadata`: following a link here would make the
+    // listing report the TARGET's type, so a broken link would look missing and
+    // a link to a directory would look like a directory. The listing describes
+    // what is IN the directory, which is the link itself.
+    let meta = std::fs::symlink_metadata(entry.path());
+
+    let (kind, size) = match &meta {
+        Ok(meta) if meta.file_type().is_symlink() => ("symlink", meta.len()),
+        Ok(meta) if meta.is_dir() => ("dir", 0),
+        Ok(meta) if meta.is_file() => ("file", meta.len()),
+        Ok(meta) => ("other", meta.len()),
+        // An entry we cannot stat is still an entry. Reporting it as an error
+        // would fail the whole listing for one unreadable file, and a caller
+        // walking a directory needs to know it is there.
+        Err(_) => ("other", 0),
+    };
+
+    json!({ "name": name, "kind": kind, "size": size })
+}
+
+/// Read at most `limit` entries, plus whether more remain.
+fn read_entries(path: &str, limit: usize) -> Result<(Vec<Value>, bool), String> {
+    let dir = std::fs::read_dir(path).map_err(|error| encode_error(classify(&error), error))?;
+    let mut entries = Vec::new();
+    let mut more = false;
+    for entry in dir {
+        let Ok(entry) = entry else {
+            // A single unreadable entry must not fail the listing; it is skipped
+            // and the caller still learns what else is there.
+            continue;
+        };
+        if entries.len() >= limit {
+            more = true;
+            break;
+        }
+        entries.push(entry_of(&entry));
+    }
+    Ok((entries, more))
+}
+
+/// `hands.list(path) -> stream of entry batches`
+///
+/// # Why this is a primitive and not "caller policy"
+///
+/// The four-primitive design rests on "directory walking is the caller's job,
+/// because the caller can do it". That premise holds only when the caller can
+/// reach the filesystem — which is exactly what is NOT true here. The measured
+/// case (`transport-lab/FINDINGS.md` §6-§7.1) is a REMOTE hands: the brain
+/// cannot enumerate a disk it cannot see, so "walking is policy" would leave the
+/// caller with no way to discover a single filename.
+///
+/// The split that does hold:
+///
+/// - **Enumerate** (what is in this directory?) — a capability, only the hands
+///   can answer it, so it belongs here.
+/// - **Match, sort, recurse, batch, retry** (which of those do I want, and in
+///   what order?) — policy, needs no filesystem access, belongs to the caller.
+///
+/// So this lists ONE directory, non-recursively, in filesystem order, with no
+/// pattern argument and no filtering. A glob or a recursive walk here would put
+/// policy in the wrong layer and make the reply size unbounded by anything the
+/// caller chose.
+///
+/// Streaming rather than a single reply: a directory's size is not knowable
+/// before reading it, so one reply would reintroduce exactly the unbounded
+/// message that measured as unusable at ≥1 MiB. The caller pulls batches and
+/// stops when it wants to.
+fn register_list(peer: &Arc<Peer>) {
+    let target = Arc::clone(peer);
+    peer.on_deferred(
+        "hands.list",
+        Arc::new(move |reply: DeferredReply, args: Vec<Value>| {
+            let path = str_arg(&args, 0);
+            let opts = args.get(1).cloned().unwrap_or_else(|| json!({}));
+            // Batch size is a caller choice, bounded so a single frame cannot
+            // grow without limit.
+            let batch = opts
+                .get("batch")
+                .and_then(Value::as_u64)
+                .unwrap_or(STAT_PREVIEW_MAX as u64)
+                .clamp(1, 4096) as usize;
+
+            // The not-a-directory check lives in `DirectoryReader::open`, so it
+            // cannot be skipped by a second caller. Doing it again here would be
+            // a second copy of the rule, which is how the two drift apart.
+            match DirectoryReader::open(&path, batch) {
+                Ok(reader) => {
+                    if let Err(error) = target.open_stream(&reply_id(&reply), Box::new(reader)) {
+                        reply.fail(error);
+                    }
+                }
+                Err(error) => reply.fail(error),
+            }
+        }),
+    );
+}
+
+/// Walks one directory, one batch of entries per chunk.
+struct DirectoryReader {
+    reader: std::fs::ReadDir,
+    batch: usize,
+    done: bool,
+}
+
+impl DirectoryReader {
+    fn open(path: &str, batch: usize) -> Result<Self, String> {
+        // The guard lives HERE, not only in the handler, and that placement is
+        // the point: on Windows `read_dir` on a FILE SUCCEEDS and yields an
+        // empty iterator (measured), so without this check a non-directory is
+        // indistinguishable from an empty directory — the caller would conclude
+        // "nothing there" about a path that exists. Checking here means every
+        // caller of the reader gets that guarantee, not just the one handler
+        // that happened to remember to look.
+        let meta =
+            std::fs::metadata(path).map_err(|error| encode_error(classify(&error), error))?;
+        if !meta.is_dir() {
+            return Err(encode_error(
+                Code::NotDir,
+                format!("{path} is not a directory"),
+            ));
+        }
+        let reader =
+            std::fs::read_dir(path).map_err(|error| encode_error(classify(&error), error))?;
+        Ok(Self {
+            reader,
+            batch,
+            done: false,
+        })
+    }
+}
+
+impl StreamProducer for DirectoryReader {
+    fn next_chunk(&mut self) -> StreamStep {
+        if self.done {
+            return StreamStep::Done;
+        }
+        let mut entries = Vec::new();
+        // Stop at the batch size even if more remain, so the reply frame stays
+        // bounded by the caller's choice rather than by the directory.
+        for entry in self.reader.by_ref() {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            entries.push(entry_of(&entry));
+            if entries.len() >= self.batch {
+                break;
+            }
+        }
+        if entries.is_empty() {
+            self.done = true;
+            return StreamStep::Done;
+        }
+        // NOTE: there is deliberately NO "short batch means finished" check here.
+        // One was written and then removed, because it saved nothing: with or
+        // without it, the consumer needs exactly one further `next_chunk` to
+        // observe `Done` (traced across n=0,3,4,7,8,16 for every batch size — the
+        // call count is identical). A "saving" that changes no observable
+        // behaviour is dead code, and leaving it would put a claim in this
+        // comment that no test can falsify. The stream terminates because this
+        // arm returns `Done` on the next call, which is what the consumer sees.
+        let bytes = serde_json::to_vec(&Value::Array(entries)).unwrap_or_else(|_| b"[]".to_vec());
+        StreamStep::Chunk(bytes)
+    }
 }
 
 // --- read (producer) -------------------------------------------------------
@@ -713,6 +962,280 @@ mod tests {
         let error = stat_path(missing.to_str().unwrap()).expect_err("must fail");
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(classify(&error), Code::NotFound);
+    }
+
+    // --- stat preview -------------------------------------------------------
+
+    #[test]
+    fn stat_of_a_file_has_no_entry_preview() {
+        // `null`, not `[]`: "this is not a directory" and "this directory is
+        // empty" are different answers, and one shape for both would merge them.
+        let dir = temp_dir("stat-file-no-entries");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, b"x").expect("write");
+        let stat = stat_path(path.to_str().unwrap()).expect("stat");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(stat["entries"], Value::Null);
+    }
+
+    #[test]
+    fn stat_of_a_directory_previews_its_entries_without_truncation() {
+        let dir = temp_dir("stat-dir-preview");
+        std::fs::write(dir.join("a.txt"), b"x").expect("write");
+        std::fs::create_dir(dir.join("sub")).expect("mkdir");
+        let stat = stat_path(dir.to_str().unwrap()).expect("stat");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let entries = &stat["entries"];
+        assert_eq!(entries["truncated"], json!(false));
+        let mut names: Vec<String> = entries["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a.txt", "sub"]);
+    }
+
+    #[test]
+    fn stat_preview_is_marked_truncated_at_the_boundary() {
+        // The off-by-one that matters: a directory with EXACTLY `STAT_PREVIEW_MAX`
+        // entries must not claim to be truncated (there is nothing more), and one
+        // with a single extra MUST claim it (or the caller silently believes it
+        // has seen everything and never calls `list`).
+        let exact = temp_dir("stat-preview-exact");
+        for i in 0..STAT_PREVIEW_MAX {
+            std::fs::write(exact.join(format!("f{i}")), b"x").expect("write");
+        }
+        let stat = stat_path(exact.to_str().unwrap()).expect("stat");
+        std::fs::remove_dir_all(&exact).ok();
+        assert_eq!(
+            stat["entries"]["truncated"],
+            json!(false),
+            "exactly {STAT_PREVIEW_MAX} entries is NOT truncated"
+        );
+        assert_eq!(
+            stat["entries"]["items"].as_array().unwrap().len(),
+            STAT_PREVIEW_MAX
+        );
+
+        let over = temp_dir("stat-preview-over");
+        for i in 0..=STAT_PREVIEW_MAX {
+            std::fs::write(over.join(format!("f{i}")), b"x").expect("write");
+        }
+        let stat = stat_path(over.to_str().unwrap()).expect("stat");
+        std::fs::remove_dir_all(&over).ok();
+        assert_eq!(
+            stat["entries"]["truncated"],
+            json!(true),
+            "one more than the preview must be flagged, or the caller never lists"
+        );
+        assert_eq!(
+            stat["entries"]["items"].as_array().unwrap().len(),
+            STAT_PREVIEW_MAX
+        );
+    }
+
+    #[test]
+    fn stat_of_an_empty_directory_is_an_empty_preview_not_an_error() {
+        let dir = temp_dir("stat-empty-dir");
+        let stat = stat_path(dir.to_str().unwrap()).expect("stat");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(stat["entries"]["items"], json!([]));
+        assert_eq!(stat["entries"]["truncated"], json!(false));
+        assert!(
+            stat["entries"].get("error").is_none(),
+            "an empty directory is not a failure"
+        );
+    }
+
+    // --- list ---------------------------------------------------------------
+
+    /// Drain a `DirectoryReader` into `(names, batches)`.
+    ///
+    /// ⚠ BOUNDED ON PURPOSE. The first version looped until `Done`, so a producer
+    /// regression that never terminates made the TEST HANG rather than fail —
+    /// observed twice while fault-injecting, and a hung suite with no failure line
+    /// is far worse than a red one (it reads as a slow machine). Every drain loop
+    /// in this file therefore has a call budget and panics past it.
+    fn drain_list(path: &str, batch: usize) -> (Vec<String>, usize) {
+        let mut reader = DirectoryReader::open(path, batch).expect("open");
+        let mut names = Vec::new();
+        let mut batches = 0;
+        loop {
+            assert!(
+                batches < 10_000,
+                "the stream produced {batches} batches without ending — the producer \
+                 is not terminating"
+            );
+            match reader.next_chunk() {
+                StreamStep::Chunk(bytes) => {
+                    batches += 1;
+                    let values: Vec<Value> = serde_json::from_slice(&bytes).expect("json array");
+                    for value in values {
+                        names.push(value["name"].as_str().unwrap().to_string());
+                    }
+                }
+                StreamStep::Done => break,
+                StreamStep::Failed(error) => panic!("unexpected failure: {error}"),
+            }
+        }
+        names.sort();
+        (names, batches)
+    }
+
+    #[test]
+    fn list_returns_every_entry_in_a_directory() {
+        let dir = temp_dir("list-all");
+        std::fs::write(dir.join("b.txt"), b"yy").expect("write");
+        std::fs::write(dir.join("a.txt"), b"x").expect("write");
+        std::fs::create_dir(dir.join("sub")).expect("mkdir");
+        let (names, _) = drain_list(dir.to_str().unwrap(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(names, vec!["a.txt", "b.txt", "sub"]);
+    }
+
+    #[test]
+    fn list_reports_kind_so_a_caller_can_tell_files_from_directories() {
+        // The whole reason enumeration is a primitive: a caller that only got
+        // names would need one `stat` per entry to know what to do with it —
+        // N round trips, which is the cost §6 was about.
+        let dir = temp_dir("list-kind");
+        std::fs::write(dir.join("f.txt"), b"12345").expect("write");
+        std::fs::create_dir(dir.join("d")).expect("mkdir");
+
+        let mut reader = DirectoryReader::open(dir.to_str().unwrap(), 16).expect("open");
+        let StreamStep::Chunk(bytes) = reader.next_chunk() else {
+            panic!("expected one batch");
+        };
+        std::fs::remove_dir_all(&dir).ok();
+
+        let values: Vec<Value> = serde_json::from_slice(&bytes).expect("json");
+        let by_name = |name: &str| {
+            values
+                .iter()
+                .find(|v| v["name"] == json!(name))
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .clone()
+        };
+        assert_eq!(by_name("f.txt")["kind"], json!("file"));
+        assert_eq!(by_name("f.txt")["size"], json!(5));
+        assert_eq!(by_name("d")["kind"], json!("dir"));
+    }
+
+    #[test]
+    fn list_batches_by_the_requested_size_and_does_not_lose_entries() {
+        // Batching must partition, not truncate: the entries after the first
+        // batch are the ones a boundary bug would silently drop.
+        let dir = temp_dir("list-batching");
+        for i in 0..7 {
+            std::fs::write(dir.join(format!("f{i}")), b"x").expect("write");
+        }
+        let (names, batches) = drain_list(dir.to_str().unwrap(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(names.len(), 7, "every entry must arrive: {names:?}");
+        // 7 entries at 2 per batch: 2,2,2 then a SHORT batch of 1 that ends it.
+        assert_eq!(batches, 4, "expected 3 full batches then a short one");
+    }
+
+    #[test]
+    fn list_of_an_exact_multiple_ends_without_an_empty_trailing_batch() {
+        // 4 entries at 2 per batch must produce exactly 2 batches. A "fill until
+        // short" loop that only stops on a short batch would emit a third, empty
+        // one — harmless here, but the same loop is what would spin forever if it
+        // stopped only on error.
+        let dir = temp_dir("list-exact");
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("f{i}")), b"x").expect("write");
+        }
+        let (names, batches) = drain_list(dir.to_str().unwrap(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(names.len(), 4);
+        assert_eq!(batches, 2, "an exact multiple must not add an empty batch");
+    }
+
+    #[test]
+    fn list_of_an_empty_directory_produces_no_batch_at_all() {
+        let dir = temp_dir("list-empty");
+        let (names, batches) = drain_list(dir.to_str().unwrap(), 8);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(names.is_empty());
+        assert_eq!(batches, 0, "nothing to send means send nothing");
+    }
+
+    #[test]
+    fn the_stream_terminates_after_the_last_entry_however_the_batches_fall() {
+        // The real contract: the consumer must reach `Done`, and must not be
+        // handed an unbounded number of empty batches on the way. This replaces a
+        // test that asserted a "short batch ends the stream early" saving — that
+        // saving turned out not to exist (the terminal call is needed either way),
+        // and the check was removed rather than kept with a comment no test could
+        // falsify.
+        for (count, batch) in [(0usize, 8usize), (3, 8), (4, 2), (7, 2), (16, 16)] {
+            let dir = temp_dir(&format!("list-terminates-{count}-{batch}"));
+            for i in 0..count {
+                std::fs::write(dir.join(format!("f{i}")), b"x").expect("write");
+            }
+
+            let mut reader = DirectoryReader::open(dir.to_str().unwrap(), batch).expect("open");
+            let mut data_calls = 0;
+            let mut empty_batches = 0;
+            let mut calls = 0;
+            loop {
+                calls += 1;
+                assert!(
+                    calls < 100,
+                    "the stream never terminated for {count}/{batch}"
+                );
+                match reader.next_chunk() {
+                    StreamStep::Chunk(bytes) => {
+                        let values: Vec<Value> =
+                            serde_json::from_slice(&bytes).expect("json array");
+                        if values.is_empty() {
+                            empty_batches += 1;
+                        } else {
+                            data_calls += 1;
+                        }
+                    }
+                    StreamStep::Done => break,
+                    StreamStep::Failed(error) => panic!("unexpected failure: {error}"),
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+
+            assert_eq!(
+                data_calls,
+                count.div_ceil(batch),
+                "{count} entries at batch {batch}: wrong number of data batches"
+            );
+            assert_eq!(
+                empty_batches, 0,
+                "{count} entries at batch {batch}: an empty batch is never useful and \
+                 costs the caller a full round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn list_of_a_file_reports_not_a_directory_rather_than_failing_obscurely() {
+        // A caller that guessed "dir" must be told exactly that, not handed
+        // ENOENT (which would read as "it is gone" and send it down a retry path
+        // that can never succeed).
+        let dir = temp_dir("list-not-dir");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, b"x").expect("write");
+        // Matched rather than `expect_err`, because the Ok arm has no `Debug`.
+        let error = match DirectoryReader::open(path.to_str().unwrap(), 8) {
+            Ok(_) => panic!("listing a file must not succeed"),
+            Err(error) => error,
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            error.starts_with("ENOTDIR:"),
+            "expected ENOTDIR, got: {error}"
+        );
     }
 
     // --- read ---------------------------------------------------------------
