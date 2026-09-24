@@ -287,7 +287,20 @@ export class HandsService extends Service {
           async next(): Promise<IteratorResult<T>> {
             if (released) return { done: true, value: undefined }
             if (!iterator) iterator = (await open())[Symbol.asyncIterator]()
-            const result = await iterator.next()
+            let result: IteratorResult<T>
+            try {
+              result = await iterator.next()
+            } catch (error) {
+              // ⚠ Stream failures must be translated too. `stat`/`write` wrap
+              // their rejections, but a stream error surfaces from `next()`
+              // inside kkrpc, so without this it escapes as a plain Error whose
+              // `message` is `"EISDIR: …"` but whose `.code` is missing — a
+              // caller branching on the code would silently take the wrong
+              // path. Found by hands-e2e-integration.test.ts, which is the only
+              // test that crosses the service/peer seam.
+              stop()
+              throw asHandsError(error)
+            }
             // The stream ended on its own: drop the guard so a long session of
             // many small files does not accumulate registrations.
             if (result.done) stop()

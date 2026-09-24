@@ -5,6 +5,11 @@ import type { ShellStdioBridge } from "../src/stdio"
 
 // Acceptance ⑥ for M2-1: a plugin reaches tray/notify/dialog through BOTH the
 // curated domain services and the raw `ctx.shell` mirror, and each call is
+/** An async iterable that yields nothing — what the `hands` streams need. */
+async function* emptyStream(): AsyncIterable<never> {
+  // Intentionally yields nothing.
+}
+
 // attributed to the calling plugin. `seen` proves the call reached the shell;
 // `audit` proves the capability layer knew who called.
 function fakeBridge(seen: string[]): ShellStdioBridge {
@@ -50,6 +55,25 @@ function fakeBridge(seen: string[]): ShellStdioBridge {
       resolve: async () => "",
     },
     devWatchEvent: async () => true,
+    // ⚠ `clipboard` and `os` were added to `ShellStdioBridge` by the hands PR, and
+    // this fake was not updated with them. Nothing failed, because `host/tests`
+    // is in NO tsconfig program — the type error only surfaced when the tests
+    // were added to one. Kept here so the fake matches the interface it claims to
+    // implement.
+    clipboard: {
+      writeText: async () => true,
+      readText: async () => null,
+    },
+    os: {
+      info: async () => ({
+        platform: "win32",
+        version: "10.0.0",
+        family: "windows",
+        arch: "x86_64",
+        locale: null,
+        hostname: "test-host",
+      }),
+    },
     tray: {
       setSnapshot: async () => {
         seen.push("tray")
@@ -60,12 +84,35 @@ function fakeBridge(seen: string[]): ShellStdioBridge {
   return {
     ready: async () => {},
     shell,
+    // `hands` is part of `ShellStdioBridge` since this PR. The curated-call tests
+    // here never reach it, but the bridge type requires it — and leaving it out
+    // was invisible until `host/tests` joined a tsc program.
+    hands: {
+      stat: async () => null,
+      read: () => emptyStream(),
+      write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+      watch: () => emptyStream(),
+      list: () => emptyStream(),
+    },
     tray: { setSnapshot: async () => ({ ok: true, revision: 1 }), onAction: () => () => {} },
     shortcut: {
       register: async () => ({ ok: true }),
       unregister: async () => ({ ok: true }),
       onPress: () => () => {},
     },
+    // `handsHello` (the shell→brain identity announcement) and `sawWriteFailure`
+    // (the EPIPE detector) are also part of the bridge. Nothing in this file
+    // exercises them; they are here so the fake satisfies the interface it is
+    // declared to return — which no tsconfig checked until now.
+    handsHello: {
+      onHello: () => () => {},
+      currentHello: () => undefined,
+    },
+    sawWriteFailure: () => false,
+    // `deepLink` predates this PR; it was missing here all along and only became
+    // visible once `host/tests` joined a tsc program. `onOpen` is the local
+    // fan-out registration, not an RPC.
+    deepLink: { onOpen: () => () => {} },
   }
 }
 

@@ -232,8 +232,26 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
+      # Build the hands end-to-end peer BEFORE the JS tests.
+      #
+      # `host/tests/hands-e2e-integration.test.ts` spawns this binary to drive
+      # the real `HandsService` against the real Rust file primitives over real
+      # pipes — the seam no other test crosses. It compiles those sources by
+      # `#[path]`, so it is production code, not a copy.
+      #
+      # ⚠ Without this step those tests SKIP, and a skip is not a pass: the
+      # first CI run of them reported "8 tests skipped" on a green job. That is
+      # exactly the "green that hides the gap" failure this suite exists to
+      # prevent, so the tests also require the artifact when
+      # `VRCXK_REQUIRE_HANDS_E2E=1` (set below) — a missing binary is then a
+      # FAILURE rather than a silent skip.
+      - name: Build hands e2e peer (for the integration test)
+        run: cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml
+
       - name: Bun tests (frontend + host)
         run: bun run test
+        env:
+          VRCXK_REQUIRE_HANDS_E2E: "1"
 
       - name: Frontend build
         run: bun run build
