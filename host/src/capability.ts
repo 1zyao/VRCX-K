@@ -1,5 +1,12 @@
 import { type Context, Service, symbols } from "cordis"
+import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
+import { callerEntryId, findOverreach, formatOverreach } from "./overreach"
 import type { AppInfo, OsInfo, PathKind, ShellStdioBridge, ShellSysAPI } from "./stdio"
+
+// Re-exported so callers that already import the caller helpers from this module
+// keep working; the implementation lives in `overreach.ts`, which owns the whole
+// declaration-vs-actual rule (importing the other way would be a cycle).
+export { callerEntryId }
 
 type ShellApi = ShellSysAPI["shell"]
 
@@ -81,7 +88,23 @@ export function callerName(self: unknown): string | null {
  */
 export class ShellHandle {
   bridge?: ShellStdioBridge
+  /**
+   * Looks up a plugin's manifest by `entry.id`, for overreach detection (#24).
+   *
+   * Injected rather than imported so `capability.ts` keeps no dependency on the
+   * manifest registry (which is built during bootstrap and lives behind a
+   * WeakMap). Absent means the check is OFF — a host with no loader (tests, the
+   * shell-less dev mode) has no manifests to compare against, and must not start
+   * warning about every call.
+   */
+  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
+
   constructor(private readonly audit: CapabilityAudit) {}
+
+  /** Enable overreach detection by supplying the manifest registry lookup. */
+  useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
+    this.manifestLookup = lookup
+  }
 
   attach(bridge: ShellStdioBridge): void {
     this.bridge = bridge
@@ -104,6 +127,18 @@ export class ShellHandle {
     const who = callerName(self) ?? "<unknown>"
     const detail = args.length > 0 ? ` ${args.map(describe).join(", ")}` : ""
     this.audit(`[cap] ${who} -> ${method}${detail}`)
+
+    // Overreach: declared vs actual (#24). Warn only — never refuse. See
+    // `overreach.ts` for why an enforcement layer cannot exist at this stage.
+    if (this.manifestLookup) {
+      const entryId = callerEntryId(self)
+      const finding = findOverreach(
+        entryId,
+        method,
+        entryId ? this.manifestLookup(entryId) : undefined,
+      )
+      if (finding) this.audit(formatOverreach(finding))
+    }
   }
 }
 

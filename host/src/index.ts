@@ -15,7 +15,7 @@ import { declaresHeartbeat, FIBER_ACTIVE, FIBER_FAILED } from "./fiber"
 import { HandsService } from "./hands"
 import { stopOnShellLost, stopOnStdinLoss } from "./lifecycle"
 import { log } from "./log"
-import { loadManifests } from "./manifests"
+import { loadManifests, manifestRegistryOf } from "./manifests"
 import { makeRestartRequester } from "./restart"
 import { AutostartService } from "./shell-extras"
 import { ShortcutService } from "./shortcut"
@@ -271,6 +271,18 @@ async function bootstrap() {
   // plugin is in the tree, an absent declaration simply means there is nothing
   // to compare its capability usage against (design P2: show, never block).
   await loadManifests(ctx, includeEntry)
+
+  // Enable overreach detection now that manifests exist (#24). Wired AFTER the
+  // load, because the lookup reads the registry `loadManifests` just built — and
+  // left OFF until then, so a plugin loading during bootstrap cannot produce a
+  // "no manifest" warning for a manifest that simply had not been read yet.
+  //
+  // ⚠ Declare-and-warn only, never a refusal: plugins are in-process, so a
+  // determined one can bypass this with a plain `import`. See `overreach.ts`.
+  const registry = manifestRegistryOf(ctx)
+  if (registry) {
+    capabilities.useManifests((entryId) => registry.get(entryId))
+  }
 
   // ── Dev watcher (issue #11) — strictly opt-in ──────────────────────────
   let devWatch: DevWatch | undefined
