@@ -240,7 +240,7 @@ fn next_id(prefix: &str) -> String {
 ///
 /// | shape | cost vs payload |
 /// |---|---|
-/// | `"AAEC…"` — base64 string | **1.33x** (the documented carrier) |
+/// | `"AAEC…"` — base64 string | **1.33x** (what we send) |
 /// | `{"type":"Buffer","data":[…]}` — a Node `Buffer` | ~4-6x |
 /// | `{"0":65,"1":66,…}` — a raw `Uint8Array` | **11.4x** |
 ///
@@ -249,6 +249,14 @@ fn next_id(prefix: &str) -> String {
 /// and both are worse than a correct transfer that merely costs bandwidth. The
 /// waste is the sender's, and it stays visible — this function's cost is written
 /// down here so nobody re-derives "binary over JSON is fine".
+///
+/// ⚠ **This is a property of the STOCK JSON CODEC, not of the pipe.** kkrpc
+/// exposes `createTransport({ platform, codec })`, so a length-prefixed binary
+/// framing is possible over the SAME single pipe — measured at 1.8-2.1x faster
+/// than base64 with no desynchronisation
+/// (`docs/probes/hand-io/04-binary-framing.mjs`; FINDINGS §5.1). The cost is
+/// changing BOTH ends, not impossibility. The three shapes below exist because we
+/// currently keep the stock codec — not because bytes are impossible here.
 fn decode_chunk(value: Option<&Value>) -> Result<Vec<u8>, String> {
     let Some(value) = value else {
         return Err("stream frame carries no value".into());
@@ -1503,8 +1511,15 @@ mod tests {
 
     #[test]
     fn a_base64_chunk_is_decoded() {
-        // The documented carrier. 1.33x the payload, and the only shape the host
-        // is supposed to send.
+        // The carrier we SEND: 1.33x the payload and the cheapest of the three
+        // shapes reachable through the stock JSON codec.
+        //
+        // ⚠ "cheapest available", not "required by the protocol". kkrpc lets the
+        // platform and codec be replaced (`createTransport({platform, codec})`),
+        // and a length-prefixed binary framing over the SAME pipe is measured at
+        // 1.8-2.1x faster than base64 (docs/probes/hand-io/04-binary-framing.mjs,
+        // FINDINGS §5.1). Adopting it requires changing BOTH ends — that is the
+        // cost, not an impossibility. Do not describe base64 as a contract.
         let decoded = decode_chunk(Some(&json!("AAEC"))).expect("decode");
         assert_eq!(decoded, vec![0u8, 1, 2]);
     }

@@ -343,9 +343,16 @@ async function* decodeStream(stream: AsyncIterable<unknown>): AsyncIterable<Uint
 /**
  * Re-encode bytes as base64 for the wire.
  *
- * The shell accepts three carriers (it decodes base64, Node `Buffer` and numeric
- * `Uint8Array` maps) but base64 is the one it sends and the cheapest of the
- * three — the other two cost 4-11x the payload once JSON has seen them.
+ * ⚠ base64 is our CHOICE, not a protocol requirement. The shell accepts three
+ * carriers (base64, Node `Buffer`, numeric `Uint8Array` maps) and base64 is the
+ * cheapest of them — the other two cost 4-11x once JSON has seen them.
+ *
+ * But that ranking only holds while the stock JSON codec is in place. kkrpc lets
+ * the platform and codec be replaced (`createTransport({ platform, codec })`), and
+ * a length-prefixed binary framing over the SAME single pipe measures 1.8-2.1x
+ * faster than base64 with no desynchronisation
+ * (`docs/probes/hand-io/04-binary-framing.mjs`). The cost is changing both ends,
+ * not impossibility — so do not describe base64 as a contract.
  */
 async function* encodeStream(stream: AsyncIterable<Uint8Array>): AsyncIterable<string> {
   for await (const chunk of stream) {
