@@ -1,7 +1,13 @@
 # `ctx.hands` 宿主侧方案（含审计）
 
-> **状态**：**方案，待实现**。手侧四个原语已落地（PR #40）；本文是把它们接成
-> 插件可用能力面的宿主侧设计。
+> **状态**：**已落地**（PR #40）。本文原是一份方案；§6 的落地步骤 1–5 **全部已实现**，
+> 手侧五个原语（含 `list` 与 `hands.hello`）也已落地。
+>
+> ⚠ **本文仍是「为什么这样设计」的主副本**，不是实现清单 —— 实现以
+> `host/src/hands.ts` / `host/src/stdio.ts` / `host/src/overreach.ts` 为准。
+> 保留方案文字是因为**取舍的理由**在这里（尤其 §4.2 根 ctx 的处置、§5 的成因分离），
+> 而那些理由在代码里只剩结论。
+>
 > **日期**：2026-09。
 > **关系**：形状来自 [`hands-capability-proposal.md`](hands-capability-proposal.md)；
 > 本文只增补**宿主侧的新实测**与落地步骤。冲突以实测为准。
@@ -10,7 +16,7 @@
 
 ## 0. 一句话与三个前提
 
-把 `hands.stat/read/write/watch` 包成 `ctx.hands`（`Service` 子类），**每条流绑调用者
+把 `hands.stat/read/write/watch/list` 包成 `ctx.hands`（`Service` 子类），**每条流绑调用者
 的生命周期**，并让每次调用**可归因、可审计**。
 
 落地前必须先解决三件事，三件都有本轮实测：
@@ -352,7 +358,7 @@ read(path, opts) {
 
 | 本文内容 | 主副本 |
 |---|---|
-| 手侧四原语、错误码、背压、平台陷阱 | [`hands-capability-proposal.md`](hands-capability-proposal.md) + `src-tauri/src/hands.rs` |
+| 手侧五原语、错误码、背压、平台陷阱、路径语义 | [`hands-capability-proposal.md`](hands-capability-proposal.md) + `src-tauri/src/hands.rs` |
 | 通道/流帧/宿主消费 | [`probes/probe-host-streaming-channel.ts`](../docs/probes/probe-host-streaming-channel.ts) |
 | 生命周期绑定与泄漏 | [`probes/probe-host-stream-lifecycle.ts`](../docs/probes/probe-host-stream-lifecycle.ts)、[`probe-host-stream-leak.ts`](../docs/probes/probe-host-stream-leak.ts)、[`probe-host-effect-economy.ts`](../docs/probes/probe-host-effect-economy.ts) |
 | 队头阻塞（真 peer 真管道） | [`probes/hands-e2e/hol.mjs`](../docs/probes/hands-e2e/hol.mjs) |
