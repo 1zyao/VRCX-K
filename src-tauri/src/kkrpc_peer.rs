@@ -647,6 +647,39 @@ impl Peer {
     /// The producer is taken OUT of the table for the duration of each chunk so
     /// the lock is never held across file I/O, and `cancelled` decides whether it
     /// goes back — see [`StreamTable::cancelled`].
+    ///
+    /// # ⚠ This loop runs on the READER THREAD, and that is a measured latency bug
+    ///
+    /// The reader thread cannot call `read_line` again until this whole batch is
+    /// emitted, so an inbound interactive request waits out the **remaining
+    /// credit** — not one chunk.
+    ///
+    /// Measured (`docs/probes/hands-e2e/hol-credit.mjs`, MID vs END probe at equal
+    /// credit): the interactive p95 is **linear in the outstanding credit**, at
+    /// ~1.7 ms per outstanding chunk, while the batch-end probe sits at idle.
+    ///
+    /// | credit | p95 mid-batch | p95 at batch end |
+    /// |---|---|---|
+    /// | 4  | 6.9 ms | 0.34 ms |
+    /// | 32 | 50.8 ms | 0.32 ms |
+    ///
+    /// It also **explains** the raw 51x tail seen in `hol.mjs`: kkrpc's consumer
+    /// opens with `pull n=32` and replenishes 16 at a time
+    /// (`node_modules/kkrpc/dist/streaming.js`), so 1.7 x 32 ~= 54 ms against a
+    /// measured max of 55.7 ms, and 1.7 x 16 ~= 27 ms against a measured p95 of
+    /// 24.3 ms.
+    ///
+    /// ⇒ The cause is neither pipe queueing nor "the peer is busy with base64":
+    /// it is **dispatch starvation caused by batching on the reader thread**. A
+    /// cheaper carrier shortens each iteration but does not remove the wait for
+    /// the whole batch.
+    ///
+    /// The real fix is to give producers their OWN thread, exactly as
+    /// [`Peer::open_event_stream`] already does for watches (whose comment states
+    /// this hazard — the producer path has the same one). Do not "fix" it by
+    /// lowering the credit alone: throughput scales with it (87 MiB/s at credit 1
+    /// vs 171 MiB/s at 32), and emitting a single chunk per pull would **deadlock**,
+    /// because kkrpc's consumer only replenishes once `consumedSincePull >= 16`.
     fn pump_producer(self: &Arc<Self>, sid: &str, credit: usize) {
         for _ in 0..credit {
             let mut producer = {

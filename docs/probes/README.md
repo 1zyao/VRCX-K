@@ -220,23 +220,52 @@ a host that forgets still transfers correctly rather than silently corrupting.
 
 ### `hands-e2e/hol.mjs` — head-of-line blocking on the real peer
 
-Takes the proposal's §5 **inference** and measures it on the actual Rust peer over
-a real pipe: round-trip latency of `hands.stat` while a 128 MiB `hands.read`
-stream is flowing, plus a post-load control.
-
 ```bash
 node docs/probes/hands-e2e/hol.mjs --size=134217728 --samples=100
 ```
 
-Result: **p50 barely moves (1.28x) but p95 degrades 51x** (0.37 → 18.85 ms), and
-latency recovers after the stream stops. That **corrects** §5's "bulk will make
+Result: **p50 barely moves (1.16–1.28x) but p95 degrades ~51–59x**, and latency
+recovers after the stream stops. That **corrects** §5's "bulk will make
 interaction feel stuck" — the cost is in the tail, not the median.
 
-⚠ Two honesty notes carried in the file itself: the loaded tail could come from
-**queueing** OR from the peer simply being **busy** (its reader thread both pumps
-chunks and answers requests), and this probe **cannot separate** them. And a
-loopback measurement cannot license any cross-machine conclusion — the same
-discipline as [`transport-lab`](transport-lab/FINDINGS.md) §8.
+⚠ The cause was **not** separated by this probe; `hol-credit.mjs` below is what
+does it. A loopback measurement also cannot license any cross-machine conclusion —
+the same discipline as [`transport-lab`](transport-lab/FINDINGS.md) §8.
+
+### `hands-e2e/hol-credit.mjs` — WHAT the tail scales with (the cause)
+
+Separates the three candidate causes for the tail above, by comparing two probe
+positions **at the same credit and in the same run**, so throughput and per-chunk
+cost are held constant and only "is the producer mid-batch?" varies:
+
+```bash
+node docs/probes/hands-e2e/hol-credit.mjs --sizeMiB=64 --credits=4,8,16,32
+```
+
+| credit | MID p95 (producer pumping) | END p95 (credit exhausted) |
+|---|---|---|
+| 4 | 6.9 ms | 0.34 ms |
+| 16 | 28.5 ms | 0.55 ms |
+| 32 | 50.8 ms | 0.32 ms |
+
+**The tail is linear in the outstanding credit (~1.7 ms/chunk), and END is flat
+at idle.** ⇒ the reader thread is starved by `pump_producer`'s
+`for _ in 0..credit` loop: it does not return to `read_line` until the whole batch
+is emitted. This also **explains the raw 51x**: kkrpc's consumer opens with
+`pull n=32` and replenishes 16 at a time (`node_modules/kkrpc/dist/streaming.js`),
+so 1.7 × 32 ≈ 54 ms (measured max 55.7) and 1.7 × 16 ≈ 27 ms (measured p95 24.3).
+
+⚠ **The first version of this probe was invalid and is worth knowing about**: it
+probed only at batch END, where the producer is *necessarily* blocked awaiting
+credit — so it measured the idle window and reported "the tail does not scale with
+credit" (1.2–1.8x). **A failure that does not vary with the variable is the
+instrument** (this README's own rule). MID and END must be compared at the same
+credit.
+
+⚠ **Reducing credit is not a free fix**: at credit=1 the tail vanishes (0.44 ms)
+but throughput drops 171 → 87 MiB/s, and sending one chunk per pull would
+**deadlock** — kkrpc's consumer replenishes only after 16 values
+(`!(consumedSincePull < 16)`).
 
 ## Host-side streaming probes (single-file, root of `docs/probes/`)
 
