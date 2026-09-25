@@ -5,7 +5,7 @@ import { RPCChannel } from "kkrpc"
 import { stdioJsonTransport } from "kkrpc/stdio"
 import type { HostStdioAPI, ShellSysAPI } from "../src/stdio"
 import type { HostWsReady } from "../src/ws"
-import { killTree, resolveBun, warmBun } from "./helpers"
+import { killTree, pipe, resolveBun, warmBun } from "./helpers"
 
 const hostDir = join(import.meta.dir, "..")
 const bun = resolveBun()
@@ -15,20 +15,6 @@ beforeAll(async () => {
 }, 60_000)
 
 let child: ReturnType<typeof spawn> | undefined
-
-/**
- * The pipe end of the spawned child, checked.
- *
- * `spawn` types these as optional (they depend on `stdio`), but this test always
- * passes `["pipe","pipe","pipe"]`. Throwing names a mis-spawned fixture instead
- * of crashing on `undefined` inside the transport.
- */
-function pipe<T>(end: T | undefined | null, name: string): T {
-  if (end === undefined || end === null) {
-    throw new Error(`spawned host has no ${name} pipe (was it spawned with "pipe"?)`)
-  }
-  return end
-}
 
 afterEach(() => {
   if (child?.pid) killTree(child.pid)
