@@ -260,7 +260,39 @@ export class HandsService extends Service {
     })
   }
 
-  /** Write a stream of bytes; resolves with the true byte count. */
+  /**
+   * Write a stream of bytes; resolves with the true byte count.
+   *
+   * # Why this primitive is NOT `guarded(...)` — deliberate, not an oversight
+   *
+   * `read`/`watch`/`list` hand back a stream the CALLER pulls. If the caller
+   * walks away mid-iteration the producer would keep producing for nobody — the
+   * measured leak this file's header cites (16 chunks after the owning plugin was
+   * unloaded) — so the guard's job there is to CANCEL the producer.
+   *
+   * `write` has no such orphan to cancel. The consumer of the caller's bytes is
+   * the SHELL, inside the pending `this.api.write(...)`; that drain lives exactly
+   * as long as the call that started it, because the answer ("how many bytes") is
+   * only knowable after the last chunk — which is why the shell defers the reply.
+   * The only actor that can go away is the CALLER, and a caller that abandons a
+   * promise it is awaiting is not a reason to stop writing bytes it already asked
+   * to write: a half-written file plus a cancelled reply is a worse outcome than
+   * a completed write, and there is no host-side cancel for a deferred-reply call
+   * to invoke anyway (`guarded()`'s abort path ends in `iterator.return()`, which
+   * a write has no equivalent of; releasing the registration alone would just
+   * drop the record of a write that is still running).
+   *
+   * ⚠ The consequence, stated plainly and PINNED by
+   * `write keeps draining after its calling plugin is unloaded` in
+   * `host/tests/hands-service.test.ts`: disposing the calling fiber while a write
+   * is in flight does NOT stop it — the caller's generator is drained to the end
+   * and the shell still receives every chunk. That test exists so this behaviour
+   * cannot drift silently in either direction (a future guard, or a future
+   * early-return, changes it and fails).
+   *
+   * Audit coverage is unaffected: `record` runs at CALL time, so a write that is
+   * started and then abandoned still leaves its trace (same rule as `read`).
+   */
   async write(
     path: string,
     data: AsyncIterable<HandsChunk>,
@@ -369,9 +401,21 @@ export class HandsService extends Service {
         return {
           async next(): Promise<IteratorResult<T>> {
             if (released) return { done: true, value: undefined }
-            if (!iterator) iterator = (await open())[Symbol.asyncIterator]()
             let result: IteratorResult<T>
             try {
+              // ⚠ `open()` MUST run inside this try, not before it. It is the call
+              // most likely to reject — "no shell attached" is a plain
+              // `HandsError`, and a peer refusal travels over the wire — and a
+              // rejection here used to skip `stop()` entirely, so the guard
+              // registered in `[Symbol.asyncIterator]()` above was never
+              // released. Measured consequence: 50 failing `for await` iterations
+              // against an unattached shell left 50 registrations on the caller's
+              // fiber, all of them surviving until unload (pinned by "a stream
+              // call whose open() REJECTS still releases its registration"). The
+              // success path is untouched: `open()` still runs exactly once
+              // (guarded by `!iterator`) and its failure now takes the same
+              // `stop()` + `asHandsError` path as `iterator.next()`.
+              if (!iterator) iterator = (await open())[Symbol.asyncIterator]()
               result = await iterator.next()
             } catch (error) {
               // ⚠ Stream failures must be translated too. `stat`/`write` wrap

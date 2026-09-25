@@ -64,6 +64,15 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   return out
 }
 
+/** A promise plus its resolver, for tests that must block the shell mid-call. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {}
+  const promise = new Promise<void>((settle) => {
+    resolve = settle
+  })
+  return { promise, resolve }
+}
+
 describe("the raw mirror is not usable without a shell", () => {
   test("a stat with no shell attached fails with a clear code", async () => {
     const ctx = new Context()
@@ -187,6 +196,106 @@ describe("write re-encodes to the carrier the shell sends", () => {
     expect(result.bytes).toBe(999)
     expect(result.endOffset).toBe(1500)
   })
+})
+
+describe("write: deliberately NOT guarded, and the behaviour that keeps it honest", () => {
+  test("write keeps draining after its calling plugin is unloaded", async () => {
+    // ⚠ This test pins a DELIBERATE difference, not a desired feature.
+    //
+    // `read`/`watch`/`list` return a stream the CALLER pulls, so an abandoned
+    // consumer must be able to cancel the producer — that is `guarded()`, and the
+    // measured leak above (16 chunks after unload) is why it exists.
+    //
+    // `write` has no orphan to cancel: the consumer is the SHELL, inside the
+    // pending `this.api.write(...)`, and the reply is DEFERRED because "how many
+    // bytes" is only knowable after the last chunk. Stopping it at caller-unload
+    // would mean a half-written file plus a cancelled reply — worse than a write
+    // that completes — and the caller's generator is not "leaking" work nobody
+    // asked for; every chunk it yields is a chunk the caller already handed over.
+    //
+    // So the behaviour is: unload does NOT stop an in-flight write. If someone
+    // later wraps `write` in `guarded()` without re-reading the reasoning in
+    // `hands.ts`, this test fails and forces the decision to be made explicitly.
+    const ctx = new Context()
+    let writesSeen = 0
+    const gate = deferred()
+
+    const svc = new HandsService(ctx, {})
+    svc.attachShell({
+      hands: {
+        stat: async () => null,
+        read: () => emptyStream(),
+        // The shell holds the call open past the unload, then reports the count.
+        write: async (_path: string, data: AsyncIterable<unknown>) => {
+          for await (const _chunk of data) {
+            writesSeen += 1
+            if (writesSeen === 1) await gate.promise // block while the plugin is disposed
+          }
+          return { bytes: writesSeen * 3, endOffset: writesSeen * 3, mode: "create" }
+        },
+        watch: () => emptyStream(),
+        list: () => emptyStream(),
+      },
+    } as unknown as ShellStdioBridge)
+
+    // An endless caller: if anything ever DID try to cancel the drain, this would
+    // be where it showed up.
+    let produced = 0
+    let sourceReturned = false
+    async function* endless(): AsyncIterable<Uint8Array> {
+      try {
+        while (true) {
+          produced += 1
+          yield new Uint8Array([0, 1, 2])
+          if (produced >= 4) return // bounded so the test terminates
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+      } finally {
+        sourceReturned = true
+      }
+    }
+
+    // Held in an object, not a `let`: the value is produced by a callback the
+    // test awaits around, and a property read is not subject to the narrowing a
+    // captured `let` gets.
+    const outcome: { result?: { bytes: number; endOffset: number; mode: string } } = {}
+    const plugin = ctx.plugin(function writingPlugin(inner: Context) {
+      // Fire-and-forget, exactly like the `read` leak test: a real plugin must not
+      // block its own load on a long write. Nothing awaits this, which is the
+      // point — the plugin goes away while the promise is still pending.
+      void inner.hands
+        .write("/tmp/out", endless())
+        .then((result) => {
+          outcome.result = result
+        })
+        .catch(() => {})
+    })
+    await plugin
+
+    // Wait until the shell has really started consuming before unloading.
+    const deadline = Date.now() + 5_000
+    while (writesSeen === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(writesSeen).toBe(1)
+    expect(produced).toBeGreaterThan(0)
+
+    // Unload the owner mid-write. Under `guarded()` this is where the drain would
+    // stop; here it must NOT.
+    ;(plugin as unknown as { dispose: () => void }).dispose()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    gate.resolve() // let the shell's blocked first iteration finish
+
+    const doneDeadline = Date.now() + 5_000
+    while (outcome.result === undefined && Date.now() < doneDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+
+    // The write ran to the end of the caller's generator and reported real bytes.
+    expect(sourceReturned).toBe(true)
+    expect(writesSeen).toBe(4)
+    expect(outcome.result).toEqual({ bytes: 12, endOffset: 12, mode: "create" })
+  }, 15_000)
 })
 
 describe("error surface: codes survive and stay distinguishable", () => {
@@ -352,6 +461,102 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
     const after = rootFiber._disposables?.length ?? 0
     // 50 reads must not leave 50 registrations behind.
     expect(after - before).toBeLessThan(5)
+  })
+
+  test("a stream call whose open() REJECTS still releases its registration", async () => {
+    // ⚠ THE regression for the leak this pair of tests pins down.
+    //
+    // `guarded()` registers on the caller's ctx inside `[Symbol.asyncIterator]()`,
+    // and `stop()` is the only thing that releases it. `open()` used to run
+    // BEFORE the `try` in `next()`, so its rejection skipped `stop()` entirely:
+    // a failing stream call — no shell attached, or a peer that refuses the
+    // stream — leaked one registration per call. Measured: 50 failing `for await`
+    // iterations with no shell attached left 50 extra registrations that lived
+    // until unload.
+    //
+    // The count is read the way the two tests above read it (the root fiber's
+    // `_disposables`), so on the OLD code this reports `after - before === 50`
+    // for path (a) alone.
+    //
+    // ⚠ Each path gets its OWN Context: two `HandsService` instances on one ctx
+    // collide (`service "hands" has been registered at <root>`, cordis index.js
+    // `:1158`), because providing is not instance-scoped.
+    type RootFiberCounter = { fiber: { _disposables?: { length?: number } } }
+
+    /** Count leak for one rejection path, driven `rounds` times. */
+    async function leakedRegistrations(
+      rounds: number,
+      make: (ctx: Context) => HandsService,
+    ): Promise<number> {
+      const ctx = new Context()
+      const svc = make(ctx)
+      const rootFiber = (ctx as unknown as RootFiberCounter).fiber
+      const before = rootFiber._disposables?.length ?? 0
+      for (let i = 0; i < rounds; i++) {
+        await expect(collect(svc.read(`/tmp/f${i}`))).rejects.toThrow(/no shell attached/)
+      }
+      return (rootFiber._disposables?.length ?? 0) - before
+    }
+
+    // (a) No bridge at all: `this.api` throws `EUNSUPPORTED: no shell attached`,
+    // which is the "shell is not attached" half of the report.
+    const noShell = await leakedRegistrations(50, (ctx) => new HandsService(ctx, {}))
+
+    // (b) A shell that IS attached but refuses the stream. The real mirror throws
+    // SYNCHRONOUSLY here rather than rejecting, which is the same `open()` path
+    // and the reason the fix has to live inside the `try` rather than in a
+    // `.catch()` on a promise.
+    const refused = await leakedRegistrations(50, (ctx) => {
+      const svc = new HandsService(ctx, {})
+      svc.attachShell({
+        hands: {
+          stat: async () => null,
+          read: () => {
+            throw new Error("EUNSUPPORTED: no shell attached")
+          },
+          write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+          watch: () => emptyStream(),
+          list: () => emptyStream(),
+        },
+      } as unknown as ShellStdioBridge)
+      return svc
+    })
+
+    // 50 failing stream calls must not leave 50 registrations behind each. The
+    // bound is tight because the old-code failure mode is exactly 50 per path,
+    // not 4.
+    expect(noShell).toBeLessThan(5)
+    expect(refused).toBeLessThan(5)
+  })
+
+  test("a failing stream call is still a HandsError, not a raw Error", async () => {
+    // The same fix must preserve the ERROR SURFACE of the rejection path: a
+    // caller branching on `.code` must not silently get `undefined` because the
+    // failure happened in `open()` rather than in `iterator.next()`. Coded and
+    // uncoded failures are both pinned, since `HandsError` keeps `undefined` for
+    // a message with no known code rather than inventing one.
+    const ctx = new Context()
+    const coded = new HandsService(ctx, {})
+    coded.attachShell({
+      hands: {
+        stat: async () => null,
+        read: () => {
+          throw new Error("ENOENT: /tmp/gone")
+        },
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        watch: () => emptyStream(),
+        list: () => emptyStream(),
+      },
+    } as unknown as ShellStdioBridge)
+
+    const failure = await collect(coded.read("/tmp/gone")).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(failure).toBeInstanceOf(HandsError)
+    expect((failure as HandsError).code).toBe("ENOENT")
+    // The prefix is stripped, as it is on every other path.
+    expect((failure as HandsError).message).toBe("/tmp/gone")
   })
 
   test("breaking out of a stream releases its registration", async () => {
