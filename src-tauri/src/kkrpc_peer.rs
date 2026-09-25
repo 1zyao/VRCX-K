@@ -1962,6 +1962,12 @@ mod tests {
 
     #[test]
     fn a_producer_that_ends_sends_a_terminal_frame_and_is_forgotten() {
+        // ⚠ The close is ASYNCHRONOUS: the producer owns its own thread, so the
+        // terminal frame is written by that thread and the handle is closed on its
+        // way out — a hair AFTER the frame the reader just observed. Asserting
+        // `closed` immediately is therefore a race (this failed only when several
+        // `cargo test` runs shared the machine). Poll for the invariant; see the
+        // sibling test below for the same lesson on the cancellation path.
         let mut h = Harness::new();
         let closed = Arc::new(Mutex::new(false));
         h.peer
@@ -1983,10 +1989,18 @@ mod tests {
         assert_eq!(h.next_frame()["d"], json!(false));
         let terminal = h.next_frame();
         assert_eq!(terminal["d"], json!(true), "clean end must be terminal");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !*closed.lock().unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             *closed.lock().unwrap(),
             "a finished producer must be closed, not left holding a handle"
         );
+
+        // The table entry is removed BEFORE the terminal frame is written (that
+        // is how the ending is claimed), so this one is not racy.
         assert!(
             h.peer.streams.lock().unwrap().producers.is_empty(),
             "a finished stream must not be retained"

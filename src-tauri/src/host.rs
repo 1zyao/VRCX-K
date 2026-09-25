@@ -1217,6 +1217,18 @@ fn start_host_process(app: Option<&AppHandle>) -> Result<StartingHost, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    // ⚠ Tell the host WHERE to write its log file, because on a release build it
+    // has nowhere else to put it. The shell is `windows_subsystem = "windows"`
+    // (`main.rs`), so there is no console and the host's stderr — where every
+    // `[cap]` audit line and every `#24` overreach warning goes — is discarded.
+    // Without this the whole declare-and-warn feature was invisible on a user's
+    // machine, which is exactly what `#24` promises it is not.
+    //
+    // The shell owns the location because it is the component that knows the
+    // app's data directory; the host is a sidecar and must not guess it.
+    if let Some(dir) = host_log_dir(app) {
+        cmd.env("VRCXK_LOG_DIR", dir);
+    }
     let mut tree = ProcessTree::spawn(&mut cmd).map_err(|err| {
         format!(
             "spawn {} in {}: {err}",
@@ -1566,6 +1578,24 @@ fn resolve_host_launch(app: Option<&AppHandle>) -> Result<HostLaunch, String> {
     let cwd_override = std::env::var_os("VRCXK_HOST_DIR").map(PathBuf::from);
     let resource_dir = app.and_then(|app| app.path().resource_dir().ok());
     resolve_host_launch_with(resource_dir, explicit, cwd_override, tauri::is_dev())
+}
+
+/// Where the host should write its log file, if we can determine it.
+///
+/// ⚠ This exists because the host's stderr goes NOWHERE in a release build. The
+/// shell is `windows_subsystem = "windows"` (`main.rs`), so there is no console
+/// attached; on desktop the host is spawned with `stderr(Stdio::inherit())`, which
+/// inherits a handle that leads to no window. Every `[cap]` audit line and every
+/// `#24` overreach warning was therefore written and thrown away, while `#24`
+/// states its whole honest scope as "undeclared access becomes VISIBLE".
+///
+/// The SHELL resolves this because it owns the app's data directory; the host is a
+/// sidecar and cannot know the user's profile layout. `None` means "no log file",
+/// which the host must treat as "stay on stderr" rather than as an error — that is
+/// the correct behaviour in dev and in tests, where stderr IS readable.
+fn host_log_dir(app: Option<&AppHandle>) -> Option<String> {
+    let dir = app?.path().app_log_dir().ok()?;
+    Some(dir.to_string_lossy().into_owned())
 }
 
 /// Pure core of `resolve_host_launch` (inputs passed in for testability).
