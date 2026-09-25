@@ -90,7 +90,7 @@ function fakeBridge(seen: string[]): ShellStdioBridge {
     hands: {
       stat: async () => null,
       read: () => emptyStream(),
-      write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+      write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
       watch: () => emptyStream(),
       list: () => emptyStream(),
     },

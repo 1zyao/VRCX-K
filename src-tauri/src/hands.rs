@@ -624,8 +624,8 @@ fn register_write(peer: &Arc<Peer>) {
                     // Resolved by `open` already; re-resolving cannot fail here
                     // (it validated the same `opts`), but the error is propagated
                     // rather than unwrapped so a future divergence is loud.
-                    let mode = match writer_mode(&opts) {
-                        Ok(mode) => mode,
+                    let mode = match write_intent(&opts) {
+                        Ok(intent) => intent.label(),
                         Err(error) => {
                             reply.fail(error);
                             return;
@@ -651,42 +651,128 @@ fn register_write(peer: &Arc<Peer>) {
     );
 }
 
-/// The write mode, or an error naming the accepted values.
+/// How a write should open the file.
 ///
-/// ⚠ This returned a bare `"create"` for ANY unrecognised input, which is a
-/// silent downgrade rather than a rejection: `create` does not truncate, so a
-/// typo (`"overwrite"`, `"trunc"`, a non-string, a missing field) quietly became
-/// "write over the head of the file and leave the old tail". Measured through a
-/// real peer: 100 bytes over a 10 240-byte file reported `endOffset: 100` while
-/// the file on disk was still 10 240 bytes — a reply that reads like a successful
-/// overwrite of a file it never truncated.
+/// ⚠ WHY THIS REPLACED A `mode` ENUM, and what the enum got wrong.
 ///
-/// ⚠ The same function ALREADY rejects one illegal combination (`append` with
-/// `offset > 0`), so refusing a bad `mode` is the established behaviour here, not
-/// a new strictness.
+/// The old `mode: "create" | "truncate" | "append"` made ONE field carry TWO
+/// independent decisions, and its default resolved them in a way that corrupted
+/// files. Measured through a real peer: writing 11 bytes over a 20-byte JSON file
+/// replied `{bytes: 11, endOffset: 11, mode: "create"}` while the file on disk
+/// became `{"alpha":9}"beta":2}` — invalid JSON, reported as success. The default
+/// did not truncate, but the contract said "overwrite from 0".
 ///
-/// A MISSING `mode` still means `create` — that is the documented default, not a
-/// typo, and changing it would break every existing caller. Anything PRESENT but
-/// unrecognised is refused.
-fn writer_mode(opts: &Value) -> Result<&'static str, String> {
-    match opts.get("mode") {
-        None | Some(Value::Null) => Ok("create"),
-        Some(Value::String(mode)) => match mode.as_str() {
-            "create" => Ok("create"),
-            "append" => Ok("append"),
-            "truncate" => Ok("truncate"),
-            other => Err(encode_error(
-                Code::Unsupported,
-                format!(
-                    "hands.write: unknown mode {other:?} (expected create, append or truncate)"
-                ),
-            )),
-        },
-        Some(other) => Err(encode_error(
-            Code::Unsupported,
-            format!("hands.write: `mode` must be a string, got {other}"),
-        )),
+/// The two decisions are genuinely orthogonal:
+///
+/// | caller intent | offset | truncate |
+/// |---|---|---|
+/// | rewrite a file (config, export) | 0 | **true** |
+/// | resume a transfer (from `endOffset`) | told by `read` | **false** |
+/// | patch bytes in place | told by the caller | **false** |
+/// | append to a rolling log | end, **atomically** | **false** |
+///
+/// So the default is now `truncate: true` (matching the documented contract), and
+/// RESUME — which must never truncate — says so explicitly by passing
+/// `truncate: false`. Neither intent has to guess what the other's default is.
+///
+/// ⚠ `append` stays its own flag rather than being "offset = end": it opens with
+/// `O_APPEND`, which makes concurrent writers race-free. `seek(end)` then `write`
+/// is a read-modify-write and loses data when two writers interleave; that is
+/// measured (`append_mode_ignores_a_moved_cursor`) and is the whole reason a
+/// rolling log works.
+#[derive(Debug, Clone, Copy)]
+struct WriteIntent {
+    /// Where to start writing. `None` = 0 (or the end, for `append`).
+    offset: Option<u64>,
+    /// Cut the file at the write position before writing.
+    truncate: bool,
+    /// Open with `O_APPEND` instead of seeking.
+    append: bool,
+}
+
+impl WriteIntent {
+    /// The name reported back to the caller, for observability.
+    fn label(self) -> &'static str {
+        if self.append {
+            "append"
+        } else if self.truncate {
+            "truncate"
+        } else {
+            "overwrite"
+        }
     }
+}
+
+/// Parse `{ offset, truncate, append }`, refusing contradictions rather than
+/// silently picking a winner.
+fn write_intent(opts: &Value) -> Result<WriteIntent, String> {
+    let offset = match opts.get("offset") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or_else(|| {
+            encode_error(
+                Code::Unsupported,
+                format!("hands.write: `offset` must be a non-negative integer, got {value}"),
+            )
+        })?),
+    };
+    let truncate = match opts.get("truncate") {
+        None | Some(Value::Null) => true, // The documented default: rewrite the file.
+        Some(Value::Bool(flag)) => *flag,
+        Some(other) => {
+            return Err(encode_error(
+                Code::Unsupported,
+                format!("hands.write: `truncate` must be a boolean, got {other}"),
+            ));
+        }
+    };
+    let append = match opts.get("append") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(other) => {
+            return Err(encode_error(
+                Code::Unsupported,
+                format!("hands.write: `append` must be a boolean, got {other}"),
+            ));
+        }
+    };
+
+    // Contradictions are refused, not resolved. Each of these has an obvious
+    // "what the caller probably meant", and guessing is how the previous design
+    // produced a silent overwrite of a file it never truncated.
+    if append && offset.is_some_and(|offset| offset > 0) {
+        return Err(encode_error(
+            Code::Unsupported,
+            "hands.write: `append` and `offset > 0` are mutually exclusive",
+        ));
+    }
+    if append && truncate && opts.get("truncate").is_some() {
+        // `truncate: true` + `append: true` is self-defeating: appending to a file
+        // that was just emptied always writes at 0. Refusing beats silently
+        // ignoring one of the two.
+        return Err(encode_error(
+            Code::Unsupported,
+            "hands.write: `append` and `truncate: true` are mutually exclusive \
+             (appending to a truncated file always starts at 0)",
+        ));
+    }
+    if truncate && offset.is_some_and(|offset| offset > 0) {
+        // Truncating at the end of the file (rather than at the write position)
+        // is a legitimate "cut the tail" operation, so this is allowed — but a
+        // caller resuming a transfer almost always means `truncate: false`, so
+        // the combination is worth naming in the docs rather than guessing.
+        return Ok(WriteIntent {
+            offset,
+            truncate,
+            append,
+        });
+    }
+
+    Ok(WriteIntent {
+        offset,
+        // `append: true` without an explicit `truncate` must not truncate.
+        truncate: truncate && !append,
+        append,
+    })
 }
 
 /// `Debug` so tests can `.expect_err(...)` on the `Result` — the Ok type has to
@@ -700,14 +786,9 @@ struct FileWriter {
 
 impl FileWriter {
     fn open(path: &str, opts: &Value) -> Result<Self, String> {
-        let offset = opts.get("offset").and_then(Value::as_u64);
-        let mode = writer_mode(opts)?;
-        if mode == "append" && offset.is_some_and(|offset| offset > 0) {
-            return Err(encode_error(
-                Code::Unsupported,
-                "hands.write: `append` and `offset > 0` are mutually exclusive",
-            ));
-        }
+        // `write_intent` owns every contradiction check (append+offset,
+        // append+truncate, unknown values), so nothing is re-validated here.
+        let intent = write_intent(opts)?;
 
         // ⚠ Refuse anything that is not a regular file BEFORE opening it, for the
         // same reason `FileReader::open` does: `OpenOptions::open` on a FIFO with
@@ -743,21 +824,18 @@ impl FileWriter {
 
         let mut options = OpenOptions::new();
         options.write(true).create(true);
-        match mode {
-            "append" => {
-                options.append(true);
-            }
-            "truncate" => {
-                options.truncate(true);
-            }
-            _ => {
-                options.truncate(false);
-            }
+        if intent.append {
+            options.append(true);
+        } else if intent.truncate {
+            options.truncate(true);
         }
         let mut file = options
             .open(path)
             .map_err(|error| encode_error(classify(&error), error))?;
-        if let Some(offset) = offset {
+        // Seeking is meaningless with `O_APPEND` (the kernel forces every write to
+        // the end), and `write_intent` has already refused the contradictory
+        // combination, so this only runs for a real offset.
+        if let Some(offset) = intent.offset {
             file.seek(SeekFrom::Start(offset))
                 .map_err(|error| encode_error(classify(&error), error))?;
         }
@@ -1813,7 +1891,7 @@ mod tests {
         std::fs::write(&path, b"first").expect("seed");
 
         let mut writer =
-            FileWriter::open(path.to_str().unwrap(), &json!({ "mode": "append" })).expect("open");
+            FileWriter::open(path.to_str().unwrap(), &json!({ "append": true })).expect("open");
         // Move the cursor backwards; append must ignore it.
         writer.file.seek(SeekFrom::Start(0)).expect("seek");
         writer.file.write_all(b"+second").expect("write");
@@ -1839,7 +1917,7 @@ mod tests {
         std::fs::write(&path, vec![b'A'; 1024 * 1024]).expect("seed");
 
         let writer =
-            FileWriter::open(path.to_str().unwrap(), &json!({ "mode": "append" })).expect("open");
+            FileWriter::open(path.to_str().unwrap(), &json!({ "append": true })).expect("open");
         let (reply, sink_bytes) = crate::kkrpc_peer::test_support::reply_with_sink();
         let mut sink = DeferredWriter {
             writer,
@@ -1864,39 +1942,84 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_write_mode_is_refused_rather_than_downgraded() {
-        // ⚠ THE REGRESSION for the silent downgrade. Any unrecognised `mode`
-        // became `"create"`, which does NOT truncate — so a typo silently meant
-        // "overwrite the head and keep the old tail". Measured: 100 bytes over a
-        // 10 240-byte file replied `endOffset: 100` while the file stayed 10 240.
-        // The same function already refused `append` + `offset > 0`, so refusing a
-        // bad mode is the established behaviour, not new strictness.
+    fn an_unrecognised_write_flag_is_refused_rather_than_downgraded() {
+        // ⚠ THE REGRESSION for the silent downgrade. The old `mode` field returned
+        // `"create"` for ANY unrecognised input, and `create` did NOT truncate — so
+        // a typo silently meant "overwrite the head and keep the old tail".
+        // Measured: 100 bytes over a 10 240-byte file replied `endOffset: 100`
+        // while the file stayed 10 240 bytes.
+        //
+        // The field is gone, but the LESSON is what survives: a malformed option is
+        // refused, never guessed at.
         for bad in [
-            json!({ "mode": "overwrite" }),
-            json!({ "mode": "trunc" }),
-            json!({ "mode": "" }),
-            json!({ "mode": 7 }),
-            json!({ "mode": true }),
+            json!({ "offset": "5" }),
+            json!({ "truncate": "yes" }),
+            json!({ "truncate": 1 }),
+            json!({ "append": "no" }),
+            json!({ "append": 0 }),
         ] {
-            let error = writer_mode(&bad)
-                .expect_err("an unrecognised mode must be refused, not downgraded");
+            let error =
+                write_intent(&bad).expect_err("a malformed option must be refused, not downgraded");
             assert!(
                 error.starts_with("EUNSUPPORTED"),
                 "the refusal must carry a parseable code, got: {error}"
             );
         }
-        // A MISSING mode is still the documented default, not a typo.
-        assert_eq!(writer_mode(&json!({})).expect("default"), "create");
-        assert_eq!(
-            writer_mode(&json!({ "mode": null })).expect("null"),
-            "create"
-        );
-        for good in ["create", "append", "truncate"] {
-            assert_eq!(
-                writer_mode(&json!({ "mode": good })).expect("known mode"),
-                good
+    }
+
+    #[test]
+    fn the_default_intent_rewrites_the_file() {
+        // ⚠ THE CORRUPTION REGRESSION, stated as the contract it should have been.
+        //
+        // The old default did NOT truncate, so rewriting a file with shorter
+        // content left the old tail behind — measured: an 11-byte write over a
+        // 20-byte JSON file produced `{"alpha":9}"beta":2}`, invalid JSON, reported
+        // as SUCCESS. The documented contract always said "overwrite from 0", so
+        // the default must truncate.
+        let intent = write_intent(&json!({})).expect("default");
+        assert!(intent.truncate, "the default must rewrite, not patch");
+        assert!(!intent.append);
+        assert_eq!(intent.offset, None);
+        assert_eq!(intent.label(), "truncate");
+    }
+
+    #[test]
+    fn resuming_a_transfer_never_truncates() {
+        // The other half of the split: a caller resuming from `read`'s `endOffset`
+        // must be able to say "do NOT cut the file" explicitly. Under the old
+        // design that was the DEFAULT, which is why the corrupting case above had
+        // to ask for `mode: "truncate"` — and why forgetting it silently produced a
+        // corrupt file.
+        let intent = write_intent(&json!({ "offset": 4096, "truncate": false })).expect("resume");
+        assert!(!intent.truncate);
+        assert_eq!(intent.offset, Some(4096));
+        assert_eq!(intent.label(), "overwrite");
+    }
+
+    #[test]
+    fn contradictory_write_intents_are_refused() {
+        // Guessing which side the caller meant is how the old design produced a
+        // silent partial overwrite. Each contradiction names itself instead.
+        for bad in [
+            json!({ "append": true, "offset": 5 }),
+            json!({ "append": true, "truncate": true }),
+        ] {
+            let error = write_intent(&bad).expect_err("a contradiction must be refused");
+            assert!(
+                error.starts_with("EUNSUPPORTED"),
+                "the refusal must carry a parseable code, got: {error}"
             );
         }
+        // ⚠ `append: true` WITHOUT an explicit `truncate` is NOT a contradiction:
+        // it means "append", so the rewrite default is turned off rather than
+        // treated as a conflict the caller never expressed.
+        let intent = write_intent(&json!({ "append": true })).expect("append");
+        assert!(intent.append);
+        assert!(
+            !intent.truncate,
+            "append must not inherit the rewrite default"
+        );
+        assert_eq!(intent.label(), "append");
     }
 
     #[test]
@@ -1935,7 +2058,7 @@ mod tests {
         let path = dir.join("x.txt");
         let error = FileWriter::open(
             path.to_str().unwrap(),
-            &json!({ "mode": "append", "offset": 5 }),
+            &json!({ "append": true, "offset": 5 }),
         )
         .err()
         .expect("must fail");

@@ -207,10 +207,32 @@ export type HandsReadOptions = {
 }
 
 export type HandsWriteOptions = {
-  /** Start offset. Omitted = overwrite from 0. */
+  /**
+   * Start offset. Omitted = 0.
+   *
+   * ⚠ Combine with `truncate: false` to RESUME a transfer from the `endOffset`
+   * a previous `read`/`write` reported. Leaving the default `truncate` on while
+   * passing an offset cuts the file at that offset, which is almost never what a
+   * resumer means.
+   */
   offset?: number
-  /** `append` and `offset > 0` are mutually exclusive (the shell rejects it). */
-  mode?: "create" | "truncate" | "append"
+  /**
+   * Cut the file at the write position before writing. **Defaults to `true`.**
+   *
+   * ⚠ This default is the fix for a corruption, not a preference. It used to be
+   * implemented as `mode: "create"`, which did NOT truncate while the contract
+   * documented "overwrite from 0" — so rewriting a file with shorter content left
+   * the old tail behind. Measured through a real peer: writing 11 bytes over a
+   * 20-byte JSON file produced `{"alpha":9}"beta":2}`, invalid JSON, reported as
+   * SUCCESS. Pass `false` when appending or resuming.
+   */
+  truncate?: boolean
+  /**
+   * Open with `O_APPEND` instead of seeking, so concurrent writers cannot lose
+   * each other's writes. Mutually exclusive with `offset > 0` and with an
+   * explicit `truncate: true`.
+   */
+  append?: boolean
 }
 
 export type HandsWatchOptions = {
@@ -218,9 +240,16 @@ export type HandsWatchOptions = {
 }
 
 export type HandsWriteResult = {
+  /** Bytes THIS call wrote — not the resulting file size. */
   bytes: number
+  /** Where the cursor now sits, which is what a resumer passes back as `offset`. */
   endOffset: number
-  mode: string
+  /**
+   * Which intent the shell actually applied. Derived from the flags, not echoed
+   * from an input field, so it reports what happened even when the caller passed
+   * nothing.
+   */
+  mode: "truncate" | "overwrite" | "append"
 }
 
 /**

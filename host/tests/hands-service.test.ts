@@ -41,7 +41,7 @@ function serviceWith(hands: Partial<ShellStdioBridge["hands"]>): {
     hands: {
       stat: async () => null,
       read: () => emptyStream(),
-      write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+      write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
       watch: () => emptyStream(),
       list: () => emptyStream(),
       ...hands,
@@ -178,7 +178,7 @@ describe("write re-encodes to the carrier the shell sends", () => {
     const { svc } = serviceWith({
       write: async (_path, data) => {
         for await (const chunk of data) seen.push(chunk)
-        return { bytes: 3, endOffset: 3, mode: "create" }
+        return { bytes: 3, endOffset: 3, mode: "truncate" }
       },
     })
     const result = await svc.write("/tmp/out", from([new Uint8Array([0, 1, 2])]))
@@ -231,7 +231,7 @@ describe("write: deliberately NOT guarded, and the behaviour that keeps it hones
             writesSeen += 1
             if (writesSeen === 1) await gate.promise // block while the plugin is disposed
           }
-          return { bytes: writesSeen * 3, endOffset: writesSeen * 3, mode: "create" }
+          return { bytes: writesSeen * 3, endOffset: writesSeen * 3, mode: "truncate" }
         },
         watch: () => emptyStream(),
         list: () => emptyStream(),
@@ -294,7 +294,7 @@ describe("write: deliberately NOT guarded, and the behaviour that keeps it hones
     // The write ran to the end of the caller's generator and reported real bytes.
     expect(sourceReturned).toBe(true)
     expect(writesSeen).toBe(4)
-    expect(outcome.result).toEqual({ bytes: 12, endOffset: 12, mode: "create" })
+    expect(outcome.result).toEqual({ bytes: 12, endOffset: 12, mode: "truncate" })
   }, 15_000)
 })
 
@@ -383,7 +383,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
             }
           })(),
         stat: async () => null,
-        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
         watch: () => emptyStream(),
         list: () => emptyStream(),
       },
@@ -443,7 +443,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
       hands: {
         read: () => from(["AAEC"]),
         stat: async () => null,
-        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
         watch: () => emptyStream(),
         list: () => emptyStream(),
       },
@@ -514,7 +514,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
           read: () => {
             throw new Error("EUNSUPPORTED: no shell attached")
           },
-          write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+          write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
           watch: () => emptyStream(),
           list: () => emptyStream(),
         },
@@ -543,7 +543,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
         read: () => {
           throw new Error("ENOENT: /tmp/gone")
         },
-        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
         watch: () => emptyStream(),
         list: () => emptyStream(),
       },
@@ -566,7 +566,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
       hands: {
         read: () => from(["AAEC", "AwQF", "BgcI"]),
         stat: async () => null,
-        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
         watch: () => emptyStream(),
         list: () => emptyStream(),
       },
@@ -598,7 +598,7 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
             await new Promise((resolve) => setTimeout(resolve, 200))
           })(),
         stat: async () => null,
-        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
         watch: () => emptyStream(),
         list: () => emptyStream(),
       },
@@ -643,7 +643,7 @@ describe("attribution plumbing", () => {
       hands: {
         stat: async () => null,
         read: () => emptyStream(),
-        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
         watch: () => emptyStream(),
         list: () => emptyStream(),
       },
@@ -798,7 +798,7 @@ describe("hands.list is audited and guarded like the other primitives", () => {
           })(),
         stat: async () => null,
         read: () => emptyStream(),
-        write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+        write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
         watch: () => emptyStream(),
       },
     } as unknown as ShellStdioBridge)

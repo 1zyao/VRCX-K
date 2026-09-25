@@ -118,10 +118,23 @@ export type HandsReadOptions = {
 }
 
 export type HandsWriteOptions = {
-  /** 起始偏移。默认 0（覆盖）；传 offset 即续写。 */
+  /** 起始偏移。省略 = 0。⚠ 续传要配 `truncate: false`。 */
   offset?: number
-  /** 打开模式。`truncate` 与 `offset>0` 互斥。 */
-  mode?: "create" | "truncate" | "append"
+  /**
+   * 写入前在写入位置截断文件。**默认 `true`。**
+   *
+   * ⚠ 这个默认值是一次**损坏修复**的结果，不是偏好。它原本由
+   * `mode: "create"` 实现，而 `create` **不截断**，契约却写着「从 0 覆盖」——
+   * 于是用更短的内容重写文件会留下旧尾巴。真 peer 实测：11 字节覆盖 20 字节 JSON
+   * 得到 `{"alpha":9}"beta":2}`（非法 JSON），而回复是**成功**。
+   * 追加或续传时传 `false`。
+   */
+  truncate?: boolean
+  /**
+   * 以 `O_APPEND` 打开而不是 seek，使并发写者不会互相覆盖。
+   * 与 `offset > 0`、以及与显式 `truncate: true` 互斥。
+   */
+  append?: boolean
 }
 
 export type HandsWatchOptions = {
