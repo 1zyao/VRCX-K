@@ -1975,6 +1975,15 @@ mod tests {
     fn returning_a_stream_closes_the_producer_and_acknowledges() {
         // Cancellation must release the file handle, or a long-lived shell leaks
         // one descriptor per abandoned download.
+        //
+        // ⚠ The close is ASYNCHRONOUS now, and this test was racy because of it.
+        // Since the producer owns its own thread, `return` only SIGNALS
+        // (`ProducerStream::cancel`); the owning thread closes the handle on its
+        // way out, because closing from the reader would race a thread that may
+        // be inside `next_chunk`. So the ordering is: reader acks → thread
+        // observes the flag → thread closes. Asserting `closed` immediately after
+        // the ack therefore loses that race under load — it reproduced only when
+        // several `cargo test` runs shared the machine. Poll for the invariant.
         let mut h = Harness::new();
         let closed = Arc::new(Mutex::new(false));
         h.peer
@@ -2000,6 +2009,12 @@ mod tests {
             "`return` owes its control id back"
         );
         assert_eq!(ack["d"], json!(true));
+
+        // The invariant this test is actually about: the handle IS released.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !*closed.lock().unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             *closed.lock().unwrap(),
             "the cancelled producer must be closed"

@@ -775,6 +775,22 @@ struct FileWatcher {
     target: PathBuf,
     /// Whether the watch had to move up to the parent (target absent at start).
     watching_parent: bool,
+    /// The path the watch was ACTUALLY registered on — which is NOT `target`.
+    ///
+    /// ⚠ This field exists because `close()` used to unwatch `target`, and those
+    /// two are different paths in three ordinary cases:
+    ///
+    ///   1. `target` is canonicalized (`comparable`) but `watch` is given the
+    ///      caller's original string — so a symlinked ancestor (macOS `/var` →
+    ///      `/private/var`) or any relative input makes them differ.
+    ///   2. The target did not exist at start, so the watch went on the PARENT
+    ///      while `target` is "parent + filename" — a path that was never
+    ///      registered at all.
+    ///
+    /// `notify::unwatch` matches the path it was given, so unwatching `target`
+    /// was a no-op in those cases: the watch outlived the stream, and `let _ =`
+    /// swallowed the evidence. Keeping the registered path makes `close()` exact.
+    registered: PathBuf,
 }
 
 /// Resolve a path for comparison with event paths.
@@ -851,11 +867,24 @@ impl FileWatcher {
             }
         };
 
+        // ⚠ Remember what was ACTUALLY registered, not what was asked for.
+        // `close()` must unwatch this exact path — see the field docs for the
+        // three cases where it differs from `target`.
+        let registered = if watching_parent {
+            requested
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| requested.clone())
+        } else {
+            requested.clone()
+        };
+
         Ok(Self {
             rx,
             watcher,
             target,
             watching_parent,
+            registered,
         })
     }
 
@@ -916,10 +945,23 @@ impl StreamSource for FileWatcher {
     }
 
     fn close(&mut self) {
-        // Explicit, so the watch is gone even if the watcher object outlives
-        // this call. Best-effort by design: a failed unwatch must not panic the
-        // stream thread.
-        let _ = self.watcher.unwatch(&self.target);
+        // ⚠ Unwatch the REGISTERED path, not `target`. They differ whenever the
+        // caller's string was relative, had a symlinked ancestor, or the target
+        // did not exist so the watch moved to the parent — and `unwatch` matches
+        // exactly, so the old `&self.target` was a silent no-op in those cases.
+        //
+        // ⚠ Keep `let _ =`? No — that is what hid this. A failure is reported to
+        // stderr instead. It still must not PANIC (this runs on the stream
+        // thread, and a panic there would take the stream down for a cleanup
+        // problem), so an explicit log is the right middle ground: the stream
+        // ends normally and the operator can see that a watch was left behind.
+        if let Err(error) = self.watcher.unwatch(&self.registered) {
+            eprintln!(
+                "[shell] hands.watch: could not unwatch {} (registered as {}): {error}",
+                self.target.display(),
+                self.registered.display()
+            );
+        }
     }
 }
 
@@ -1715,6 +1757,48 @@ mod tests {
         drop(watcher);
         std::fs::remove_dir_all(&dir).ok();
         assert!(fell_back, "an absent target must watch its parent");
+    }
+
+    #[test]
+    fn close_unwatches_the_path_that_was_registered_not_the_canonicalized_one() {
+        // ⚠ THE REGRESSION for the silent no-op unwatch.
+        //
+        // `start` canonicalizes into `target` (via `comparable`) but hands the
+        // CALLER's string to `watch`. `close` used to unwatch `&self.target`, so
+        // in every case where those differ — a relative input, a symlinked
+        // ancestor (macOS `/var` → `/private/var`), or the parent-directory
+        // fallback — the unwatch matched nothing, the watch outlived the stream,
+        // and `let _ =` discarded the error. This pins the invariant directly:
+        // the path `close` will unwatch must equal the path `watch` was given.
+        let dir = temp_dir("watch-unwatch");
+        let target = dir.join("live.log");
+        std::fs::write(&target, b"seed\n").expect("write");
+
+        // (a) Target EXISTS: registration is on the caller's path, and the
+        //     canonical form differs from it whenever `dir` contains a symlink
+        //     (on macOS `temp_dir()` is the `/var` form).
+        let watcher = FileWatcher::start(target.to_str().unwrap(), false).expect("start");
+        assert!(!watcher.watching_parent);
+        assert_eq!(
+            watcher.registered,
+            PathBuf::from(target.to_str().unwrap()),
+            "close must unwatch exactly what watch was given"
+        );
+        drop(watcher);
+
+        // (b) Target ABSENT: registration is on the PARENT, so unwatching the
+        //     target would be a no-op — and `target` here is "parent + name",
+        //     a path that was never registered at all.
+        let missing = dir.join("not-yet.log");
+        let watcher = FileWatcher::start(missing.to_str().unwrap(), false).expect("start");
+        assert!(watcher.watching_parent);
+        assert_eq!(
+            watcher.registered, dir,
+            "the fallback registers the PARENT, so that is what close must unwatch"
+        );
+        drop(watcher);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
