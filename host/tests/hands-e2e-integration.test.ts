@@ -42,7 +42,7 @@ import { join } from "node:path"
 import { Context } from "cordis"
 import { stdioJsonTransport } from "kkrpc/stdio"
 import { StreamingRPCChannel } from "kkrpc/streaming"
-import { HandsService } from "../src/hands"
+import { HandsError, HandsService } from "../src/hands"
 import type {
   HandsHelloHandler,
   HandsHelloWire,
@@ -116,6 +116,17 @@ let helloBridge: ShellHandsHelloBridge
 let helloLog: HandsHelloWire[]
 let seenLaunchId: string | undefined
 
+/**
+ * The RAW `hands.*` API — the channel's own proxy, not `HandsService`.
+ *
+ * Needed because the service sits ON TOP of `decodeStream`, which consumes with
+ * `for await` and therefore **discards a generator's terminal value**. Anything
+ * about the terminal frame's `value` is invisible through the service (a test
+ * asserting it there passes no matter what the wire carries), so the one test
+ * that pins it has to use the raw channel.
+ */
+let rawHands: Record<string, unknown> | undefined
+
 /** Drain a stream into an array (the other test files have their own copies). */
 async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
   const out: T[] = []
@@ -182,6 +193,7 @@ function connect(): HandsService {
   // every call arrive as `unknown RPC method: stat` — which is what the first run
   // of this test reported.
   const api = channel.getAPI() as { hands: unknown }
+  rawHands = api.hands as Record<string, unknown>
   const ctx = new Context()
   const service = new HandsService(ctx, {})
   service.attachShell({
@@ -242,6 +254,53 @@ describe("the host's HandsService drives the real Rust peer", () => {
   )
 
   test.skipIf(!binaryAvailable)(
+    "a FAILING stat REJECTS through the real peer, with a parseable code",
+    async () => {
+      // ⚠ THE SEAM THIS FILE EXISTS FOR, applied to the failure path.
+      //
+      // `register_stat` used to be a sync `peer.on`, whose reply frame is always
+      // `{"t":"r","v":…}` — no error arm — so a failure had to be returned AS the
+      // value `{"error":"CODE: detail"}`. Measured then:
+      //
+      //     stat("\\.\NUL") RESOLVED to {"error":"EACCES: …"}  → .size undefined
+      //
+      // i.e. "cannot read it" reached the CALLER as "read it, no size". The Rust
+      // unit test pins `stat_outcome`; this one pins the other half of the seam —
+      // that the rejection survives base64/framing, and that `HandsService`
+      // translates it into a `HandsError` whose `.code` a caller can branch on.
+      //
+      // An interior NUL is refused at the OS layer on every platform (Windows:
+      // `os error 1`; Unix: `CString` → `NulError`), so this is not another
+      // platform assumption.
+      let caught: unknown
+      try {
+        await svc.stat("a\0b")
+      } catch (error) {
+        caught = error
+      }
+      expect(caught).toBeInstanceOf(HandsError)
+      const err = caught as HandsError
+      // ⚠ THE EXPECTED CODE IS `EINVAL`, AND IT USED TO BE `EACCES` — the same
+      // change the Rust unit test next to `stat_outcome` records. An interior NUL
+      // is refused by the OS layer on every platform (`InvalidInput`), and the old
+      // `classify` catch-all reported every unrecognised kind as `Denied`. That was
+      // the bug: `EACCES` tells a caller to go and ask the user for permissions,
+      // while a malformed path can never succeed on any machine. This file pinned
+      // the buggy value end-to-end (it only runs when the release binary exists, so
+      // the Rust-side change did not surface it locally) and went red on all three
+      // desktop CI runners. It is exact on purpose: a disjunction here would let the
+      // regression back in.
+      expect(err.code).toBe("EINVAL")
+      // The prefix must be STRIPPED into `.code`, not left in the message for
+      // callers to parse — that is the whole point of the class.
+      expect(err.message).not.toContain("EINVAL:")
+      // And the code must not be the misleading one.
+      expect(err.code).not.toBe("EACCES")
+    },
+    30_000,
+  )
+
+  test.skipIf(!binaryAvailable)(
     "read streams real bytes: base64 on the wire, decoded by the service",
     async () => {
       // THE seam this file exists for. The Rust side sends base64; if the
@@ -267,6 +326,55 @@ describe("the host's HandsService drives the real Rust peer", () => {
       const chunks: Uint8Array[] = []
       for await (const chunk of svc.read(path, { offset: 4 })) chunks.push(chunk)
       expect(Buffer.concat(chunks.map((c) => Buffer.from(c))).toString()).toBe("456789")
+    },
+    30_000,
+  )
+
+  test.skipIf(!binaryAvailable)(
+    "a finished stream ends with NO value, and the wire really carries none",
+    async () => {
+      // ⚠ Pins the TERMINAL FRAME's shape, which nothing asserted before.
+      //
+      // Rust sends `{"t":"sr","sid":…,"d":true}` with no `"v"` because
+      // `StreamStep::Done` carries no payload (see `kkrpc_peer.rs`) and
+      // `StreamSink::finish` takes no value.
+      //
+      // ⚠ kkrpc's remote consumer DOES decode a terminal `v` and hand it to the
+      // waiting iterator — verified by experiment, not by reading: injecting
+      // `"v": "LEAKED"` into the terminal frame makes the raw channel's final
+      // result `{done:true, value:"LEAKED"}`. (An earlier claim of mine that the
+      // JS side "ignores it anyway" was a misread of the `:667` short-circuit
+      // branch; 1zyao corrected it, Lyric-ovo independently confirmed the line.)
+      //
+      // So WHY drive the raw API here rather than `svc.read`? Because `svc.read`
+      // cannot see it: `decodeStream` consumes with `for await`, and `for await`
+      // DISCARDS a generator's terminal value. Asserting through the service would
+      // therefore pass even with the leak injected — an unfalsifiable test, which
+      // is what the first version of this was. The raw channel is where the
+      // contract is observable, so that is where it is pinned.
+      const path = join(work, "terminal.bin")
+      writeFileSync(path, "abc")
+      const raw = (rawHands as { read: (p: string) => AsyncIterable<unknown> }).read(path)
+      const iterator = raw[Symbol.asyncIterator]()
+
+      const seen: Array<IteratorResult<unknown>> = []
+      for (;;) {
+        const result = await iterator.next()
+        seen.push(result)
+        if (result.done) break
+      }
+
+      const terminal = seen.filter((result) => result.done)
+      expect(terminal).toHaveLength(1)
+      // The contract: no value. `undefined` rather than `null` — sending an
+      // explicit `null` would CHANGE the terminal type (a point 1zyao raised),
+      // so this asserts the absence of a value, not a particular one.
+      //
+      // This WILL fail if anyone gives `StreamStep::Done` a payload without
+      // wiring `"v"` through — and, equally, it will fail (correctly) if someone
+      // starts sending a terminal value and expects consumers to read it.
+      expect(terminal[0].value).toBeUndefined()
+      expect(seen.length).toBeGreaterThan(1)
     },
     30_000,
   )
