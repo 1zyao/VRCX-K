@@ -30,6 +30,7 @@ import Loader from "@cordisjs/plugin-loader"
 import { Context } from "cordis"
 import { createShellCapabilities, ShellHandle } from "../src/capability"
 import type { VRCXKPluginManifest } from "../src/contracts/pluginManifest.generated"
+import { HandsService } from "../src/hands"
 import { checkGrant, findOverreach, formatOverreach, rawShellSubdomain } from "../src/overreach"
 import type { ShellStdioBridge } from "../src/stdio"
 
@@ -43,10 +44,25 @@ function manifest(permissions?: Record<string, unknown>): VRCXKPluginManifest {
   } as unknown as VRCXKPluginManifest
 }
 
+/** An async iterable that yields nothing — the empty-stream shape the bridge wants. */
+async function* emptyAsync(): AsyncIterable<never> {
+  // Intentionally yields nothing.
+}
+
 /** A no-op bridge: the calls must reach the shell for the audit hook to fire. */
 function fakeBridge(): ShellStdioBridge {
   const ok = async () => true
   return {
+    // The `hands` namespace is only reached by the `ctx.hands` coverage tests.
+    // `write` takes a stream and resolves; `stat` answers null so the granted-call
+    // control does not depend on a real file.
+    hands: {
+      stat: async () => null,
+      read: () => emptyAsync(),
+      write: async () => ({ bytes: 0, endOffset: 0, mode: "create" }),
+      watch: () => emptyAsync(),
+      list: () => emptyAsync(),
+    },
     shell: {
       notify: ok,
       openUrl: ok,
@@ -193,7 +209,37 @@ describe("findOverreach: who MUST be warned about", () => {
       manifest({ shell: ["notify"] }),
     )
     expect(finding).toBeDefined()
+    // ⚠ `shell`, NOT `window`. The manifest says `shell: ["notify"]`, so the key
+    // the author must edit is `shell` — reporting `window` named a capability
+    // that appears nowhere in their manifest, and following that message would
+    // add the wrong grant. (This assertion previously pinned `"window"`, which is
+    // the defect: the test froze the wrong behaviour as expected.)
+    expect(finding?.capability).toBe("shell")
+    // The reason must still distinguish "never mentioned it" from "mentioned it
+    // narrowly" — the fix differs, so the wording must too.
+    expect(finding?.reason).toBe("out-of-scope")
+  })
+
+  test("the undeclared spelling still reports the sub-domain's own name", () => {
+    // The other branch of the same choice: when the manifest has no `shell` key
+    // at all, the call can only be satisfied by the sub-domain's own capability,
+    // so THAT is the key to name.
+    const finding = findOverreach("4daad489:p", "shell.window.show", manifest({ notify: true }))
     expect(finding?.capability).toBe("window")
+    expect(finding?.reason).toBe("undeclared")
+  })
+
+  test("the warn line names the key the author can actually edit", () => {
+    // The finding's `capability` is only useful if it reaches the message — this
+    // asserts the whole path, since that is what a plugin author reads.
+    const finding = findOverreach(
+      "4daad489:p",
+      "shell.window.show",
+      manifest({ shell: ["notify"] }),
+    )
+    const line = formatOverreach(finding as NonNullable<typeof finding>)
+    expect(line).toContain("declares `shell` but not this entry")
+    expect(line).not.toContain("declares `window`")
   })
 })
 
@@ -233,6 +279,7 @@ describe("end to end through the real capability surface and a real loader entry
   async function runThroughLoader(
     declared: Record<string, unknown>,
     source: string,
+    opts: { withHands?: boolean } = {},
   ): Promise<{ audits: string[]; entryId: string }> {
     const root = await mkdtemp(join(tmpdir(), "vrcxk-overreach-"))
     await mkdir(join(root, "plugins"), { recursive: true })
@@ -246,8 +293,21 @@ describe("end to end through the real capability surface and a real loader entry
     handle.attach(fakeBridge())
     // Mirrors production: the registry is keyed by the entry's STABLE suffix,
     // which is what `manifestRegistryOf(ctx).get(entryId)` does.
-    handle.useManifests((entryId) => (entryId.endsWith(":probe") ? manifest(declared) : undefined))
+    const lookup = (entryId: string) =>
+      entryId.endsWith(":probe") ? manifest(declared) : undefined
+    handle.useManifests(lookup)
     createShellCapabilities(ctx, handle)
+
+    // ⚠ The CURATED hands service, which is the supported entry point. It needs
+    // the SAME lookup: an earlier version gave it none, so `ctx.hands.*` was
+    // audited but never checked while the raw mirror was — the exact inversion
+    // `#24` exists to prevent. Opt-in here so the raw-path tests stay honest
+    // about which service they are exercising.
+    if (opts.withHands) {
+      const hands = new HandsService(ctx, { audit: (line) => audits.push(line) })
+      hands.attachShell(fakeBridge())
+      hands.useManifests(lookup)
+    }
 
     await ctx.plugin(Loader)
     ctx.loader.builtins.include = Include
@@ -296,6 +356,41 @@ describe("end to end through the real capability surface and a real loader entry
     const warn = audits.find((line) => line.includes("overreach"))
     expect(warn).toBeDefined()
     expect(warn).toContain("window")
+  }, 20_000)
+
+  test("⚠ the CURATED ctx.hands path IS checked (it was not, before this)", async () => {
+    // THE REGRESSION for the coverage inversion. `ctx.hands` is the SUPPORTED
+    // entry point, and it had no overreach check at all: the check lived only in
+    // `ShellHandle.record`, so the raw escape hatch was covered and this was not.
+    //
+    // The manifest declares `hands: ["stat"]` and the plugin calls `write`, so the
+    // warn must name `hands` and say the entry is out of scope (not "undeclared" —
+    // the capability WAS declared, narrowly; the two need different fixes).
+    const { audits } = await runThroughLoader(
+      { hands: ["stat"] },
+      `export function apply(ctx: any) {
+         void (async () => {
+           try { for await (const _ of ctx.hands.write("/tmp/x", (async function* () {})())) {} } catch {}
+         })()
+       }\n`,
+      { withHands: true },
+    )
+    const warn = audits.find((line) => line.includes("overreach"))
+    expect(warn).toBeDefined()
+    expect(warn).toContain("hands.write")
+    expect(warn).toContain("declares `hands` but not this entry")
+  }, 20_000)
+
+  test("a ctx.hands call the manifest DOES grant is not reported", async () => {
+    // The control: the new check must not fire on a correct declaration, or it
+    // would be noise that trains people to ignore the warn.
+    const { audits } = await runThroughLoader(
+      { hands: ["stat"] },
+      `export function apply(ctx: any) { void ctx.hands.stat("/tmp/x").catch(() => {}) }\n`,
+      { withHands: true },
+    )
+    expect(audits.some((line) => line.includes("[cap]"))).toBe(true)
+    expect(audits.some((line) => line.includes("overreach"))).toBe(false)
   }, 20_000)
 
   test("a plugin with no registered manifest produces no warn, but is still audited", async () => {

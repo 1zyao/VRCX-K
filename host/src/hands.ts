@@ -36,6 +36,8 @@
 //     This is NOT a security boundary — an in-process plugin can `import fs`.
 
 import { type Context, Service, symbols } from "cordis"
+import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
+import { overreachWarning } from "./overreach"
 import type {
   HandsChange,
   HandsErrorCode,
@@ -172,11 +174,31 @@ export function normalizeChange(value: unknown): HandsChange | undefined {
 export class HandsService extends Service {
   private bridge?: ShellStdioBridge
   private readonly auditLine: HandsAudit
+  /**
+   * Manifest lookup for `#24` overreach detection.
+   *
+   * Set by `useManifests` once the registry exists. `undefined` means "manifests
+   * are not loaded", which is NOT the same as "this plugin is undeclared" — see
+   * `overreachWarning`, which returns nothing in that case rather than warning on
+   * every call.
+   */
+  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
 
   constructor(ctx: Context, options: HandsServiceOptions = {}) {
     super(ctx, "hands")
     this.bridge = options.bridge
     this.auditLine = options.audit ?? (() => {})
+  }
+
+  /**
+   * Enable overreach detection by supplying the manifest registry lookup.
+   *
+   * ⚠ Required for `#24` to cover this service at all. Without it `ctx.hands` is
+   * audited but never checked, which is how the supported entry point ended up
+   * unchecked while the raw mirror was covered.
+   */
+  useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
+    this.manifestLookup = lookup
   }
 
   /** Attach or detach the shell bridge (services are provided before it exists). */
@@ -214,6 +236,15 @@ export class HandsService extends Service {
   private record(self: unknown, method: string, detail: string): void {
     const who = callerName(self) ?? "<unknown>"
     this.auditLine(`[cap] ${who} -> hands.${method} ${detail}`)
+
+    // Overreach: declared vs actual (#24).
+    //
+    // ⚠ `ctx.hands` is the SUPPORTED entry point and it had NO check before
+    // this — the raw escape hatch (`ctx.shell.hands.*`) was checked while this
+    // was not, which is the exact inversion `#24` exists to prevent. It is the
+    // same shared helper the mirror uses, so the rule cannot drift between them.
+    const warning = overreachWarning(self, `hands.${method}`, this.manifestLookup)
+    if (warning) this.auditLine(warning)
   }
 
   // --- the four primitives ------------------------------------------------

@@ -470,8 +470,30 @@ impl FileReader {
     fn open(path: &str, offset: u64) -> Result<Self, String> {
         let meta =
             std::fs::metadata(path).map_err(|error| encode_error(classify(&error), error))?;
+        // ⚠ ONLY regular files. `is_dir` alone was not enough, and the omission was
+        // a denial-of-service on this peer rather than a wrong answer:
+        //
+        //   - a FIFO blocks in `open` until a writer appears, and
+        //   - a character device (`/dev/zero`, Windows `\\.\NUL`) never returns 0
+        //     from `read`, so a 256 KiB chunk loop turns into a spin.
+        //
+        // Both run on the READER thread (`pump_producer`), so one call like that
+        // stops `read_line` from ever running again: cancellation frames are never
+        // seen and EVERY other in-flight RPC stalls until the shell's 30s timeout
+        // kills the tree. A capability with no path fence (proposal §7.1) must not
+        // let a caller wedge the whole channel by naming the wrong path.
+        //
+        // `is_file()` follows symlinks (`metadata`, not `symlink_metadata`), so a
+        // link to a regular file still reads. Anything else is refused loudly
+        // rather than left undefined — a hang is indistinguishable from a bug.
         if meta.is_dir() {
             return Err(encode_error(Code::IsDir, path));
+        }
+        if !meta.is_file() {
+            return Err(encode_error(
+                Code::Unsupported,
+                format!("{path} is not a regular file (devices and FIFOs are not readable)"),
+            ));
         }
         let mut file = File::open(path).map_err(|error| encode_error(classify(&error), error))?;
         if offset > 0 {
@@ -492,8 +514,28 @@ impl StreamProducer for FileReader {
         // otherwise appear as one continuous file, and the caller would commit
         // a spliced result. This is exactly the `ESTALE` case the proposal
         // separates from `ENOENT`.
+        //
+        // ⚠ An empty id is AMBIGUOUS and must not be treated as "unchanged".
+        // `identity()` collapses two different states into `""`:
+        //   (a) the filesystem cannot report an id (some network shares), and
+        //   (b) the path no longer exists.
+        // Treating both as "same" meant a file DELETED mid-read produced a clean
+        // EOF and the caller got a success result — `ENOENT` reported as data.
+        // Measured: `identity()` after an unlink returns `""`, and a read from the
+        // still-open handle then returns the bytes with no error at all.
+        //
+        // So the two are separated here: (b) fails loudly, (a) skips the
+        // comparison (the id is a rotation check, not the payload).
         let current = identity(&self.path);
-        if !self.opened_id.is_empty() && !current.is_empty() && current != self.opened_id {
+        if current.is_empty() {
+            if !path_exists(&self.path) {
+                return StreamStep::Failed(encode_error(
+                    Code::NotFound,
+                    format!("{} was removed during read", self.path.display()),
+                ));
+            }
+            // Present but unidentifiable: nothing to compare against, so continue.
+        } else if !self.opened_id.is_empty() && current != self.opened_id {
             return StreamStep::Failed(encode_error(
                 Code::Stale,
                 format!("{} was replaced during read", self.path.display()),
@@ -850,10 +892,24 @@ impl StreamSource for FileWatcher {
 
 /// Best-effort file identity. An empty string means "this filesystem cannot say"
 /// — a network share — and callers must treat that as "unknown", not as "same".
+///
+/// ⚠ It ALSO returns `""` when the path does not exist, which is a different
+/// thing: "unknown" lets a check be skipped, "gone" must fail the read. Callers
+/// that need to tell them apart must pair this with [`path_exists`] — see
+/// `FileReader::next_chunk`.
 fn identity(path: impl AsRef<Path>) -> String {
     file_id::get_file_id(path)
         .map(|id| format!("{id:?}"))
         .unwrap_or_default()
+}
+
+/// Does the path still exist?
+///
+/// `symlink_metadata` (not `metadata`) so a dangling symlink still counts as
+/// present: the question is "is the directory entry still there", which is what
+/// distinguishes a removed file from one whose id the filesystem cannot report.
+fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// Read a stream reference out of an argument position, unwrapping the value
@@ -1319,6 +1375,69 @@ mod tests {
     }
 
     #[test]
+    fn read_of_a_file_removed_mid_read_fails_rather_than_ending_cleanly() {
+        // ⚠ THE REGRESSION for the empty-id ambiguity, and the failure it
+        // prevented was silent: `identity()` returns `""` BOTH when the
+        // filesystem cannot report an id AND when the path is gone, and the guard
+        // treated every empty value as "unchanged". So a file DELETED mid-read
+        // kept reading from the still-open handle and ended with a clean `Done` —
+        // the caller stored a complete-looking result for a file that no longer
+        // existed, with `ENOENT` never reported.
+        //
+        // Measured before the fix: after `remove_file`, `identity()` is empty, the
+        // guard skips, and the open handle returns the remaining bytes with no
+        // error at all.
+        let dir = temp_dir("read-removed");
+        let path = dir.join("vanishing.log");
+        std::fs::write(&path, vec![7u8; CHUNK * 2]).expect("write");
+
+        let mut reader = FileReader::open(path.to_str().unwrap(), 0).expect("open");
+        assert!(matches!(reader.next_chunk(), StreamStep::Chunk(_)));
+
+        // Delete the path while the handle stays open — the case the guard missed.
+        std::fs::remove_file(&path).expect("remove");
+
+        let outcome = reader.next_chunk();
+        std::fs::remove_dir_all(&dir).ok();
+        match outcome {
+            StreamStep::Failed(message) => assert!(
+                message.starts_with("ENOENT"),
+                "a removed file must report ENOENT (not a clean end), got: {message}"
+            ),
+            other => panic!(
+                "expected ENOENT, got {} — a deleted file must not look like a finished read",
+                match other {
+                    StreamStep::Chunk(_) => "a chunk".to_string(),
+                    StreamStep::Done => "a clean end".to_string(),
+                    StreamStep::Failed(message) => message,
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn read_of_a_file_that_simply_ends_still_reports_done() {
+        // The control for the test above: the new ENOENT branch must not fire on a
+        // file that is still there. Without this, "always fail" would pass the
+        // regression while breaking every ordinary read.
+        let dir = temp_dir("read-normal-end");
+        let path = dir.join("short.log");
+        std::fs::write(&path, b"abc").expect("write");
+        let mut reader = FileReader::open(path.to_str().unwrap(), 0).expect("open");
+
+        let mut chunks = 0;
+        loop {
+            match reader.next_chunk() {
+                StreamStep::Chunk(_) => chunks += 1,
+                StreamStep::Done => break,
+                StreamStep::Failed(message) => panic!("unexpected failure: {message}"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(chunks, 1);
+    }
+
+    #[test]
     fn read_of_a_missing_file_reports_not_found_not_stale() {
         // The distinction the proposal insists on: these two need opposite
         // handling, so they must not collapse into one code.
@@ -1329,6 +1448,118 @@ mod tests {
             .expect("must fail");
         std::fs::remove_dir_all(&dir).ok();
         assert!(error.starts_with("ENOENT"), "got: {error}");
+    }
+
+    #[test]
+    fn read_of_a_directory_is_refused_rather_than_opened() {
+        let dir = temp_dir("read-a-dir");
+        let error = FileReader::open(dir.to_str().unwrap(), 0)
+            .err()
+            .expect("must refuse a directory");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(error.starts_with("EISDIR"), "got: {error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_character_device_never_reaches_the_read_path() {
+        // ⚠ Attempted regression test for the reader-thread wedge, KEPT because
+        // what it pins is worth knowing — but it does NOT exercise the `is_file`
+        // guard, and saying so is the point.
+        //
+        // Measured on Windows: `std::fs::metadata(r"\\.\NUL")` already FAILS with
+        // `os error 1` (ERROR_INVALID_FUNCTION), so the call never reaches the new
+        // guard — the OS refuses it a step earlier. (Node's `statSync` on the same
+        // path SUCCEEDS and reports a character device, which is why this looked
+        // testable; the two runtimes disagree, and Rust's behaviour is the one
+        // that matters here.)
+        //
+        // So on Windows this asserts the *outcome* a caller sees — a prompt error,
+        // never a hang — rather than the code path that produced it. The guard
+        // itself is exercised on Unix, where `metadata` on a FIFO succeeds and
+        // `is_file()` is false; that path is NOT covered by local or Windows CI
+        // (no `mkfifo`) and is therefore an honest gap, recorded in the proposal's
+        // unverified list rather than claimed as tested.
+        let error = FileReader::open(r"\\.\NUL", 0)
+            .err()
+            .expect("a character device must not open");
+        // Either code is correct here: EACCES when the OS refuses the stat first
+        // (what Windows does today), EUNSUPPORTED when the guard is what refuses.
+        assert!(
+            error.starts_with("EACCES") || error.starts_with("EUNSUPPORTED"),
+            "expected a prompt refusal (EACCES or EUNSUPPORTED), got: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_of_a_fifo_is_refused_by_the_regular_file_guard() {
+        // ⚠ THE REAL regression for the reader-thread wedge, and it only runs on
+        // Unix because Windows has no `mkfifo`.
+        //
+        // A FIFO is the case the guard exists for: `metadata` SUCCEEDS on it and
+        // `is_dir()` is false, so before the guard `File::open` would BLOCK here
+        // until a writer appeared — on the reader thread, meaning cancellation
+        // frames are never read and every other in-flight RPC stalls until the
+        // shell kills the tree.
+        //
+        // `mkfifo` is invoked directly (no crate) and the test skips if the
+        // command is unavailable, rather than asserting on a file that was never
+        // created — a test that silently passes when its fixture is missing is
+        // the failure mode this suite keeps guarding against.
+        let dir = temp_dir("read-fifo");
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            std::fs::remove_dir_all(&dir).ok();
+            eprintln!("mkfifo unavailable; skipping the FIFO guard check");
+            return;
+        }
+
+        // The stat must SUCCEED (else this proves nothing about the guard), and
+        // the open must refuse without blocking.
+        let meta = std::fs::metadata(&fifo).expect("metadata on a FIFO succeeds");
+        assert!(!meta.is_dir(), "a FIFO is not a directory");
+
+        let error = FileReader::open(fifo.to_str().unwrap(), 0)
+            .err()
+            .expect("a FIFO must be refused, not opened");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            error.starts_with("EUNSUPPORTED"),
+            "expected EUNSUPPORTED from the regular-file guard, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_symlink_to_a_regular_file_is_still_readable() {
+        // The guard uses `metadata` (following links), so refusing non-regular
+        // files must NOT lock out the ordinary case of a symlinked log file.
+        let dir = temp_dir("read-symlink-ok");
+        let real = dir.join("real.txt");
+        std::fs::write(&real, b"hello").expect("write");
+        let link = dir.join("link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        #[cfg(windows)]
+        {
+            // A file symlink needs elevation on Windows, so fall back to the real
+            // path rather than skipping: the assertion that matters (a regular
+            // file still opens) is preserved either way.
+            if std::os::windows::fs::symlink_file(&real, &link).is_err() {
+                let reader = FileReader::open(real.to_str().unwrap(), 0).expect("open real");
+                drop(reader);
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+        }
+        let reader = FileReader::open(link.to_str().unwrap(), 0).expect("open symlink");
+        drop(reader);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- write --------------------------------------------------------------

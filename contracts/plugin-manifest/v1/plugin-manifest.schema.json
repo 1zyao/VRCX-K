@@ -230,12 +230,12 @@
             { "type": "boolean" },
             {
               "type": "array",
-              "maxItems": 11,
+              "maxItems": 15,
               "uniqueItems": true,
               "items": { "$ref": "#/$defs/ShellSubdomain" }
             }
           ],
-          "description": "Raw shell surface. Sub-domain granularity only."
+          "description": "Raw shell surface. Sub-domain granularity only. ⚠ `maxItems` MUST equal the `ShellSubdomain` enum length, or a plugin granting every sub-domain has its whole manifest rejected — which silently disables the `#24` warn for exactly the most-privileged plugins. A contract test pins the two together."
         },
         "notify": { "$ref": "#/$defs/PermissionGrant" },
         "dialog": { "$ref": "#/$defs/PermissionGrant" },
@@ -256,13 +256,13 @@
             { "type": "boolean" },
             {
               "type": "array",
-              "maxItems": 4,
+              "maxItems": 5,
               "uniqueItems": true,
               "items": { "$ref": "#/$defs/HandsPrimitive" },
               "description": "A narrow grant: exactly the listed primitives."
             }
           ],
-          "description": "File primitives (stat/read/write/watch). Reaches the whole disk, so prefer a narrow list over `true`. Declaration only at this stage — not enforced (#24 is declare-and-warn, and the real boundary is M4's subprocess isolation)."
+          "description": "File primitives (stat/read/write/watch/list). Reaches the whole disk, so prefer a narrow list over `true`. Declaration only at this stage — not enforced (#24 is declare-and-warn, and the real boundary is M4's subprocess isolation). ⚠ `maxItems` MUST equal the `HandsPrimitive` enum length: adding a primitive to the enum without raising this made a 5-primitive grant INVALID, so the manifest was rejected and the `#24` warn silently switched off. A contract test pins the two together."
         }
       }
     },

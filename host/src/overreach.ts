@@ -15,12 +15,21 @@
 //   instead of silent, which is `#24`'s stated honest scope.
 //
 // THE TWO PATHS THAT MUST BOTH BE COVERED (#24 §2)
-//   1. the curated services (`ctx.notify`, `ctx.hands`, …) — attribution is
+//   1. the curated services (`ctx.notify`, `ctx.dialog`, …) — attribution is
 //      natural because they are `Service`s;
 //   2. the raw `ctx.shell.*` escape hatch — this needed M2-1's transparent call
 //      record first, which is why the audit hook exists at all.
-//   Both funnel through `ShellHandle.record`, so the check lives there rather
-//   than in each service.
+//
+// ⚠ AN EARLIER VERSION OF THIS COMMENT WAS FALSE, and the code matched the
+//   comment rather than the requirement: it claimed "both funnel through
+//   `ShellHandle.record`". Only path 2 does. `ctx.hands` is a `Service` with its
+//   OWN audit line (`hands.ts`'s `record`), so the check lived in
+//   `ShellHandle.record` alone and **the supported entry point went unchecked
+//   while the escape hatch was checked** — the exact inversion `#24` exists to
+//   prevent.
+//
+//   Both call sites now go through `overreachVerdict` below, so the rule has one
+//   implementation and a new service cannot silently opt out of it.
 //
 // ⚠ WHY THE CHECK KEYS ON `entry.id` AND NOT ON `callerName`
 //   `callerName` decorates the id with a `#runtimeName` suffix for humans. The
@@ -163,8 +172,18 @@ export function findOverreach(
     if (checkGrant(ownGrant, shellSub, method) === "granted") return undefined
     // Report against whichever spelling the manifest actually used, so the
     // message points at something the author can edit.
-    const target = shellGrant !== undefined ? shellSub : shellSub
-    const grant = shellGrant !== undefined ? shellGrant : ownGrant
+    //
+    // ⚠ `target` must be the GRANT's key, not the call's sub-domain. Reporting
+    // the sub-domain named a capability the author never declared: with
+    // `shell: ["notify"]` and a call to `shell.window.show`, the old code said
+    // "it declares `window` but not this entry" — and `window` appears nowhere in
+    // that manifest. An author following that advice would add `window` instead
+    // of widening `shell`, which is exactly the wrong edit this comment exists to
+    // prevent. (`shell` is what `checkGrant` is asked about below, so the two
+    // arguments now agree.)
+    const viaShellGrant = shellGrant !== undefined
+    const target = viaShellGrant ? "shell" : shellSub
+    const grant = viaShellGrant ? shellGrant : ownGrant
     const verdict = checkGrant(grant, target, method)
     return {
       entryId,
@@ -207,4 +226,37 @@ export function formatOverreach(finding: OverreachFinding): string {
 export function callerLabel(entryId: string): string {
   const index = entryId.lastIndexOf(":")
   return index === -1 ? entryId : entryId.slice(index + 1)
+}
+
+/**
+ * The ONE place a capability call is checked against a manifest.
+ *
+ * Both entry points call this — `ShellHandle.record` for the raw mirror and
+ * `HandsService.record` for the curated `ctx.hands` service — so the rule has a
+ * single implementation. Before this existed the check lived only in
+ * `ShellHandle.record`, and `ctx.hands` (the SUPPORTED entry point) went
+ * unchecked while the escape hatch was checked.
+ *
+ * Returns the warn line to log, or `undefined` when there is nothing to report.
+ * Taking the lookup as an argument keeps this free of any registry/context
+ * dependency, so both callers can pass whatever they hold.
+ *
+ * ⚠ Still declare-and-warn only. See the header.
+ */
+export function overreachWarning(
+  self: unknown,
+  method: string,
+  lookup: ((entryId: string) => VRCXKPluginManifest | undefined) | undefined,
+): string | undefined {
+  // No lookup means "manifests are not loaded yet" (or a shell-less/test host),
+  // NOT "this plugin is undeclared". Warning here would fire on every call in
+  // every test that wires a service without the registry.
+  if (!lookup) return undefined
+  const entryId = callerEntryId(self)
+  // No entry (a bare `ctx.plugin()`) or no registered manifest means there is
+  // nothing to violate: `#24` calls the first case out by name, and the second is
+  // a plugin that never shipped a manifest. Accusing either would be noise.
+  if (!entryId) return undefined
+  const finding = findOverreach(entryId, method, lookup(entryId))
+  return finding ? formatOverreach(finding) : undefined
 }

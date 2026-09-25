@@ -279,9 +279,16 @@ async function bootstrap() {
   //
   // ⚠ Declare-and-warn only, never a refusal: plugins are in-process, so a
   // determined one can bypass this with a plain `import`. See `overreach.ts`.
+  //
+  // BOTH entry points get the lookup, and that is the point: `#24` §2 requires
+  // the curated services and the raw mirror to be covered alike. Wiring only
+  // `capabilities` left `ctx.hands` — the SUPPORTED entry point — unchecked while
+  // the escape hatch was checked.
   const registry = manifestRegistryOf(ctx)
   if (registry) {
-    capabilities.useManifests((entryId) => registry.get(entryId))
+    const lookup = (entryId: string) => registry.get(entryId)
+    capabilities.useManifests(lookup)
+    hands.useManifests(lookup)
   }
 
   // ── Dev watcher (issue #11) — strictly opt-in ──────────────────────────

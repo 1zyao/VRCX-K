@@ -1,6 +1,6 @@
 import { type Context, Service, symbols } from "cordis"
 import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
-import { callerEntryId, findOverreach, formatOverreach } from "./overreach"
+import { callerEntryId, overreachWarning } from "./overreach"
 import type { AppInfo, OsInfo, PathKind, ShellStdioBridge, ShellSysAPI } from "./stdio"
 
 // Re-exported so callers that already import the caller helpers from this module
@@ -130,15 +130,13 @@ export class ShellHandle {
 
     // Overreach: declared vs actual (#24). Warn only — never refuse. See
     // `overreach.ts` for why an enforcement layer cannot exist at this stage.
-    if (this.manifestLookup) {
-      const entryId = callerEntryId(self)
-      const finding = findOverreach(
-        entryId,
-        method,
-        entryId ? this.manifestLookup(entryId) : undefined,
-      )
-      if (finding) this.audit(formatOverreach(finding))
-    }
+    //
+    // ⚠ This is the RAW mirror's call site. The curated services have their own
+    // audit hooks, and each of them must call `overreachWarning` too — the check
+    // does not live "in `record`" for every path just because it lives in this
+    // one. `ctx.hands` was unchecked for exactly that reason.
+    const warning = overreachWarning(self, method, this.manifestLookup)
+    if (warning) this.audit(warning)
   }
 }
 

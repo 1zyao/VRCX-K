@@ -139,7 +139,7 @@ export interface Services {
  */
 export interface Permissions {
   /**
-   * Raw shell surface. Sub-domain granularity only.
+   * Raw shell surface. Sub-domain granularity only. ⚠ `maxItems` MUST equal the `ShellSubdomain` enum length, or a plugin granting every sub-domain has its whole manifest rejected — which silently disables the `#24` warn for exactly the most-privileged plugins. A contract test pins the two together.
    */
   shell?:
     | boolean
@@ -196,6 +196,68 @@ export interface Permissions {
         ShellSubdomain,
         ShellSubdomain,
         ShellSubdomain
+      ]
+    | [
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain
+      ]
+    | [
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain
+      ]
+    | [
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain
+      ]
+    | [
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain
       ];
   notify?: PermissionGrant;
   dialog?: PermissionGrant;
@@ -212,7 +274,7 @@ export interface Permissions {
    */
   autostart?: boolean | string[];
   /**
-   * File primitives (stat/read/write/watch). Reaches the whole disk, so prefer a narrow list over `true`. Declaration only at this stage — not enforced (#24 is declare-and-warn, and the real boundary is M4's subprocess isolation).
+   * File primitives (stat/read/write/watch/list). Reaches the whole disk, so prefer a narrow list over `true`. Declaration only at this stage — not enforced (#24 is declare-and-warn, and the real boundary is M4's subprocess isolation). ⚠ `maxItems` MUST equal the `HandsPrimitive` enum length: adding a primitive to the enum without raising this made a 5-primitive grant INVALID, so the manifest was rejected and the `#24` warn silently switched off. A contract test pins the two together.
    */
   hands?:
     | boolean
@@ -220,7 +282,8 @@ export interface Permissions {
     | [HandsPrimitive]
     | [HandsPrimitive, HandsPrimitive]
     | [HandsPrimitive, HandsPrimitive, HandsPrimitive]
-    | [HandsPrimitive, HandsPrimitive, HandsPrimitive, HandsPrimitive];
+    | [HandsPrimitive, HandsPrimitive, HandsPrimitive, HandsPrimitive]
+    | [HandsPrimitive, HandsPrimitive, HandsPrimitive, HandsPrimitive, HandsPrimitive];
 }
 /**
  * Frontend extension point (M3). Omit for headless plugins.
