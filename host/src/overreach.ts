@@ -14,6 +14,19 @@
 //   What it DOES buy: accidental misuse and undeclared access become VISIBLE
 //   instead of silent, which is `#24`'s stated honest scope.
 //
+// ⚠ BUT "VISIBLE" CURRENTLY MEANS "VISIBLE TO A DEVELOPER", AND ONLY ON A
+//   CONSOLE. The warn goes to `log()` → `console.error` → the host's **stderr**.
+//   In a RELEASE build the shell is `windows_subsystem = "windows"`
+//   (`src-tauri/src/main.rs`), so there is no console attached and **nothing
+//   receives it** — and the host writes no log file anywhere. So on a user's
+//   machine a detected overreach is still, in practice, silent.
+//
+//   This is a REAL gap against `#24`'s intent, not a wording quibble, and it is
+//   tracked rather than papered over: until the warn reaches a channel a user or
+//   a support bundle can read (the shell's snapshot/event stream, or a rotating
+//   log file), do NOT describe this feature as "the user can see it". The
+//   mechanism is correct; the delivery is not yet wired.
+//
 // THE TWO PATHS THAT MUST BOTH BE COVERED (#24 §2)
 //   1. the curated services (`ctx.notify`, `ctx.dialog`, …) — attribution is
 //      natural because they are `Service`s;
