@@ -35,6 +35,30 @@ fn str_arg(args: &[Value], i: usize) -> String {
         .to_string()
 }
 
+// ⚠ KNOWN GAP — the four items below are dead code ON MOBILE, and the Android
+//   build warns about them ON PURPOSE. Read this before "cleaning them up".
+//
+//   The only caller is `shell.deepLink.register`, whose handler sits inside the
+//   `#[cfg(desktop)]` block further down (it shares that block with `autostart`).
+//   On Android that block is not compiled at all, so these compile but nothing
+//   calls them, and `cargo build --target aarch64-linux-android` reports:
+//
+//       warning: constant `MAX_SCHEME_LEN` is never used
+//       warning: constant `RESERVED_SCHEMES` is never used
+//       warning: function `is_scheme_char` is never used
+//       warning: function `validate_deep_link_scheme` is never used
+//
+//   ⚠ That message is misleading in one direction and accurate in another: on
+//   DESKTOP these ARE used (so the warning never fires there, and `clippy
+//   -D warnings` stays clean), while on Android they genuinely have no caller.
+//   It is not leftover code — it is the deep-link surface being desktop-only.
+//
+//   The warning is deliberately LEFT IN as the reminder, so do NOT silence it
+//   with `#[allow(dead_code)]`: the day someone wires deep-link for Android,
+//   these are exactly what must be reached, and a silenced warning would hide
+//   that they were skipped. If this warning ever disappears without Android
+//   deep-link being implemented, something was papered over — check why.
+
 /// Longest scheme this surface accepts.
 ///
 /// RFC 3986 sets no length limit, so the number is a deliberate choice rather
