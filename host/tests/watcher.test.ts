@@ -166,7 +166,24 @@ describe("HostWatcher", () => {
     const temp = join(pluginRoot, ".index.ts.tmp")
     await writeFile(temp, "export default 3")
     await rename(temp, entry)
-    await waitFor(events, (event) => event.type === "change")
+    // ⚠ WAIT FOR THE EVENT THIS TEST IS ABOUT, not for "any change".
+    //
+    // This used to be `waitFor(events, (e) => e.type === "change")` followed by
+    // `expect(events.some((e) => e.type === "change" && e.path === entry))`.
+    // The wait and the assertion disagreed: **writing the temp file emits its
+    // own `change`** for `.index.ts.tmp` (measured — a lone `writeFile(temp)`
+    // produces `type=change path=<root>/plugin/.index.ts.tmp` before any rename
+    // happens), so the wait could be satisfied by the TEMP path while `entry` had
+    // not arrived yet, and the assertion then failed on a platform that was
+    // behaving correctly. That is the intermittent macos-latest failure: it dies
+    // on the `expect` at the old line 170, never in `waitFor`.
+    //
+    // Waiting on the exact predicate the assertion needs removes the race without
+    // weakening what is asserted — the point of the test (an atomic rename
+    // surfaces as a `change` for the BINDING's path) is unchanged.
+    await waitFor(events, (event) => event.type === "change" && event.path === entry)
+    // Redundant with the wait above, but kept so the CONTRACT is visible in the
+    // test body and a regression reports the path rather than a generic timeout.
     expect(events.some((event) => event.type === "change" && event.path === entry)).toBe(true)
     const added = join(pluginRoot, "new.ts")
     await writeFile(added, "new")

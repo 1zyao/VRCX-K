@@ -49,6 +49,13 @@ host/dist/
 # bun-linux-*`); large and never committed.
 host/.bun-cache/
 
+# TypeScript incremental build info. Written by `tsc` whenever a config enables
+# `incremental` / `composite`, and it records absolute-ish paths plus a graph that
+# is meaningless on another machine. Found the hard way: running a throwaway
+# `tsc -p <temp config>` at the repo root left `tsconfig.node.tsbuildinfo` behind
+# as an untracked file that `git add -A` would have swept into a commit.
+*.tsbuildinfo
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
