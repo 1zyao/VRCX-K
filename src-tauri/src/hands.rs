@@ -694,6 +694,8 @@ fn writer_mode(opts: &Value) -> Result<&'static str, String> {
 #[derive(Debug)]
 struct FileWriter {
     file: File,
+    /// Bytes accepted by this writer. See [`DeferredWriter::finish`].
+    written: u64,
 }
 
 impl FileWriter {
@@ -759,7 +761,7 @@ impl FileWriter {
             file.seek(SeekFrom::Start(offset))
                 .map_err(|error| encode_error(classify(&error), error))?;
         }
-        Ok(Self { file })
+        Ok(Self { file, written: 0 })
     }
 }
 
@@ -774,7 +776,10 @@ impl StreamSink for DeferredWriter {
         self.writer
             .file
             .write_all(bytes)
-            .map_err(|error| encode_error(classify(&error), error))
+            .map_err(|error| encode_error(classify(&error), error))?;
+        // ⚠ Count what THIS call wrote, not where the cursor ended up.
+        self.writer.written += bytes.len() as u64;
+        Ok(())
     }
 
     fn finish(&mut self, outcome: Result<(), String>) {
@@ -793,11 +798,12 @@ impl StreamSink for DeferredWriter {
                 // `endOffset` still comes from the cursor, so `append` keeps
                 // reporting where the bytes actually landed rather than where the
                 // caller asked them to start.
-                let written = self.writer.file.stream_position().unwrap_or(0);
+                let written = self.writer.written;
+                let end_offset = self.writer.file.stream_position().unwrap_or(written);
                 let _ = self.writer.file.flush();
                 self.reply.send(json!({
                     "bytes": written,
-                    "endOffset": written,
+                    "endOffset": end_offset,
                     "mode": self.mode,
                 }));
             }
@@ -1817,6 +1823,47 @@ mod tests {
     }
 
     #[test]
+    fn bytes_counts_what_this_call_wrote_not_the_resulting_file_size() {
+        // ⚠ THE REGRESSION for the conflated counter. `bytes` and `endOffset` both
+        // came from the file cursor, so appending 5 bytes to a 1 MiB file reported
+        // `bytes: 1048581` — measured through a real peer. A caller showing
+        // "5 B written", or checking its own byte count, got the file size; the
+        // two agree only when writing a fresh file, which is why it survived.
+        //
+        // ⚠ It asserts the REPLY FRAME, not `writer.written`. The first version
+        // read the field directly, so re-injecting the bug (making `bytes` the
+        // cursor again) left it GREEN — it checked the input to the fix rather
+        // than its output. A capturing reply shows what a caller really receives.
+        let dir = temp_dir("write-bytes");
+        let path = dir.join("big.bin");
+        std::fs::write(&path, vec![b'A'; 1024 * 1024]).expect("seed");
+
+        let writer =
+            FileWriter::open(path.to_str().unwrap(), &json!({ "mode": "append" })).expect("open");
+        let (reply, sink_bytes) = crate::kkrpc_peer::test_support::reply_with_sink();
+        let mut sink = DeferredWriter {
+            writer,
+            reply,
+            mode: "append",
+        };
+        sink.write(b"12345").expect("write");
+        sink.finish(Ok(()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let frame = crate::kkrpc_peer::test_support::last_frame(&sink_bytes);
+        assert_eq!(
+            frame["v"]["bytes"],
+            json!(5),
+            "`bytes` must be what THIS call wrote, not the resulting file size"
+        );
+        assert_eq!(
+            frame["v"]["endOffset"],
+            json!(1024 * 1024 + 5),
+            "`endOffset` stays the cursor position, which is what a resumer needs"
+        );
+    }
+
+    #[test]
     fn an_unrecognised_write_mode_is_refused_rather_than_downgraded() {
         // ⚠ THE REGRESSION for the silent downgrade. Any unrecognised `mode`
         // became `"create"`, which does NOT truncate — so a typo silently meant
@@ -1850,6 +1897,36 @@ mod tests {
                 good
             );
         }
+    }
+
+    #[test]
+    fn writing_to_a_directory_is_refused_with_eisdir_on_every_platform() {
+        // ⚠ The write-side twin of the read guard. `OpenOptions::open` on a
+        // directory succeeds on Unix and fails with `EACCES` on Windows, so the
+        // two platforms disagreed on the code; worse, `open(FIFO, O_WRONLY)`
+        // BLOCKS and this runs inline on the ONE reader thread.
+        let dir = temp_dir("write-dir");
+        let error = FileWriter::open(dir.to_str().unwrap(), &json!({}))
+            .expect_err("a directory must not be opened for writing");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            error.starts_with("EISDIR"),
+            "both platforms must agree on EISDIR, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_missing_write_target_is_still_created() {
+        // The control for the guard above: refusing non-regular files must NOT
+        // refuse a path that simply does not exist yet — `create(true)` is how
+        // callers make a new file, and that is the common case.
+        let dir = temp_dir("write-new");
+        let path = dir.join("fresh.bin");
+        FileWriter::open(path.to_str().unwrap(), &json!({}))
+            .expect("a missing path must still be creatable");
+        let exists = path.exists();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(exists, "create(true) must have made the file");
     }
 
     #[test]
@@ -2081,34 +2158,5 @@ mod tests {
         let error = failure(FileReader::open(dir.to_str().unwrap(), 0));
         std::fs::remove_dir_all(&dir).ok();
         assert!(error.starts_with("EISDIR"), "got: {error}");
-    }
-    #[test]
-    fn writing_to_a_directory_is_refused_with_eisdir_on_every_platform() {
-        // ⚠ The write-side twin of the read guard. `OpenOptions::open` on a
-        // directory succeeds on Unix and fails with `EACCES` on Windows, so the
-        // two platforms disagreed on the code; worse, `open(FIFO, O_WRONLY)`
-        // BLOCKS and this runs inline on the ONE reader thread.
-        let dir = temp_dir("write-dir");
-        let error = FileWriter::open(dir.to_str().unwrap(), &json!({}))
-            .expect_err("a directory must not be opened for writing");
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(
-            error.starts_with("EISDIR"),
-            "both platforms must agree on EISDIR, got: {error}"
-        );
-    }
-
-    #[test]
-    fn a_missing_write_target_is_still_created() {
-        // The control for the guard above: refusing non-regular files must NOT
-        // refuse a path that simply does not exist yet — `create(true)` is how
-        // callers make a new file, and that is the common case.
-        let dir = temp_dir("write-new");
-        let path = dir.join("fresh.bin");
-        FileWriter::open(path.to_str().unwrap(), &json!({}))
-            .expect("a missing path must still be creatable");
-        let exists = path.exists();
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(exists, "create(true) must have made the file");
     }
 }

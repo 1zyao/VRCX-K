@@ -1137,6 +1137,28 @@ pub(crate) mod test_support {
         DeferredReply::new(peer, "test".into())
     }
 
+    /// A [`DeferredReply`] plus the bytes it writes, so a test can assert on the
+    /// exact reply FRAME a sink produced.
+    ///
+    /// ⚠ Needed because asserting a sink's INTERNAL field is not the same as
+    /// asserting what a caller receives. A regression test that read the field
+    /// stayed green when the bug was re-injected; reading the emitted frame is
+    /// what actually fails. See `hands.rs`'s
+    /// `bytes_counts_what_this_call_wrote_not_the_resulting_file_size`.
+    pub(crate) fn reply_with_sink() -> (DeferredReply, Arc<Mutex<Vec<u8>>>) {
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let peer = Peer::new(SharedSink(Arc::clone(&sink)));
+        (DeferredReply::new(peer, "test".into()), sink)
+    }
+
+    /// The last complete frame written through a [`reply_with_sink`] handle.
+    pub(crate) fn last_frame(sink: &Arc<Mutex<Vec<u8>>>) -> serde_json::Value {
+        let bytes = sink.lock().expect("sink");
+        let text = String::from_utf8_lossy(&bytes);
+        let line = text.lines().last().unwrap_or_default();
+        serde_json::from_str(line).unwrap_or(serde_json::Value::Null)
+    }
+
     /// A writer that keeps whatever it is given, for tests that only need the
     /// peer to exist.
     pub(crate) struct SharedSink(pub Arc<Mutex<Vec<u8>>>);
