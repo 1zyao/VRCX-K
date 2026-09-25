@@ -228,13 +228,36 @@ a host that forgets still transfers correctly rather than silently corrupting.
 node docs/probes/hands-e2e/hol.mjs --size=134217728 --samples=100
 ```
 
-Result: **p50 barely moves (1.16–1.28x) but p95 degrades ~51–59x**, and latency
-recovers after the stream stops. That **corrects** §5's "bulk will make
-interaction feel stuck" — the cost is in the tail, not the median.
+Result **before the fix**: p50 barely moves (1.16–1.28x) but p95 degrades ~51–70x,
+and latency recovers after the stream stops. That **corrected** §5's "bulk will
+make interaction feel stuck" — the cost was in the tail, not the median.
 
 ⚠ The cause was **not** separated by this probe; `hol-credit.mjs` below is what
-does it. A loopback measurement also cannot license any cross-machine conclusion —
+did it. A loopback measurement also cannot license any cross-machine conclusion —
 the same discipline as [`transport-lab`](transport-lab/FINDINGS.md) §8.
+
+⚠ **Updated after the C-1 fix** (producers now run on their own thread — see
+`kkrpc_peer.rs::spawn_producer`). Measured on the same probe and payload:
+
+| | before | after |
+|---|---|---|
+| p50 degradation | 1.03x | **~7–9x** |
+| p95 degradation | **70.25x** | **~8–10x** |
+| throughput | 156 MiB/s | **~183 MiB/s** |
+
+⇒ **The tail is fixed; the median regressed.** Both are real, and the mechanism
+is in `hol-credit.mjs`'s two arms: the p50 cost appears ONLY while the producer is
+actively writing (MID ~1.0 ms) and vanishes once credit is exhausted
+(END ~0.22 ms ≈ idle). With one 256 KiB chunk taking ~1.4 ms to write at this
+throughput, a reader that wants the write mutex waits ~half that — the measured
+~0.9 ms. **It is write-mutex contention inherent to a separate writer sharing one
+channel, not a polling artefact** (a 1 ms → 50 µs poll change and a
+`sched_yield` per chunk both left it unmoved).
+
+⚠ **Not fixed, and not fixable inside this design**: one channel means the
+producer must take the same write lock the reader needs. Removing it needs a
+second carrier (the option `docs/hands-prior-art.md` §2 surveys), which is a
+protocol decision, not a tuning one.
 
 ### `hands-e2e/hol-credit.mjs` — WHAT the tail scales with (the cause)
 

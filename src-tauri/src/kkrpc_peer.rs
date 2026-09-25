@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -171,18 +171,20 @@ struct Consumer {
 #[derive(Default)]
 struct StreamTable {
     next_sid: u64,
-    producers: HashMap<String, Producer>,
+    /// Producer streams, keyed by sid. The value is the CONTROL block, not the
+    /// producer: the producer itself is owned by its own thread (see
+    /// [`Peer::spawn_producer`]), which is what keeps a batch off the reader
+    /// thread. Removing the entry is how a terminal frame is claimed — whoever
+    /// still finds it owns the ending.
+    producers: HashMap<String, Arc<ProducerStream>>,
     consumers: HashMap<String, Consumer>,
     /// Event streams (watches), which run on their OWN thread. See [`StreamSource`].
     events: HashMap<String, Arc<EventStream>>,
     /// Stream ids cancelled while they were mid-pump.
     ///
-    /// The pump REMOVES its producer from the table before doing file I/O (so the
-    /// lock is not held across a read), which means a `return` can arrive during
-    /// that window and find nothing to cancel. Without this set the pump would
-    /// re-insert the producer afterwards and the stream would be un-cancellable
-    /// — the host has stopped pulling, so the open file would leak until the
-    /// process exits.
+    /// Kept for the window where a producer has been taken off the table but its
+    /// thread has not yet observed the cancellation, so a late `return` is not
+    /// lost.
     cancelled: HashSet<String>,
 }
 
@@ -192,6 +194,77 @@ struct StreamTable {
 struct EventStream {
     credit: AtomicI64,
     cancelled: AtomicBool,
+}
+
+/// Shared control block for one PRODUCER stream.
+///
+/// Same shape as [`EventStream`] and for the same reason: the producer runs on
+/// its own thread, so the reader thread and the producer thread coordinate here
+/// rather than by the reader owning the producer.
+///
+/// ⚠ Why this exists at all — measured, not theoretical. `pump_producer` used to
+/// run the whole `for _ in 0..credit` batch ON THE READER THREAD, so the reader
+/// could not return to `read_line` until the batch drained and an inbound
+/// request waited out the **remaining credit**. `hol-credit.mjs` isolated it:
+/// interactive p95 was linear in outstanding credit (~1.7 ms/chunk mid-batch)
+/// while the batch-END probe sat at idle, and the raw `hol.mjs` 51–70x tail fell
+/// straight out of kkrpc's `pull n=32` open (1.7 x 32 ~= 54 ms vs a measured
+/// 55.7 ms max).
+///
+/// ⚠ CREDIT IS SIGNALLED, NOT POLLED. The first version slept `IDLE_POLL` and
+/// re-checked, which put the poll interval directly into the latency: p50 sat at
+/// ~1 ms with a 1 ms interval, and dropping the interval to 50 µs moved it to
+/// ~0.95 ms — i.e. the wake-up granularity WAS the residual. A [`Condvar`] makes
+/// a `pull` wake the producer immediately, so the only remaining cost is the
+/// real work. [`EventStream`] can afford a 10 ms sleep because a watch is quiet
+/// by nature; a producer is on the hot path of every `hands.read`.
+#[derive(Default)]
+struct ProducerStream {
+    credit: Mutex<i64>,
+    /// Signalled on every credit increase and on cancellation.
+    credit_changed: Condvar,
+    cancelled: AtomicBool,
+}
+
+impl ProducerStream {
+    /// Add `n` credit and wake the producer thread.
+    fn add_credit(&self, n: i64) {
+        let mut credit = self.credit.lock().expect("producer credit");
+        *credit += n;
+        self.credit_changed.notify_one();
+    }
+
+    /// Block until credit is available or the stream is cancelled.
+    ///
+    /// Returns `false` when cancelled, so the caller exits its loop.
+    fn wait_for_credit(&self) -> bool {
+        let mut credit = self.credit.lock().expect("producer credit");
+        while *credit <= 0 {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return false;
+            }
+            // A timeout is only a safety net for a missed notification; the
+            // normal path wakes on `add_credit` or `cancel` immediately.
+            let (guard, _) = self
+                .credit_changed
+                .wait_timeout(credit, Duration::from_millis(50))
+                .expect("producer credit");
+            credit = guard;
+        }
+        !self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Spend one credit. Callers must have observed credit > 0.
+    fn spend_credit(&self) {
+        let mut credit = self.credit.lock().expect("producer credit");
+        *credit -= 1;
+    }
+
+    /// Stop the producer and wake it if it is waiting.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.credit_changed.notify_all();
+    }
 }
 
 impl StreamTable {
@@ -531,23 +604,165 @@ impl Peer {
     // --- streaming ---------------------------------------------------------
 
     /// Start a producer-side stream: reply with a stream reference, then emit
-    /// chunks as the host spends credit.
+    /// chunks from the producer's OWN THREAD as the host spends credit.
     ///
     /// The reply is a REFERENCE, not data — this is what makes a multi-GB file
     /// cost `credit × chunk` bytes of memory instead of the file size.
-    pub fn open_stream(&self, request_id: &str, producer: Producer) -> Result<String, String> {
-        let sid = {
+    ///
+    /// # ⚠ The thread is the FIX, not an optimisation
+    ///
+    /// This used to register the producer in the table and let `pump_producer`
+    /// emit batches **on the reader thread**. Measured consequence
+    /// (`docs/probes/hands-e2e/hol-credit.mjs`, MID vs END probe at equal credit):
+    /// the reader could not return to `read_line` until a whole batch drained, so
+    /// an inbound interactive request waited out the **remaining credit** —
+    /// p95 linear in outstanding credit at ~1.7 ms/chunk, which is also why
+    /// `hol.mjs` showed a 51–70x tail (kkrpc opens with `pull n=32`:
+    /// 1.7 x 32 ~= 54 ms against a measured 55.7 ms max).
+    ///
+    /// [`Peer::open_event_stream`] had already solved the same hazard for watches
+    /// by giving the source its own thread. This is that shape applied to
+    /// producers, which is why [`ProducerStream`] mirrors [`EventStream`].
+    ///
+    /// ⚠ Do NOT "fix" this by lowering the credit instead: throughput scales with
+    /// it (87 MiB/s at credit 1 vs 171 MiB/s at 32), and emitting a single chunk
+    /// per pull would **deadlock**, because kkrpc's consumer only replenishes once
+    /// `consumedSincePull >= 16`.
+    pub fn open_stream(
+        self: &Arc<Self>,
+        request_id: &str,
+        producer: Producer,
+    ) -> Result<String, String> {
+        let (sid, control) = {
             let mut streams = self.streams.lock().map_err(|err| err.to_string())?;
             let sid = streams.new_sid();
-            streams.producers.insert(sid.clone(), producer);
-            sid
+            let control = Arc::new(ProducerStream::default());
+            streams.producers.insert(sid.clone(), Arc::clone(&control));
+            (sid, control)
         };
-        self.write(&json!({
+
+        // The stream-ref reply goes out BEFORE the thread starts, so no chunk can
+        // reach the host before it holds a reference to route it by.
+        if let Err(error) = self.write(&json!({
             "t": "r",
             "id": request_id,
             "v": { STREAM_REF: "async-iterable", "id": sid },
-        }))?;
+        })) {
+            let mut streams = self.streams.lock().expect("streams");
+            streams.producers.remove(&sid);
+            let mut producer = producer;
+            producer.close();
+            return Err(error);
+        }
+
+        // Hand `sid` to the thread (which owns it) and return a copy to the
+        // caller; the thread needs it for every frame it writes.
+        let thread_sid = sid.clone();
+        self.spawn_producer(thread_sid, control, producer);
         Ok(sid)
+    }
+
+    /// The producer's own thread: wait for credit, emit one chunk, repeat.
+    ///
+    /// Owns the producer outright, so the reader thread never touches it and never
+    /// blocks on file I/O. Credit is the only coupling — the host's `pull` widens
+    /// `control.credit`, this loop consumes it.
+    fn spawn_producer(
+        self: &Arc<Self>,
+        sid: String,
+        control: Arc<ProducerStream>,
+        mut producer: Producer,
+    ) {
+        let peer = Arc::clone(self);
+        thread::spawn(move || {
+            loop {
+                // Block until the host grants credit (or the stream is cancelled).
+                // Signalled rather than polled: a poll interval would land directly
+                // in the latency of every following `hands.read`.
+                if !control.wait_for_credit() {
+                    break;
+                }
+                control.spend_credit();
+
+                let frame = match producer.next_chunk() {
+                    StreamStep::Chunk(bytes) => {
+                        let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        json!({
+                            "t": "sr", "id": next_id("x"), "sid": sid,
+                            "d": false, "v": payload,
+                        })
+                    }
+                    StreamStep::Done => {
+                        // ⚠ No `v` on the terminal frame, and that is ONLY correct
+                        // because `StreamStep::Done` carries no payload (see the
+                        // enum above) and `StreamSink::finish` takes no value
+                        // either.
+                        //
+                        // kkrpc's remote consumer DOES read a terminal `v`.
+                        // Verified against the shipped source map
+                        // (`streaming-channel.ts`):
+                        //
+                        //   :433-439  const result = { done: message.d === true,
+                        //                             value: this.decodeValue(message.v) }
+                        //             waiter.resolve(result)      // <-- delivered
+                        //   :648-655  readBuffered() returns it to the caller
+                        //   :667      `if (stream.done) return {done:true,value:undefined}`
+                        //             is NOT this path — it is the "already
+                        //             finished, next() called again" short-circuit
+                        //
+                        // So an earlier claim of mine ("the JS side ignores it
+                        // anyway, the value is hardcoded `void 0`") was WRONG: it
+                        // read the short-circuit branch as the delivery path. The
+                        // honest reason there is nothing to send is simply that no
+                        // value exists.
+                        //
+                        // ⇒ If `StreamStep::Done` ever gains a payload, THIS frame
+                        // must gain `"v"` in the same change, or the value is
+                        // silently dropped to `undefined` on the host side.
+                        json!({ "t": "sr", "id": next_id("x"), "sid": sid, "d": true })
+                    }
+                    StreamStep::Failed(message) => json!({
+                        "t": "sr", "id": next_id("x"), "sid": sid,
+                        "e": { "n": "Error", "m": message },
+                    }),
+                };
+                let terminal = frame.get("e").is_some()
+                    || frame.get("d").and_then(Value::as_bool) == Some(true);
+
+                if terminal {
+                    // Whoever still finds the entry in the table owns the ending.
+                    // A cancellation path removes it and answers on its own, so a
+                    // late terminal frame here would be a duplicate. Remove BEFORE
+                    // writing: a test (and the host) may observe the frame and
+                    // immediately assert the stream is forgotten.
+                    let owned = {
+                        let mut streams = peer.streams.lock().expect("streams");
+                        streams.producers.remove(&sid).is_some()
+                    };
+                    if owned {
+                        let _ = peer.write(&frame);
+                    }
+                    break;
+                }
+
+                if peer.write(&frame).is_err() {
+                    // The transport is gone. ⚠ Do NOT just drop our own entry:
+                    // `forget_stream` also FAILS EVERY CONSUMER SINK, and that is
+                    // the only thing standing between a broken write side and a
+                    // `hands.write` caller hanging until kkrpc's 30s timeout.
+                    // `close_streams` is not a safety net here — it runs on reader
+                    // EOF, which may never arrive if only the WRITE side is broken
+                    // (the same reasoning that put the replenish-write check in
+                    // `dispatch_stream_data`).
+                    peer.forget_stream(&sid);
+                    break;
+                }
+            }
+            // Exactly one close per producer, on every exit path (clean end,
+            // failure, cancellation, transport death) — a file handle must not
+            // outlive the stream.
+            producer.close();
+        });
     }
 
     /// Register a sink for a stream the host is producing, and open the window.
@@ -595,8 +810,21 @@ impl Peer {
                     .and_then(Value::as_u64)
                     .map(|n| n.max(1) as usize)
                     .unwrap_or(1);
-                // Event streams are pumped by their own thread; all a pull does
-                // here is widen its window.
+                // Both stream kinds are pumped by their OWN thread; all a pull
+                // does here is widen the corresponding window. ⚠ This is the whole
+                // point of the producer thread: the reader returns to `read_line`
+                // immediately instead of emitting the batch itself.
+                let producer = self
+                    .streams
+                    .lock()
+                    .expect("streams")
+                    .producers
+                    .get(sid)
+                    .map(Arc::clone);
+                if let Some(producer) = producer {
+                    producer.add_credit(credit as i64);
+                    return;
+                }
                 let event = self
                     .streams
                     .lock()
@@ -606,9 +834,7 @@ impl Peer {
                     .map(Arc::clone);
                 if let Some(event) = event {
                     event.credit.fetch_add(credit as i64, Ordering::SeqCst);
-                    return;
                 }
-                self.pump_producer(sid, credit);
             }
             // `return`/`throw` are the only request/response-shaped stream
             // frames: they owe an acknowledgement carrying this control id.
@@ -619,12 +845,15 @@ impl Peer {
                     // source and will close it.
                     if let Some(event) = streams.events.remove(sid) {
                         event.cancelled.store(true, Ordering::SeqCst);
-                    } else if let Some(mut producer) = streams.producers.remove(sid) {
-                        producer.close();
+                    } else if let Some(producer) = streams.producers.remove(sid) {
+                        // Same shape for producers: signal the owning thread and
+                        // let it close the file. Closing here would race with the
+                        // thread still inside `next_chunk`.
+                        producer.cancel();
                     } else {
-                        // Either already finished, or mid-pump and therefore out
-                        // of the table. Both mean "no further chunks"; record it
-                        // so a mid-pump producer is not re-inserted.
+                        // Already finished, or removed by the ending path. Record
+                        // it so a thread that has not yet observed the cancel
+                        // cannot resurrect the stream.
                         streams.cancelled.insert(sid.to_string());
                     }
                 }
@@ -639,127 +868,6 @@ impl Peer {
                 let _ = self.write(&acknowledgement);
             }
             _ => {}
-        }
-    }
-
-    /// Emit up to `credit` chunks for one producer.
-    ///
-    /// The producer is taken OUT of the table for the duration of each chunk so
-    /// the lock is never held across file I/O, and `cancelled` decides whether it
-    /// goes back — see [`StreamTable::cancelled`].
-    ///
-    /// # ⚠ This loop runs on the READER THREAD, and that is a measured latency bug
-    ///
-    /// The reader thread cannot call `read_line` again until this whole batch is
-    /// emitted, so an inbound interactive request waits out the **remaining
-    /// credit** — not one chunk.
-    ///
-    /// Measured (`docs/probes/hands-e2e/hol-credit.mjs`, MID vs END probe at equal
-    /// credit): the interactive p95 is **linear in the outstanding credit**, at
-    /// ~1.7 ms per outstanding chunk, while the batch-end probe sits at idle.
-    ///
-    /// | credit | p95 mid-batch | p95 at batch end |
-    /// |---|---|---|
-    /// | 4  | 6.9 ms | 0.34 ms |
-    /// | 32 | 50.8 ms | 0.32 ms |
-    ///
-    /// It also **explains** the raw 51x tail seen in `hol.mjs`: kkrpc's consumer
-    /// opens with `pull n=32` and replenishes 16 at a time
-    /// (`node_modules/kkrpc/dist/streaming.js`), so 1.7 x 32 ~= 54 ms against a
-    /// measured max of 55.7 ms, and 1.7 x 16 ~= 27 ms against a measured p95 of
-    /// 24.3 ms.
-    ///
-    /// ⇒ The cause is neither pipe queueing nor "the peer is busy with base64":
-    /// it is **dispatch starvation caused by batching on the reader thread**. A
-    /// cheaper carrier shortens each iteration but does not remove the wait for
-    /// the whole batch.
-    ///
-    /// The real fix is to give producers their OWN thread, exactly as
-    /// [`Peer::open_event_stream`] already does for watches (whose comment states
-    /// this hazard — the producer path has the same one). Do not "fix" it by
-    /// lowering the credit alone: throughput scales with it (87 MiB/s at credit 1
-    /// vs 171 MiB/s at 32), and emitting a single chunk per pull would **deadlock**,
-    /// because kkrpc's consumer only replenishes once `consumedSincePull >= 16`.
-    fn pump_producer(self: &Arc<Self>, sid: &str, credit: usize) {
-        for _ in 0..credit {
-            let mut producer = {
-                let mut streams = self.streams.lock().expect("streams");
-                if streams.cancelled.remove(sid) {
-                    return;
-                }
-                match streams.producers.remove(sid) {
-                    Some(producer) => producer,
-                    None => return,
-                }
-            };
-
-            let frame = match producer.next_chunk() {
-                StreamStep::Chunk(bytes) => {
-                    let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                    json!({
-                        "t": "sr", "id": next_id("x"), "sid": sid,
-                        "d": false, "v": payload,
-                    })
-                }
-                StreamStep::Done => {
-                    producer.close();
-                    // ⚠ No `v` on the terminal frame, and that is ONLY correct
-                    // because `StreamStep::Done` carries no payload (see the enum
-                    // above) and `StreamSink::finish` takes no value either.
-                    //
-                    // kkrpc's remote consumer DOES read a terminal `v`. Verified
-                    // against the shipped source map (`streaming-channel.ts`):
-                    //
-                    //   :433-439  const result = { done: message.d === true,
-                    //                             value: this.decodeValue(message.v) }
-                    //             waiter.resolve(result)      // <-- delivered
-                    //   :648-655  readBuffered() returns it to the caller
-                    //   :667      `if (stream.done) return {done:true,value:undefined}`
-                    //             is NOT this path — it is the "already finished,
-                    //             next() called again" short-circuit
-                    //
-                    // So an earlier claim of mine ("the JS side ignores it anyway,
-                    // the value is hardcoded `void 0`") was WRONG: it read the
-                    // short-circuit branch as the delivery path. The honest reason
-                    // there is nothing to send is simply that no value exists.
-                    //
-                    // ⇒ If `StreamStep::Done` ever gains a payload, THIS frame must
-                    // gain `"v"` in the same change, or the value is silently
-                    // dropped to `undefined` on the host side.
-                    json!({ "t": "sr", "id": next_id("x"), "sid": sid, "d": true })
-                }
-                StreamStep::Failed(message) => {
-                    producer.close();
-                    json!({
-                        "t": "sr", "id": next_id("x"), "sid": sid,
-                        "e": { "n": "Error", "m": message },
-                    })
-                }
-            };
-            let terminal =
-                frame.get("e").is_some() || frame.get("d").and_then(Value::as_bool) == Some(true);
-
-            if terminal {
-                let mut streams = self.streams.lock().expect("streams");
-                streams.cancelled.remove(sid);
-                let _ = self.write(&frame);
-                return;
-            }
-
-            // Re-insert before writing, so a `return` arriving concurrently is
-            // seen (as a removal) rather than racing with a later insert.
-            {
-                let mut streams = self.streams.lock().expect("streams");
-                if streams.cancelled.remove(sid) {
-                    producer.close();
-                    return;
-                }
-                streams.producers.insert(sid.to_string(), producer);
-            }
-            if self.write(&frame).is_err() {
-                self.forget_stream(sid);
-                return;
-            }
         }
     }
 
@@ -957,8 +1065,11 @@ impl Peer {
     /// Drop local state for a stream. Used when the transport fails mid-stream.
     fn forget_stream(&self, sid: &str) {
         let mut streams = self.streams.lock().expect("streams");
-        if let Some(mut producer) = streams.producers.remove(sid) {
-            producer.close();
+        if let Some(producer) = streams.producers.remove(sid) {
+            // Signal only: the producer's own thread is very likely inside
+            // `next_chunk` right now, so it must be the one to close the handle.
+            // Closing here would be a data race on the file.
+            producer.cancel();
         }
         if let Some(mut consumer) = streams.consumers.remove(sid) {
             consumer
@@ -976,11 +1087,13 @@ impl Peer {
         }));
     }
 
-    /// Drop every stream (transport end). Producers are closed; consumers fail.
+    /// Drop every stream (transport end). Producers are signalled; consumers fail.
     fn close_streams(&self) {
         let mut streams = self.streams.lock().expect("streams");
-        for (_, mut producer) in streams.producers.drain() {
-            producer.close();
+        for (_, producer) in streams.producers.drain() {
+            // Signal, do not close: each producer's own thread owns its handle and
+            // may be mid-`next_chunk`. It observes this flag and closes itself.
+            producer.cancel();
         }
         for (_, mut consumer) in streams.consumers.drain() {
             consumer.sink.finish(Err(TRANSPORT_CLOSED.to_string()));
@@ -1665,6 +1778,107 @@ mod tests {
         fn close(&mut self) {
             *self.closed.lock().unwrap() = true;
         }
+    }
+
+    /// A producer whose every chunk takes `per_chunk` to produce.
+    ///
+    /// Models a real file read: the cost is INSIDE `next_chunk`, which is where
+    /// `pump_producer` spends its batch. Used to measure head-of-line blocking —
+    /// see `an_inbound_request_is_served_while_a_large_batch_is_in_flight`.
+    struct SlowProducer {
+        remaining: usize,
+        per_chunk: Duration,
+        closed: Arc<Mutex<bool>>,
+    }
+
+    impl StreamProducer for SlowProducer {
+        fn next_chunk(&mut self) -> StreamStep {
+            if self.remaining == 0 {
+                return StreamStep::Done;
+            }
+            self.remaining -= 1;
+            thread::sleep(self.per_chunk);
+            StreamStep::Chunk(vec![7u8; 4])
+        }
+        fn close(&mut self) {
+            *self.closed.lock().unwrap() = true;
+        }
+    }
+
+    #[test]
+    fn an_inbound_request_is_served_while_a_large_batch_is_in_flight() {
+        // ⚠ THE HEAD-OF-LINE-BLOCKING REGRESSION.
+        //
+        // `pump_producer` used to run `for _ in 0..credit` ON THE READER THREAD,
+        // so while a batch was being produced the reader was not in `read_line`
+        // and an inbound request waited for the batch to finish. Measured end to
+        // end (docs/probes/hands-e2e/hol-credit.mjs): p95 degradation grew with
+        // the credit — 22x at credit 4, 196x at credit 32 — and MID-batch probes
+        // were far worse than END-batch ones, which is the signature of
+        // starvation rather than queueing.
+        //
+        // The contract this pins: producing N chunks must NOT delay an inbound
+        // request by anything proportional to N. Timing-based, so the assertions
+        // are deliberately loose (a generous multiple of the production cost
+        // rather than an exact bound) — the point is to catch "waits for the
+        // WHOLE batch", not to measure microseconds.
+        let mut h = Harness::new();
+        let per_chunk = Duration::from_millis(20);
+        let credit = 16; // 16 * 20ms = 320ms if the batch is not interruptible
+        let closed = Arc::new(Mutex::new(false));
+        h.peer
+            .open_stream(
+                "req-1",
+                Box::new(SlowProducer {
+                    remaining: 1000,
+                    per_chunk,
+                    closed: Arc::clone(&closed),
+                }),
+            )
+            .expect("open");
+        let sid = h.next_frame()["v"]["id"].as_str().unwrap().to_string();
+
+        // A handler that answers immediately.
+        h.peer.on("ping", Arc::new(|_| json!("still-alive")));
+
+        // Ask for a batch big enough that serving it blocks the reader for a
+        // long time if the pump owns that thread.
+        h.feed(&format!(
+            "{}\n",
+            json!({ "t": "sq", "id": "c1", "sid": sid, "op": "pull", "n": credit })
+        ));
+        // Then, while that batch is being produced, send an ordinary request.
+        // ⚠ `"op":"call"` is required: a `t:"q"` frame without it is not a
+        // request and is never dispatched (the first version of this test omitted
+        // it and failed with a frame TIMEOUT rather than the timing assertion —
+        // which looks like the bug but is only a malformed frame).
+        h.feed(&format!(
+            "{}\n",
+            json!({ "t": "q", "id": "p1", "op": "call", "p": ["ping"] })
+        ));
+
+        // Drain frames until the ping is answered, recording how long it took.
+        let started = Instant::now();
+        let mut answered = None;
+        while started.elapsed() < Duration::from_secs(10) {
+            let frame = h.next_frame();
+            if frame["id"] == json!("p1") {
+                answered = Some(started.elapsed());
+                break;
+            }
+        }
+
+        let latency = answered.expect("the ping must be answered");
+        // The batch takes credit * per_chunk to produce; a blocked reader could
+        // not answer before most of it elapsed. Require the answer well inside
+        // that window — generous enough to survive a loaded CI machine, tight
+        // enough to fail when the whole batch is un-interruptible.
+        let batch_cost = per_chunk * credit as u32;
+        assert!(
+            latency < batch_cost / 2,
+            "an inbound request waited {latency:?} — the producer is starving the \
+             reader thread (one batch costs {batch_cost:?})"
+        );
     }
 
     #[test]
