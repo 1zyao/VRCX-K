@@ -152,6 +152,12 @@ fn dispatch_app_command(
 ///
 /// The brain owns what a URL MEANS (log in, join an instance); the shell only
 /// proves it arrived.
+///
+/// ⚠ Its only caller is the `on_open_url` hook in `.setup()`. With no scheme
+/// declared in `tauri.conf.json` that hook never fires today, so this function
+/// has never run in a real launch — it is the consumer waiting for a scheme,
+/// not evidence that deep links work. See the note at
+/// `tauri_plugin_deep_link::init()` above.
 #[cfg(desktop)]
 fn forward_deep_link(app: &tauri::AppHandle, urls: Vec<String>) {
     let delivery = {
@@ -250,11 +256,37 @@ pub fn run() {
         // Deep links. Registered AFTER single-instance on purpose: a second
         // launch carrying a URL must be forwarded to the running instance, which
         // is what single-instance's `deep-link` feature (enabled in Cargo.toml)
-        // arranges. Without that pairing a `vrchat://` link would open a second
+        // arranges. Without that pairing an incoming link would open a second
         // app instead of reaching the live one.
         //
-        // ⚠ Runtime scheme registration is Windows/Linux only; on macOS the
-        // scheme must be declared in `tauri.conf.json`.
+        // ⚠ NO SCHEME IS DECLARED YET, so today nothing actually emits
+        // `deep-link://new-url` and `forward_deep_link` below never runs.
+        // Measured in `tauri-plugin-deep-link` 2.4.10 (`src/lib.rs:196-222` —
+        // this is the same function single-instance calls to forward a second
+        // launch): `handle_cli_arguments` returns immediately when the plugin
+        // config is `None`, and otherwise only accepts a URL whose scheme is in
+        // that config. `tauri.conf.json` has no `plugins.deep-link` section at
+        // all, so the config is `None` and BOTH entry points — cold start
+        // (`init_deep_link` → `handle_cli_arguments`, `src/lib.rs:73-84`) and
+        // single-instance forwarding (`tauri-plugin-single-instance` 2.4.4
+        // `src/lib.rs:55-57`) — stop before emitting. The `on_open_url` hook
+        // further down is therefore wired but unreachable.
+        //
+        // ⚠ The scheme string is a genuine open decision, not a missing line:
+        // `vrcx` is already registered by the separate VRCX app and `vrchat`
+        // belongs to the VRChat client itself, so neither can be claimed
+        // (docs/hands-prior-art.md §2.1/§2.3). No name has been chosen by the
+        // owner, so `tauri.conf.json` legitimately stays without one — the
+        // honest state here is "machinery present, no scheme declared".
+        //
+        // ⚠ Platform split (upstream `register`, 2.4.10 `src/lib.rs:259-281`
+        // vs `:133-135`): Windows/Linux support RUNTIME registration through
+        // `shell.deepLink.register`; macOS/Android/iOS return
+        // `Error::UnsupportedPlatform` and instead require the scheme to be
+        // declared in `tauri.conf.json` (`plugins.deep-link.desktop.schemes` for
+        // desktop, `plugins.deep-link.mobile` for the app-link form). So even
+        // after a runtime registration succeeds on Windows, macOS still has no
+        // path to a delivered URL until the config declares the name.
         //
         // ⚠ The `on_open_url` hook is registered in the ONE `.setup()` below,
         // NOT here. `Builder::setup` is a single slot: a second call REPLACES the
@@ -328,6 +360,17 @@ pub fn run() {
             // delivers it, this process receives it, nothing happens. The brain
             // owns what a URL MEANS (log in, join an instance); the shell only
             // proves it arrived.
+            //
+            // ⚠ This hook is currently UNREACHABLE, so it is the intended
+            // consumer for the day a scheme is chosen — not a working delivery
+            // path today. On Windows/Linux the emission is the config-gated
+            // `handle_cli_arguments` described on `init()` above, and no scheme
+            // is declared in `tauri.conf.json`. Registering one at runtime via
+            // `shell.deepLink.register` does NOT change that: the plugin's own
+            // docs say dynamic schemes "WON'T be processed" there. On macOS the
+            // plugin uses `RunEvent::Opened` instead (which does not read the
+            // config), but the bundle only advertises URL types the config
+            // declares, so the OS still has nothing to deliver.
             #[cfg(desktop)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt as _;
