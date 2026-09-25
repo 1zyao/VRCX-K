@@ -81,7 +81,9 @@ describe("HostWatcher", () => {
       debounceMs: 40,
       bindings: [binding("plugin", entry, [pluginRoot])],
       onEvent: (event) => events.push(event),
-      onChange: (path) => changes.push(path),
+      onChange: (path) => {
+        changes.push(path)
+      },
     })
     await watcher.start()
     await waitFor(events, (event) => event.type === "started")
@@ -139,7 +141,9 @@ describe("HostWatcher", () => {
         binding("b", join(root, "b.ts"), [shared]),
       ],
       onEvent: (event) => events.push(event),
-      onChange: (path) => changes.push(path),
+      onChange: (path) => {
+        changes.push(path)
+      },
     })
     await watcher.start()
     await waitFor(events, (event) => event.type === "started")
@@ -246,7 +250,9 @@ describe("HostWatcher", () => {
       debounceMs: 20,
       bindings: [binding("plugin", entry, [pluginRoot])],
       onEvent: (event) => events.push(event),
-      onChange: (path) => changes.push(path),
+      onChange: (path) => {
+        changes.push(path)
+      },
     })
     await watcher.start()
     await waitFor(events, (event) => event.type === "started")

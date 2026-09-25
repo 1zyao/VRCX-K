@@ -20,12 +20,40 @@ import {
 } from "../src/contracts/hostReady"
 import { collectHostEnvironment } from "../src/host-environment"
 
+/**
+ * The shape this file actually reads out of the schema.
+ *
+ * ⚠ `properties` used to be `Record<string, unknown>`, which made ALL eight
+ * accesses below (`.const`, `.type`, `.pattern`, …) `unknown` and therefore
+ * errors — under `strict`, `unknown` has no properties. The annotation was the
+ * bug, not the assertions: these tests read specific JSON-Schema keywords, so
+ * the type should say so. Fields are optional because a given property may use
+ * any subset (e.g. an `enum` instead of a `const`).
+ *
+ * Appearing only now is the point: `host/tests` was in no tsconfig program, so
+ * an over-wide annotation here was never checked.
+ */
+type JsonSchemaProperty = {
+  const?: unknown
+  type?: string | string[]
+  pattern?: string
+  enum?: unknown[]
+  minimum?: number
+  maximum?: number
+  /** `extra` is bounded by this; compared against the parity corpus below. */
+  maxProperties?: number
+  items?: JsonSchemaProperty
+  /** Nested object schemas — `host.properties.*` is read two levels down. */
+  properties?: Record<string, JsonSchemaProperty>
+  [key: string]: unknown
+}
+
 const schemaPath = new URL("../../contracts/host-ready/v1/host-ready.schema.json", import.meta.url)
 const schema = (await Bun.file(schemaPath).json()) as {
   $id: string
   additionalProperties: boolean
   required: string[]
-  properties: Record<string, unknown>
+  properties: Record<string, JsonSchemaProperty>
 }
 
 const env = collectHostEnvironment()
@@ -90,8 +118,13 @@ test("the platform vocabulary is the one plugin-manifest already fixed", () => {
   expect(toArch("arm64")).toBe("arm64")
   expect(() => toArch("ia32")).toThrow()
   // The contract's enums must match what the mapper can produce.
-  expect(schema.properties.host.properties.platform.enum).toEqual(["windows", "linux", "macos"])
-  expect(schema.properties.host.properties.arch.enum).toEqual(["x64", "arm64"])
+  // `hostProperties` is checked rather than `!`-asserted: a missing `properties`
+  // here means the schema itself lost its shape, which is worth failing loudly on
+  // with a name instead of throwing "cannot read property of undefined" later.
+  const hostProperties = schema.properties.host.properties
+  if (!hostProperties) throw new Error("schema.properties.host.properties is missing")
+  expect(hostProperties.platform.enum).toEqual(["windows", "linux", "macos"])
+  expect(hostProperties.arch.enum).toEqual(["x64", "arm64"])
 })
 
 test("the guard rejects a wrong schema version", () => {
@@ -184,7 +217,17 @@ const corpus = (await Bun.file(corpusPath).json()) as {
 }
 
 test("the shared extra parity corpus agrees with the schema bound", () => {
-  expect(corpus.maxProperties).toBe(schema.properties.extra.maxProperties)
+  // `maxProperties` is optional in the schema type, so the comparison against a
+  // definite number is a real assertion rather than a formality. `toBeDefined()`
+  // does NOT narrow the type (bun's matcher returns void), so the guard is an
+  // explicit throw — it both narrows and names the missing side, instead of
+  // silently comparing `number` to `undefined`.
+  const extras = schema.properties.extra
+  const bound = extras.maxProperties
+  if (typeof bound !== "number") {
+    throw new Error("schema.properties.extra.maxProperties is not a number")
+  }
+  expect(corpus.maxProperties).toBe(bound)
   expect(corpus.cases.length).toBeGreaterThan(0)
 })
 

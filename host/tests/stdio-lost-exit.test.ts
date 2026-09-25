@@ -19,7 +19,7 @@
 import { afterEach, beforeAll, expect, test } from "bun:test"
 import { spawn } from "node:child_process"
 import { join } from "node:path"
-import { killTree, resolveBun, warmBun } from "./helpers"
+import { killTree, pipe, resolveBun, warmBun } from "./helpers"
 
 const hostDir = join(import.meta.dir, "..")
 const bun = resolveBun()
@@ -49,15 +49,19 @@ test("a write failure during the handshake stops the host with the dedicated cod
   const stderr: string[] = []
   // Checked rather than asserted: `spawn` types the pipes as optional (they come
   // from `stdio`), while this test always passes ["pipe","pipe","pipe"].
-  const errPipe = child.stderr
-  const outPipe = child.stdout
-  if (!errPipe || !outPipe) {
-    throw new Error('spawned host has no stdio pipes (spawn needs stdio: ["pipe","pipe","pipe"])')
-  }
+  const errPipe = pipe(child.stderr, "stderr")
+  const outPipe = pipe(child.stdout, "stdout")
   errPipe.on("data", (c: Buffer) => stderr.push(c.toString()))
 
+  // `child` is the module-level `let` (`| undefined`, cleared in `afterEach`).
+  // TypeScript does not carry the assignment from the `spawn` call above across
+  // these statements, so it must be narrowed once here — the helper below is the
+  // local equivalent of `hostProc()` in `stdin-loss.test.ts`, and it throws a
+  // NAMED error rather than producing `undefined` at the `.once` call.
+  const spawned = child
+  if (!spawned) throw new Error("test did not spawn a host process")
   const exited = new Promise<number | null>((resolve) =>
-    child.once("exit", (exitCode) => resolve(exitCode)),
+    spawned.once("exit", (exitCode) => resolve(exitCode)),
   )
 
   // Break our read end of the host's stdout IMMEDIATELY, before it writes the

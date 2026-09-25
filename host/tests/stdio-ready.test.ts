@@ -55,11 +55,25 @@ test("host stdio ready then ping and stop", async () => {
     lifecycle: pipe(child.stdout, "stdout"),
   })
   const channel = new RPCChannel<ShellSysAPI, HostStdioAPI>(transport, {
+    // ⚠ Partial mock, and the generics are NOT the production order on purpose.
+    // `RPCChannel<Local, Remote>`: `expose` provides Local, `getAPI()` returns
+    // Remote. This test plays the SHELL, so it exposes `ShellSysAPI.ready` (what
+    // the host calls) and drives `HostStdioAPI.ping/stop` (what the host serves)
+    // — production is the mirror image (`stdio.ts` uses
+    // `<HostStdioAPI, ShellSysAPI>` because the host is the one exposing).
+    //
+    // Only `ready` is implemented: the host never calls notify/dialog/window in
+    // this scenario, so stubbing seven unused RPCs would be noise that could
+    // itself drift. The cast is the same pattern
+    // `hands-e2e-integration.test.ts` uses for its partial shell bridge.
     expose: {
-      async ready(info) {
+      // `info` is annotated rather than inferred: the `as unknown as` cast below
+      // erases the contextual type from this callback, so without it the
+      // parameter is an implicit `any` (TS7006 under `strict`).
+      async ready(info: HostWsReady) {
         resolveReady(info)
       },
-    },
+    } as unknown as ShellSysAPI,
   })
   const host = channel.getAPI()
 

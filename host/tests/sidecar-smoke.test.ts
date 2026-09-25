@@ -10,7 +10,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test"
 import { spawnSync } from "node:child_process"
 import { existsSync, statSync } from "node:fs"
 import { join } from "node:path"
-import { HOST_SPAWN_DETACHED, killTree, readReady, warmBun } from "./helpers"
+import { HOST_SPAWN_DETACHED, killTree, pipe, readReady, warmBun } from "./helpers"
 
 const repoRoot = join(import.meta.dir, "..", "..")
 
@@ -95,7 +95,7 @@ test.skipIf(!available)(
       env: { ...process.env, VRCXK_SHELL: "1" },
     })
     // Cold start of the 82MB sidecar can exceed the 15s default on Windows.
-    const ready = await readReady(proc.stderr, 60_000)
+    const ready = await readReady(pipe(proc.stderr, "stderr"), 60_000)
     expect(ready.port).toBeGreaterThan(0)
     expect(ready.token).toMatch(/^[0-9a-f]{64}$/)
     expect(ready.hostVersion).toBe("0.0.1")
@@ -104,8 +104,9 @@ test.skipIf(!available)(
     const frame = `${JSON.stringify({ t: "q", id: "smoke-stop", op: "call", p: ["stop"] })}\n`
     // Checked, not asserted: the sidecar is spawned with `stdin: "pipe"`, which
     // the type system cannot see. A missing pipe means the spawn options drifted.
-    const stdin = proc.stdin
-    if (!stdin) throw new Error('sidecar has no stdin pipe (spawn needs stdin: "pipe")')
+    // `pipe()` also narrows away the `number` (file-descriptor) arm, which is what
+    // made `stdin.write` / `.flush` / `.end` unreadable on the raw union.
+    const stdin = pipe(proc.stdin, "stdin")
     stdin.write(frame)
     await stdin.flush?.()
     stdin.end?.()

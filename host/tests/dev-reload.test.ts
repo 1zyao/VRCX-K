@@ -130,7 +130,7 @@ describe("reloadPluginEntry state machine", () => {
 
   test("keeps old fiber when the fresh import fails (strong rollback)", async () => {
     const disposeCalls: string[] = []
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -155,7 +155,7 @@ describe("reloadPluginEntry state machine", () => {
   })
 
   test("keeps old fiber when the module is not a plugin", async () => {
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -222,7 +222,7 @@ describe("reloadPluginEntry state machine", () => {
   })
 
   test("returns restart-required when restore also fails", async () => {
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -274,7 +274,7 @@ describe("reloadPluginEntry state machine", () => {
   })
 
   test("keeps old fiber when the fresh import times out", async () => {
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -299,11 +299,11 @@ describe("reloadPluginEntry state machine", () => {
     expect(result.status).toBe("kept-old")
     expect(result.phase).toBe("import")
     expect(disposeCalls).toHaveLength(0) // old fiber untouched
-    expect(entry.fiber).toBe(oldFiber)
+    expect(Object.is(entry.fiber, oldFiber)).toBe(true)
   })
 
   test("returns timeout when the new fiber build times out and restore also times out", async () => {
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -329,7 +329,7 @@ describe("reloadPluginEntry state machine", () => {
   })
 
   test("returns timeout when the new fiber await times out and restore fails", async () => {
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -357,7 +357,7 @@ describe("reloadPluginEntry state machine", () => {
   })
 
   test("returns timeout when the old fiber dispose times out", async () => {
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: () => new Promise<never>(() => {}), // never disposes
@@ -375,11 +375,11 @@ describe("reloadPluginEntry state machine", () => {
     // Half-torn entry, abandoned disposer may still be running → unknown state.
     expect(result.status).toBe("timeout")
     expect(result.phase).toBe("swap")
-    expect(entry.fiber).toBe(oldFiber) // never rebuilt over a half-torn fiber
+    expect(Object.is(entry.fiber, oldFiber)).toBe(true) // never rebuilt over a half-torn fiber
   })
 
   test("returns restored-old when the new fiber build times out but restore succeeds", async () => {
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -408,7 +408,7 @@ describe("reloadPluginEntry state machine", () => {
   })
 
   test("returns restart-required when the old fiber dispose throws", async () => {
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -427,7 +427,7 @@ describe("reloadPluginEntry state machine", () => {
     expect(result.status).toBe("restart-required")
     expect(result.phase).toBe("swap")
     // Entry was NOT rebuilt over the half-torn fiber.
-    expect(entry.fiber).toBe(oldFiber)
+    expect(Object.is(entry.fiber, oldFiber)).toBe(true)
   })
 
   test("returns restart-required when there is no old callback to restore", async () => {
@@ -456,7 +456,7 @@ describe("reloadPluginEntry state machine", () => {
 
   test("restores the require.cache snapshot when the fresh import fails", async () => {
     const { root, entryFile, utilFile } = await fixture()
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
@@ -494,7 +494,7 @@ describe("reloadPluginEntry state machine", () => {
 
   test("invalidates an explicitly injected cache instead of the runtime cache", async () => {
     const { root, entryFile } = await fixture()
-    const oldFiber = {
+    const oldFiber: FiberLike = {
       uid: 1,
       runtime: { callback: function oldApply() {} },
       dispose: async () => {
