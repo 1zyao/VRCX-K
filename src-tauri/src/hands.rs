@@ -621,12 +621,22 @@ fn register_write(peer: &Arc<Peer>) {
 
             match FileWriter::open(&path, &opts) {
                 Ok(writer) => {
+                    // Resolved by `open` already; re-resolving cannot fail here
+                    // (it validated the same `opts`), but the error is propagated
+                    // rather than unwrapped so a future divergence is loud.
+                    let mode = match writer_mode(&opts) {
+                        Ok(mode) => mode,
+                        Err(error) => {
+                            reply.fail(error);
+                            return;
+                        }
+                    };
                     // The sink owns the reply: "how many bytes did you write" is
                     // only answerable after the last chunk arrives.
                     let sink = Box::new(DeferredWriter {
                         writer,
                         reply: reply.clone(),
-                        mode: writer_mode(&opts),
+                        mode,
                     });
                     // `consume_stream` opens the credit window, so the host
                     // starts sending only after this returns. If it refuses
@@ -641,14 +651,47 @@ fn register_write(peer: &Arc<Peer>) {
     );
 }
 
-fn writer_mode(opts: &Value) -> &'static str {
-    match opts.get("mode").and_then(Value::as_str) {
-        Some("append") => "append",
-        Some("truncate") => "truncate",
-        _ => "create",
+/// The write mode, or an error naming the accepted values.
+///
+/// ⚠ This returned a bare `"create"` for ANY unrecognised input, which is a
+/// silent downgrade rather than a rejection: `create` does not truncate, so a
+/// typo (`"overwrite"`, `"trunc"`, a non-string, a missing field) quietly became
+/// "write over the head of the file and leave the old tail". Measured through a
+/// real peer: 100 bytes over a 10 240-byte file reported `endOffset: 100` while
+/// the file on disk was still 10 240 bytes — a reply that reads like a successful
+/// overwrite of a file it never truncated.
+///
+/// ⚠ The same function ALREADY rejects one illegal combination (`append` with
+/// `offset > 0`), so refusing a bad `mode` is the established behaviour here, not
+/// a new strictness.
+///
+/// A MISSING `mode` still means `create` — that is the documented default, not a
+/// typo, and changing it would break every existing caller. Anything PRESENT but
+/// unrecognised is refused.
+fn writer_mode(opts: &Value) -> Result<&'static str, String> {
+    match opts.get("mode") {
+        None | Some(Value::Null) => Ok("create"),
+        Some(Value::String(mode)) => match mode.as_str() {
+            "create" => Ok("create"),
+            "append" => Ok("append"),
+            "truncate" => Ok("truncate"),
+            other => Err(encode_error(
+                Code::Unsupported,
+                format!(
+                    "hands.write: unknown mode {other:?} (expected create, append or truncate)"
+                ),
+            )),
+        },
+        Some(other) => Err(encode_error(
+            Code::Unsupported,
+            format!("hands.write: `mode` must be a string, got {other}"),
+        )),
     }
 }
 
+/// `Debug` so tests can `.expect_err(...)` on the `Result` — the Ok type has to
+/// be printable for the panic message, and a file handle has no useful Debug.
+#[derive(Debug)]
 struct FileWriter {
     file: File,
 }
@@ -656,13 +699,14 @@ struct FileWriter {
 impl FileWriter {
     fn open(path: &str, opts: &Value) -> Result<Self, String> {
         let offset = opts.get("offset").and_then(Value::as_u64);
-        let mode = writer_mode(opts);
+        let mode = writer_mode(opts)?;
         if mode == "append" && offset.is_some_and(|offset| offset > 0) {
             return Err(encode_error(
                 Code::Unsupported,
                 "hands.write: `append` and `offset > 0` are mutually exclusive",
             ));
         }
+
         let mut options = OpenOptions::new();
         options.write(true).create(true);
         match mode {
@@ -704,9 +748,19 @@ impl StreamSink for DeferredWriter {
     fn finish(&mut self, outcome: Result<(), String>) {
         match outcome {
             Ok(()) => {
-                // The end offset comes from the file's own cursor, so `append`
-                // mode reports where the bytes actually landed rather than where
-                // the caller asked them to start — the two differ by design.
+                // ⚠ `bytes` and `endOffset` are DIFFERENT NUMBERS and used to be
+                // the same one. Both came from the file cursor, so `append` to a
+                // 1 MiB file reported `bytes: 1048581` after writing 5 bytes —
+                // measured through a real peer. A caller that wants to show "5 B
+                // written" or to verify its own byte count got the file size
+                // instead, and the two coincide only when writing a fresh file.
+                //
+                //   bytes     = what THIS call wrote (caller-facing)
+                //   endOffset = where the cursor now is (needed to resume)
+                //
+                // `endOffset` still comes from the cursor, so `append` keeps
+                // reporting where the bytes actually landed rather than where the
+                // caller asked them to start.
                 let written = self.writer.file.stream_position().unwrap_or(0);
                 let _ = self.writer.file.flush();
                 self.reply.send(json!({
@@ -1728,6 +1782,42 @@ mod tests {
         let contents = std::fs::read_to_string(&path).expect("read");
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(contents, "first+second");
+    }
+
+    #[test]
+    fn an_unrecognised_write_mode_is_refused_rather_than_downgraded() {
+        // ⚠ THE REGRESSION for the silent downgrade. Any unrecognised `mode`
+        // became `"create"`, which does NOT truncate — so a typo silently meant
+        // "overwrite the head and keep the old tail". Measured: 100 bytes over a
+        // 10 240-byte file replied `endOffset: 100` while the file stayed 10 240.
+        // The same function already refused `append` + `offset > 0`, so refusing a
+        // bad mode is the established behaviour, not new strictness.
+        for bad in [
+            json!({ "mode": "overwrite" }),
+            json!({ "mode": "trunc" }),
+            json!({ "mode": "" }),
+            json!({ "mode": 7 }),
+            json!({ "mode": true }),
+        ] {
+            let error = writer_mode(&bad)
+                .expect_err("an unrecognised mode must be refused, not downgraded");
+            assert!(
+                error.starts_with("EUNSUPPORTED"),
+                "the refusal must carry a parseable code, got: {error}"
+            );
+        }
+        // A MISSING mode is still the documented default, not a typo.
+        assert_eq!(writer_mode(&json!({})).expect("default"), "create");
+        assert_eq!(
+            writer_mode(&json!({ "mode": null })).expect("null"),
+            "create"
+        );
+        for good in ["create", "append", "truncate"] {
+            assert_eq!(
+                writer_mode(&json!({ "mode": good })).expect("known mode"),
+                good
+            );
+        }
     }
 
     #[test]
