@@ -707,6 +707,38 @@ impl FileWriter {
             ));
         }
 
+        // ⚠ Refuse anything that is not a regular file BEFORE opening it, for the
+        // same reason `FileReader::open` does: `OpenOptions::open` on a FIFO with
+        // write access BLOCKS until a reader appears, and this runs inline on the
+        // ONE reader thread — so the cancellation frame cannot be read, every
+        // inbound RPC stalls to the 30s timeout, and only `kill_tree` recovers.
+        // This is the write-side twin of the read-side guard; fixing only the
+        // read half left the same wedge reachable through `hands.write`.
+        //
+        // A MISSING path is allowed through: `create(true)` below is how callers
+        // make a new file, and that is a normal use, not a wedge. A directory is
+        // refused here so both platforms agree on the code (`EISDIR`), instead of
+        // one giving `EACCES` and the other `EISDIR`.
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_dir() => {
+                return Err(encode_error(
+                    Code::IsDir,
+                    format!("hands.write: {path} is a directory"),
+                ));
+            }
+            Ok(meta) if !meta.is_file() => {
+                return Err(encode_error(
+                    Code::Unsupported,
+                    format!("hands.write: {path} is not a regular file"),
+                ));
+            }
+            // A regular file: exactly what we want.
+            Ok(_) => {}
+            // Does not exist yet — `create(true)` will make it.
+            Err(error) if classify(&error) == Code::NotFound => {}
+            Err(error) => return Err(encode_error(classify(&error), error)),
+        }
+
         let mut options = OpenOptions::new();
         options.write(true).create(true);
         match mode {
@@ -2049,5 +2081,34 @@ mod tests {
         let error = failure(FileReader::open(dir.to_str().unwrap(), 0));
         std::fs::remove_dir_all(&dir).ok();
         assert!(error.starts_with("EISDIR"), "got: {error}");
+    }
+    #[test]
+    fn writing_to_a_directory_is_refused_with_eisdir_on_every_platform() {
+        // ⚠ The write-side twin of the read guard. `OpenOptions::open` on a
+        // directory succeeds on Unix and fails with `EACCES` on Windows, so the
+        // two platforms disagreed on the code; worse, `open(FIFO, O_WRONLY)`
+        // BLOCKS and this runs inline on the ONE reader thread.
+        let dir = temp_dir("write-dir");
+        let error = FileWriter::open(dir.to_str().unwrap(), &json!({}))
+            .expect_err("a directory must not be opened for writing");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            error.starts_with("EISDIR"),
+            "both platforms must agree on EISDIR, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_missing_write_target_is_still_created() {
+        // The control for the guard above: refusing non-regular files must NOT
+        // refuse a path that simply does not exist yet — `create(true)` is how
+        // callers make a new file, and that is the common case.
+        let dir = temp_dir("write-new");
+        let path = dir.join("fresh.bin");
+        FileWriter::open(path.to_str().unwrap(), &json!({}))
+            .expect("a missing path must still be creatable");
+        let exists = path.exists();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(exists, "create(true) must have made the file");
     }
 }
