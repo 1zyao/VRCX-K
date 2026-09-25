@@ -161,29 +161,64 @@ fn classify(error: &std::io::Error) -> Code {
 
 // --- stat ------------------------------------------------------------------
 
-/// `hands.stat(path) -> {size,id,mtimeMs,kind} | null`
+/// `hands.stat(path) -> {size,id,mtimeMs,kind,entries} | null`
 ///
 /// Returns `null` for a missing path instead of throwing: "does not exist" is a
 /// normal answer to a question, and forcing callers into try/catch for control
-/// flow is how error codes get ignored. A path that exists but cannot be read
-/// (permissions) is a real error and does throw — the caller can act on that.
+/// flow is how error codes get ignored. **Any other failure throws**, so a path
+/// that exists but cannot be read (permissions) reaches the caller as an error
+/// rather than as a stat with no size.
+///
+/// # Why this is a DEFERRED handler rather than a plain `peer.on`
+///
+/// It does not stream, so `peer.on` looks like the natural fit — and it was the
+/// original implementation. But a sync handler's reply frame is always
+/// `{"t":"r","v":…}` (see `kkrpc_peer.rs`): there is **no error arm**, so the
+/// failure had to be smuggled through the VALUE as `{"error":"CODE: detail"}`.
+///
+/// That produced a wrong answer rather than an error. Measured:
+///
+/// ```text
+/// stat("\\.\NUL") RESOLVED to: {"error":"EACCES: …"}
+///   -> .size is undefined
+/// ```
+///
+/// A caller writing `(await ctx.hands.stat(p)).size` gets `undefined` instead of
+/// a rejection — "cannot read it" is disguised as "read it, no size". The
+/// `read`/`write`/`watch`/`list` handlers all use `on_deferred` and `reply.fail`
+/// for exactly this reason; `stat` now does too, so all five agree.
 fn register_stat(peer: &Arc<Peer>) {
-    peer.on(
+    peer.on_deferred(
         "hands.stat",
-        Arc::new(|args| {
-            let path = str_arg(&args, 0);
-            match stat_path(&path) {
-                Ok(stat) => stat,
-                Err(error) if classify(&error) == Code::NotFound => Value::Null,
-                Err(error) => {
-                    // The reply value carries the code; there is no separate
-                    // error channel for a `t:"r"` frame, and the caller needs to
-                    // branch on the code rather than parse prose.
-                    json!({ "error": encode_error(classify(&error), error) })
-                }
-            }
-        }),
+        Arc::new(
+            |reply: DeferredReply, args: Vec<Value>| match stat_outcome(&str_arg(&args, 0)) {
+                Ok(stat) => reply.send(stat),
+                Err(message) => reply.fail(message),
+            },
+        ),
     );
+}
+
+/// The three outcomes of a stat, as the WIRE sees them.
+///
+/// Split out from the handler so the reply SHAPE is unit-testable: the handler
+/// itself needs a live `DeferredReply`, and the bug this guards against lived
+/// precisely in the choice between "value" and "failure" — not in `stat_path`.
+///
+/// - `Ok(value)` → a normal reply. `Value::Null` means "not there", which is a
+///   normal answer and must stay a value.
+/// - `Err(message)` → `reply.fail`, carrying the `CODE: detail` prefix the host
+///   parses back into `HandsError.code`.
+fn stat_outcome(path: &str) -> Result<Value, String> {
+    match stat_path(path) {
+        Ok(stat) => Ok(stat),
+        // "Does not exist" is a normal answer to a question. Forcing callers into
+        // try/catch for control flow is how error codes get ignored.
+        Err(error) if classify(&error) == Code::NotFound => Ok(Value::Null),
+        // Everything else is a real failure and must NOT masquerade as a
+        // successful stat — see `register_stat`'s doc for the measured bug.
+        Err(error) => Err(encode_error(classify(&error), error)),
+    }
 }
 
 fn stat_path(path: &str) -> std::io::Result<Value> {
@@ -1018,6 +1053,59 @@ mod tests {
         let error = stat_path(missing.to_str().unwrap()).expect_err("must fail");
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(classify(&error), Code::NotFound);
+    }
+
+    #[test]
+    fn stat_reports_a_real_failure_as_an_error_not_as_a_value() {
+        // ⚠ THE REGRESSION for the disguised failure. Every unit test above calls
+        // `stat_path` directly, so none of them saw the choice that was wrong:
+        // whether a failure travels as a VALUE or as a FAILURE.
+        //
+        // `register_stat` used to be a sync `peer.on`, whose reply arm is always
+        // `{"t":"r","v":…}` — no error channel — so a failure had to be returned
+        // as the value `{"error":"CODE: detail"}`. Measured through the real peer:
+        //
+        //     stat("\\.\NUL") RESOLVED to {"error":"EACCES: …"}  → .size undefined
+        //
+        // i.e. "cannot read it" reached the caller as "read it, no size", because
+        // `(await ctx.hands.stat(p)).size` is `undefined` rather than a rejection.
+        //
+        // ⚠ THE OPERAND IS PLATFORM-INDEPENDENT ON PURPOSE. The first version of
+        // this test used `cfg!(windows) { "\\.\NUL" } else { "/dev/null" }`, which
+        // is red on BOTH unix platforms: `/dev/null` **stats fine** (it is a
+        // character device, and `stat` is a metadata query — reporting
+        // `kind:"other"` is more useful than failing). So the test only ever
+        // passed on Windows, the one platform where the chosen operand happened to
+        // fail. Same shape as the hardcoded `"windows"` assertion fixed earlier:
+        // a platform assumption masquerading as a contract.
+        //
+        // An INTERIOR NUL is refused by the OS layer on every platform:
+        //   - Windows: `metadata` → `os error 1`, `InvalidInput`
+        //   - Unix:    the `CString` conversion → `NulError` → `InvalidInput`
+        // Both are measured, and `classify` maps `InvalidInput` to `Denied` →
+        // `EACCES`, so the assertion below is exact rather than a disjunction.
+        let error =
+            stat_outcome("a\0b").expect_err("a real failure must be a failure, not a value");
+        assert!(
+            error.starts_with("EACCES"),
+            "the failure must carry a parseable code, got: {error}"
+        );
+        //
+        // NOTE: `EUNSUPPORTED` is deliberately NOT accepted here. That code comes
+        // from the regular-file guard in `FileReader::open` (the READ path);
+        // `stat_path` has no such guard — it reports devices as `kind:"other"`.
+        // Accepting it here would suggest `stat` can produce it, which it cannot.
+    }
+
+    #[test]
+    fn stat_of_a_missing_path_still_answers_null_rather_than_failing() {
+        // The contract the change above must NOT break: "does not exist" is a
+        // normal answer, so it stays a VALUE (`null`) and must not become an
+        // error. Without this, a handler that always failed would satisfy the
+        // regression above while breaking every caller that branches on null.
+        let value = stat_outcome("/definitely/not/here/vrcxk")
+            .expect("a missing path is an answer, not a failure");
+        assert_eq!(value, Value::Null);
     }
 
     // --- stat preview -------------------------------------------------------

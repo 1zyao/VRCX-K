@@ -703,6 +703,29 @@ impl Peer {
                 }
                 StreamStep::Done => {
                     producer.close();
+                    // ⚠ No `v` on the terminal frame, and that is ONLY correct
+                    // because `StreamStep::Done` carries no payload (see the enum
+                    // above) and `StreamSink::finish` takes no value either.
+                    //
+                    // kkrpc's remote consumer DOES read a terminal `v`. Verified
+                    // against the shipped source map (`streaming-channel.ts`):
+                    //
+                    //   :433-439  const result = { done: message.d === true,
+                    //                             value: this.decodeValue(message.v) }
+                    //             waiter.resolve(result)      // <-- delivered
+                    //   :648-655  readBuffered() returns it to the caller
+                    //   :667      `if (stream.done) return {done:true,value:undefined}`
+                    //             is NOT this path — it is the "already finished,
+                    //             next() called again" short-circuit
+                    //
+                    // So an earlier claim of mine ("the JS side ignores it anyway,
+                    // the value is hardcoded `void 0`") was WRONG: it read the
+                    // short-circuit branch as the delivery path. The honest reason
+                    // there is nothing to send is simply that no value exists.
+                    //
+                    // ⇒ If `StreamStep::Done` ever gains a payload, THIS frame must
+                    // gain `"v"` in the same change, or the value is silently
+                    // dropped to `undefined` on the host side.
                     json!({ "t": "sr", "id": next_id("x"), "sid": sid, "d": true })
                 }
                 StreamStep::Failed(message) => {
@@ -900,10 +923,28 @@ impl Peer {
                 self.cancel_remote_stream(&sid);
             }
             Some((Ok(()), true)) => {
-                let _ = self.write(&json!({
+                // ⚠ The replenish write MUST be checked, and this is the only
+                // ignored write in the consume path.
+                //
+                // If it fails the transport is gone, so no further chunks will
+                // ever arrive — and the sink is what owns the consumer's deferred
+                // reply. Leaving it unfinished means `hands.write`'s caller waits
+                // out kkrpc's 30s timeout instead of being told the write died.
+                //
+                // `close_streams` is not a safety net here: it runs on reader EOF,
+                // which may never come if only the WRITE side is broken. The
+                // read-side path already does this correctly (it finishes the sink
+                // with the sink's own error above); this is the mirror of it.
+                if let Err(error) = self.write(&json!({
                     "t": "sq", "id": next_id("p"), "sid": sid,
                     "op": "pull", "n": REPLENISH,
-                }));
+                })) {
+                    if let Some(mut consumer) = self.take_consumer(&sid) {
+                        consumer
+                            .sink
+                            .finish(Err(format!("stream interrupted: {error}")));
+                    }
+                }
             }
             _ => {}
         }

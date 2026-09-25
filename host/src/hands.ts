@@ -357,7 +357,25 @@ export class HandsService extends Service {
         // across callers and released by the wrong one.
         const release = self.registerGuard(() => {
           released = true
-          void iterator?.return?.()
+          // ⚠ Both failure modes, because `return()` can fail EITHER way:
+          //
+          //   - it REJECTS (a remote stream's return travels over the wire, which
+          //     is exactly what kkrpc does), or
+          //   - it THROWS SYNCHRONOUSLY, which `Promise.resolve(x).catch(...)`
+          //     does NOT catch — the expression throws before `Promise.resolve`
+          //     is ever called (verified: the sync throw escapes).
+          //
+          // So the call itself is wrapped. This runs on the two paths most likely
+          // to coincide with a half-dead transport — plugin unload and shell
+          // disappearance — and this repo has already been bitten by an unhandled
+          // rejection on exactly that shape (`Include.write`). The stream is being
+          // torn down regardless, so the error is swallowed deliberately — but
+          // visibly, not by omission.
+          try {
+            void Promise.resolve(iterator?.return?.(undefined)).catch(() => {})
+          } catch {
+            /* teardown continues; the guard has already been released */
+          }
         })
 
         const stop = () => {
