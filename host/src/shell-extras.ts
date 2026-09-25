@@ -6,6 +6,17 @@
 //   stable entry point, and a plugin should not reach into the raw wire namespace
 //   for a routine operation.
 //
+// ⚠ "ATTRIBUTABLE AND AUDITED THROUGH `ctx.shell` ALREADY" WAS A FALSE COMFORT.
+//   The RAW mirror (`ctx.shell.autostart.*`) records `[cap]` lines and runs the
+//   `#24` declare-vs-actual check. This service, added in the same PR, did
+//   NEITHER: `AutostartService` took no audit callback and never called
+//   `overreachWarning`, so a plugin could flip a PERSISTENT OS startup entry
+//   without declaring `autostart` and leave no trace — while the escape hatch it
+//   exists to replace was checked. Two independent reviewers found this.
+//   `autostart` IS declarable (`contracts/plugin-manifest/.../$defs/Permissions`
+//   has an `autostart` grant), so the check has something to compare against.
+//   It now has `audit` + `useManifests` and a `record()` like `HandsService`.
+//
 // ⚠ NOT a security boundary — declare-and-warn visibility only (`#24`). A plugin
 //   that wants to write a startup entry can call the OS itself. The real boundary
 //   is M4's subprocess isolation.
@@ -22,6 +33,8 @@
 // platform has no such capability", which a plain mirror cannot express.
 
 import { type Context, Service } from "cordis"
+import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
+import { callerName, overreachWarning } from "./overreach"
 import type { ShellStdioBridge } from "./stdio"
 
 declare module "cordis" {
@@ -52,9 +65,33 @@ function describe(error: unknown): string {
  */
 export class AutostartService extends Service {
   private bridge?: ShellStdioBridge
+  /** Manifest lookup for the `#24` check; see the file header. */
+  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
+  private readonly auditLine: (line: string) => void
 
-  constructor(ctx: Context) {
+  constructor(ctx: Context, options: { audit?: (line: string) => void } = {}) {
     super(ctx, "autostart")
+    this.auditLine = options.audit ?? (() => {})
+  }
+
+  /** Give the service the manifest registry so `#24` can compare declare vs actual. */
+  useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
+    this.manifestLookup = lookup
+  }
+
+  /**
+   * One audit line per caller-visible operation, plus the `#24` check.
+   *
+   * ⚠ Records BEFORE the work, so a call that fails or has no shell is still
+   * attributed — an undeclared attempt must not become invisible because it
+   * happened to fail. Both entry points call this; see the file header for the
+   * gap this closes.
+   */
+  private record(self: unknown, method: string): void {
+    const who = callerName(self) ?? "<unknown>"
+    this.auditLine(`[cap] ${who} -> autostart.${method}`)
+    const warning = overreachWarning(self, `autostart.${method}`, this.manifestLookup)
+    if (warning) this.auditLine(warning)
   }
 
   attachShell(bridge: ShellStdioBridge): void {
@@ -71,17 +108,29 @@ export class AutostartService extends Service {
    * `false` covers "off", "no shell" AND "mobile" — the caller that wants the
    * state of a toggle cannot act differently on those, and one that needs to know
    * whether the capability exists at all asks `supported`.
+   *
+   * ⚠ A READ FAILURE IS NOT `false`. This used to swallow a rejection into
+   * `false` as well, which silently merged "cannot tell" into "off" — and the OS
+   * registration may well exist (a reviewer's point). The doc comment above
+   * listed only three cases for `false`; the `catch` invented a fourth. The
+   * sibling `setEnabled` already returns a VERDICT for exactly this reason, so
+   * this now returns one too: callers that only need a boolean use `isEnabled`,
+   * which maps the indeterminate case to `undefined` rather than lying.
    */
-  async isEnabled(): Promise<boolean> {
+  async readEnabled(): Promise<boolean | undefined> {
     const api = this.bridge?.shell.autostart
     if (!api) return false
     try {
       return await api.isEnabled()
     } catch {
-      return false
+      return undefined
     }
   }
 
+  /** Convenience for toggle UIs: `undefined` (unknown) collapses to `false`. */
+  async isEnabled(): Promise<boolean> {
+    return (await this.readEnabled()) ?? false
+  }
   /** Whether this platform has the capability at all. */
   get supported(): boolean {
     return this.bridge?.shell.autostart !== undefined
@@ -93,6 +142,7 @@ export class AutostartService extends Service {
 
   /** Turn autostart on or off. A verdict, not a bool. */
   async setEnabled(enabled: boolean): Promise<AutostartVerdict> {
+    this.record(this, "setEnabled")
     // Distinguishing "no shell" from "mobile" matters: the first is a waiting
     // state that will resolve, the second never will, and a UI offering a toggle
     // needs to know which it is looking at.

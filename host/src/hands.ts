@@ -35,9 +35,9 @@
 //   - No hard permission enforcement: `#24` (M2-8) is declare-and-warn only.
 //     This is NOT a security boundary — an in-process plugin can `import fs`.
 
-import { type Context, Service, symbols } from "cordis"
+import { type Context, Service } from "cordis"
 import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
-import { overreachWarning } from "./overreach"
+import { callerName, overreachWarning } from "./overreach"
 import type {
   HandsChange,
   HandsErrorCode,
@@ -121,24 +121,6 @@ export type HandsServiceOptions = {
   bridge?: ShellStdioBridge
   /** Transparent call record: one line per capability call, with its caller. */
   audit?: HandsAudit
-}
-
-/**
- * Resolve the calling plugin, exactly as `capability.ts` does.
- *
- * Duplicated rather than imported to keep this module free of a cycle with
- * `capability.ts` (which will import this one to register the surface).
- */
-function callerName(self: unknown): string | null {
-  if (self == null) return null
-  const caller = (self as Record<PropertyKey, unknown>)[symbols.caller] as
-    | { fiber?: { name?: string; runtime?: { name?: string }; entry?: { id?: string } } }
-    | undefined
-  const fiber = caller?.fiber
-  if (!fiber) return null
-  const entryId = fiber.entry?.id
-  if (!entryId) return fiber.name ?? null
-  return fiber.runtime?.name ? `${entryId}#${fiber.runtime.name}` : entryId
 }
 
 /**

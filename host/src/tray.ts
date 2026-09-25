@@ -20,6 +20,8 @@
 //     once a shell attaches (`attachShell`).
 
 import { type Context, Service } from "cordis"
+import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
+import { callerName, overreachWarning } from "./overreach"
 import type { TrayActionEvent, TraySetSnapshotResult } from "./stdio"
 import { TRAY_SCHEMA_VERSION, validateTrayMenuSnapshot } from "./tray_contract"
 import type { TrayGroup, TrayMenuSnapshot } from "./tray-contract.generated"
@@ -117,6 +119,8 @@ export class TrayService extends Service {
   private readonly coalesceMs: number
   private readonly logLine: (line: string) => void
   private readonly handlers = new Set<TrayActionHandler>()
+  /** Manifest lookup for the `#24` check; see `record`. */
+  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
 
   private push?: TrayPush
   private closed = false
@@ -144,6 +148,29 @@ export class TrayService extends Service {
     this.generation = options.generation ?? 0
     this.coalesceMs = options.coalesceMs ?? 0
     this.logLine = options.log ?? (() => {})
+  }
+
+  /** Give the service the manifest registry so `#24` can compare declare vs actual. */
+  useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
+    this.manifestLookup = lookup
+  }
+
+  /**
+   * One audit line per caller-visible operation, plus the `#24` check.
+   *
+   * ⚠ `setGroups` is a PUBLIC method that replaces the OS tray menu, so it is a
+   * capability a plugin requests — not, as an earlier draft of this comment
+   * assumed, a host-only push. An earlier review pass had left `ctx.autostart`
+   * and `ctx.shortcut` unchecked while claiming tray needed nothing; checking the
+   * actual surface showed `setGroups` is callable and mutates shell state, so it
+   * needs the same treatment. The pre-existing `logLine` calls below are
+   * DIAGNOSTICS (invalid payloads, handler errors) and never name the caller.
+   */
+  private record(self: unknown, method: string, detail = ""): void {
+    const who = callerName(self) ?? "<unknown>"
+    this.logLine(`[cap] ${who} -> tray.${method}${detail ? ` ${detail}` : ""}`)
+    const warning = overreachWarning(self, `tray.${method}`, this.manifestLookup)
+    if (warning) this.logLine(warning)
   }
 
   /** Revision of the latest accepted content. */
@@ -197,6 +224,9 @@ export class TrayService extends Service {
    * `invalid`, `error` or `closed`.
    */
   setGroups(groups: TrayGroup[]): Promise<TrayVerdict> {
+    // Recorded BEFORE the work so a rejected or superseded call is still
+    // attributed — an undeclared attempt must not go invisible by failing.
+    this.record(this, "setGroups", `${groups.length} group(s)`)
     if (this.closed) return Promise.resolve({ status: "closed", revision: this.revisionValue })
     const invalid = validateGroups(groups)
     if (invalid) {

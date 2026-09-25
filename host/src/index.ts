@@ -212,7 +212,11 @@ async function bootstrap() {
   // shell yet" (a waiting state) apart from "this platform has no such route"
   // (permanent) — a plain mirror cannot express that distinction. Nothing enables
   // autostart at boot: the user owns that decision, this only exposes the switch.
-  const autostart = new AutostartService(ctx)
+  //
+  // ⚠ It takes `audit` for the same reason `hands` does: this is the SUPPORTED
+  // entry point for a PERSISTENT OS change, so an undeclared call to it must
+  // leave a trace. Omitting the callback is what kept it invisible.
+  const autostart = new AutostartService(ctx, { audit: (line) => log(line) })
   ctx.effect(() => () => autostart.detachShell())
 
   await ctx.plugin(Loader)
@@ -280,15 +284,25 @@ async function bootstrap() {
   // ⚠ Declare-and-warn only, never a refusal: plugins are in-process, so a
   // determined one can bypass this with a plain `import`. See `overreach.ts`.
   //
-  // BOTH entry points get the lookup, and that is the point: `#24` §2 requires
-  // the curated services and the raw mirror to be covered alike. Wiring only
-  // `capabilities` left `ctx.hands` — the SUPPORTED entry point — unchecked while
-  // the escape hatch was checked.
+  // EVERY curated entry point gets the lookup, and that is the point: `#24` §2
+  // requires the curated services and the raw mirror to be covered alike.
+  //
+  // ⚠ This block has now been wrong twice, in the same direction both times.
+  // Wiring only `capabilities` left `ctx.hands` — the SUPPORTED entry point —
+  // unchecked while the escape hatch was checked. Then `hands` was added but
+  // `autostart` / `shortcut` were not, which two reviewers found independently.
+  // The lesson is not "remember the third service": it is that NOTHING HERE IS
+  // ENFORCED. A new service is covered only if this list is edited, so when you
+  // add one, add it here AND give it `useManifests` + a `record()` — see the
+  // checklist in `capability.ts`'s `record` comment.
   const registry = manifestRegistryOf(ctx)
   if (registry) {
     const lookup = (entryId: string) => registry.get(entryId)
     capabilities.useManifests(lookup)
     hands.useManifests(lookup)
+    autostart.useManifests(lookup)
+    shortcuts.useManifests(lookup)
+    tray.useManifests(lookup)
   }
 
   // ── Dev watcher (issue #11) — strictly opt-in ──────────────────────────

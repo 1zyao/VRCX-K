@@ -18,6 +18,8 @@
 // never delivered.
 
 import { type Context, Service } from "cordis"
+import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
+import { callerName, overreachWarning } from "./overreach"
 import type { ShellShortcutBridge, ShortcutPressEvent, ShortcutRegistration } from "./stdio"
 
 declare module "cordis" {
@@ -71,6 +73,18 @@ export class ShortcutService extends Service {
   private detach?: () => void
   private closed = false
   private readonly logLine: (line: string) => void
+  /**
+   * Manifest lookup for the `#24` declare-vs-actual check.
+   *
+   * ⚠ This service used to have NO caller attribution and NO overreach check on
+   * its normal path — `logLine` calls below are DIAGNOSTICS (invalid payloads,
+   * handler errors) and never name the caller. So a plugin could register a
+   * global hotkey without declaring `shortcut`, and nothing recorded it, while
+   * the raw `ctx.shell.shortcut.*` mirror DID both. That is the same inversion
+   * `overreach.ts` documents for `ctx.hands`; see the call to
+   * `overreachWarning` in `record`.
+   */
+  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
   /** Bindings keyed by the shell's canonical accelerator. */
   private readonly bindings = new Map<string, ShortcutHandler>()
 
@@ -78,6 +92,25 @@ export class ShortcutService extends Service {
     super(ctx, "shortcut")
     this.bridge = options.bridge
     this.logLine = options.log ?? (() => {})
+  }
+
+  /** Give the service the manifest registry so `#24` can compare declare vs actual. */
+  useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
+    this.manifestLookup = lookup
+  }
+
+  /**
+   * One audit line per caller-visible operation, plus the `#24` check.
+   *
+   * Called from `register`/`unregister` — the two entry points a plugin reaches
+   * through `ctx.shortcut`. Recording only the failures (as the old diagnostics
+   * did) is what made an undeclared call indistinguishable from a declared one.
+   */
+  private record(self: unknown, method: string, detail: string): void {
+    const who = callerName(self) ?? "<unknown>"
+    this.logLine(`[cap] ${who} -> shortcut.${method}${detail ? ` ${detail}` : ""}`)
+    const warning = overreachWarning(self, `shortcut.${method}`, this.manifestLookup)
+    if (warning) this.logLine(warning)
   }
 
   /**
@@ -101,6 +134,10 @@ export class ShortcutService extends Service {
 
   /** Register a chord and bind a handler to it. */
   async register(accelerator: string, handler: ShortcutHandler): Promise<ShortcutRegisterResult> {
+    // Record BEFORE the work, so a call that fails (or has no shell) is still
+    // attributed — an undeclared attempt must not become invisible just because
+    // it did not succeed.
+    this.record(this, "register", accelerator)
     const bridge = this.bridge
     if (this.closed || !bridge) return { status: "no-shell" }
     let registration: ShortcutRegistration
@@ -122,6 +159,7 @@ export class ShortcutService extends Service {
 
   /** Release a chord and drop its handler. */
   async unregister(accelerator: string): Promise<ShortcutRegisterResult> {
+    this.record(this, "unregister", accelerator)
     const bridge = this.bridge
     if (this.closed || !bridge) return { status: "no-shell" }
     let registration: ShortcutRegistration

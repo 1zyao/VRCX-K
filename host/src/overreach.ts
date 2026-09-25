@@ -79,6 +79,37 @@ export function callerEntryId(self: unknown): string | undefined {
   return caller?.fiber?.entry?.id
 }
 
+/**
+ * The calling plugin as a HUMAN-readable name, for `[cap]` audit lines.
+ *
+ * ⚠ Did NOT live here until now — it was a private function in `hands.ts`,
+ * duplicated there "to keep this module free of a cycle with `capability.ts`".
+ * That reasoning was about `capability.ts`, not about THIS module, and the copy
+ * meant every other curated service that wanted an audit line had to either
+ * duplicate it again or go without. `ctx.autostart` / `ctx.shortcut` went
+ * without: they had no caller attribution at all, which is how an undeclared
+ * call became indistinguishable from a declared one (both reviewers found it).
+ * One definition here lets a service add attribution without a second copy.
+ *
+ * The `#runtimeName` suffix is deliberate and is for humans only — anything that
+ * needs to LOOK SOMETHING UP must use `callerEntryId` above, because the
+ * manifest registry is keyed by the raw `entry.id`.
+ *
+ * `null` means "no caller could be resolved", which callers render as
+ * `<unknown>`; it is not an error.
+ */
+export function callerName(self: unknown): string | null {
+  if (self == null) return null
+  const caller = (self as Record<PropertyKey, unknown>)[symbols.caller] as
+    | { fiber?: { name?: string; runtime?: { name?: string }; entry?: { id?: string } } }
+    | undefined
+  const fiber = caller?.fiber
+  if (!fiber) return null
+  const entryId = fiber.entry?.id
+  if (!entryId) return fiber.name ?? null
+  return fiber.runtime?.name ? `${entryId}#${fiber.runtime.name}` : entryId
+}
+
 /** How a declaration was written: `true` (whole domain) or a narrow list. */
 type Grant = boolean | readonly string[] | undefined
 
