@@ -200,7 +200,7 @@ The Rust binary pulls those two files in with `#[path]`, so it compiles the real
 sources — it cannot drift from what ships.
 
 ```bash
-cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml
+cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e
 node docs/probes/hands-e2e/run.mjs      # 9/9 checks, ~2 s
 ```
 

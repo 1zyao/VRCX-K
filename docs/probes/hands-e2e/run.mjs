@@ -18,7 +18,7 @@
 //   6. Backpressure: the producer stops when the consumer stops pulling.
 //
 // Usage:
-//   cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml
+//   cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e
 //   node docs/probes/hands-e2e/run.mjs
 //
 // ⚠ This drives the crate's `hands` module directly through a thin probe binary
@@ -36,9 +36,12 @@ import { StreamingRPCChannel } from "kkrpc/streaming"
 const here = dirname(fileURLToPath(import.meta.url))
 const BIN = join(
   here,
-  "rust",
+  "..",
+  "..",
+  "..",
   "target",
   "release",
+  "examples",
   process.platform === "win32" ? "hands-e2e.exe" : "hands-e2e",
 )
 

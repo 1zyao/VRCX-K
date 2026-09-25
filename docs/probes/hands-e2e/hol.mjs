@@ -26,7 +26,7 @@
 //   visible rather than asserted.
 //
 // Usage:
-//   cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml
+//   cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e
 //   node docs/probes/hands-e2e/hol.mjs [--size=134217728] [--samples=200]
 //
 // ⚠ Loopback caution (the lesson from transport-lab §8): this measures a LOCAL
@@ -44,9 +44,12 @@ import { StreamingRPCChannel } from "kkrpc/streaming"
 const here = dirname(fileURLToPath(import.meta.url))
 const BIN = join(
   here,
-  "rust",
+  "..",
+  "..",
+  "..",
   "target",
   "release",
+  "examples",
   process.platform === "win32" ? "hands-e2e.exe" : "hands-e2e",
 )
 

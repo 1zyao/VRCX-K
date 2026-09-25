@@ -1,32 +1,31 @@
 // The hands e2e binary: the PRODUCTION capability modules over real stdio.
 //
-// It compiles `src-tauri/src/kkrpc_peer.rs` and `src-tauri/src/hands.rs` directly
-// by path — these are the real files, not copies. That is the point: the probe
-// tests shipped code, so it cannot drift from it.
+// It mounts `tauri_app_lib::{hands, hands_hello, kkrpc_peer}` — the real modules,
+// reached through the crate's real boundary. That is the point: the test drives
+// shipped code, so it cannot drift from it.
+//
+// ⚠ WHY THIS LIVES IN `examples/` RATHER THAN A SEPARATE PROBE CRATE.
+// It used to be `docs/probes/hands-e2e/rust/src/main.rs`, which pulled the same
+// three files in with `#[path = "../../../../../src-tauri/src/hands.rs"]`. That
+// compiled the real source, but it built a PRIVATE COPY of the module graph: the
+// driver could not name `tauri_app_lib::hands`, and nothing verified that those
+// modules were reachable the way production reaches them. Moving here required
+// making the three modules `pub` (see `lib.rs`) precisely so the example imports
+// what the shell registers, not a parallel assembly of the same files.
 //
 // Why not run the Tauri app itself: the app needs a webview and a window, so it
 // cannot run headless in CI. The capability under test has no Tauri dependency
 // (only serde/base64/notify/file-id), so mounting it on a bare stdio loop is
 // both possible and strictly more focused — it cannot pass because some
 // unrelated part of the app happened to work.
-
-// The `#[path]` is relative to THIS file: src/ → rust/ → hands-e2e/ → probes/ →
-// docs/ → repo root.
-#[path = "../../../../../src-tauri/src/kkrpc_peer.rs"]
-pub mod kkrpc_peer;
-
-#[path = "../../../../../src-tauri/src/hands.rs"]
-pub mod hands;
-
-// The hello is compiled here too, so the E2E exercises the REAL announcement
-// rather than a hand-written copy of its shape. A copy would be free to drift
-// from what production sends, and the test would keep passing while the wire
-// shape changed underneath it.
-#[path = "../../../../../src-tauri/src/hands_hello.rs"]
-pub mod hands_hello;
+//
+// ⚠ `cargo test` COMPILES examples; `cargo check` / `clippy` / `build --release`
+// do NOT. So a broken example shows up as a failing `cargo test`, not as a lint.
 
 use std::io::Write;
 use std::sync::Arc;
+
+use tauri_app_lib::{hands, hands_hello, kkrpc_peer};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -59,8 +58,9 @@ fn main() {
     }
 }
 
-// Keep the trait imports honest: the probe only needs the registration entry
-// point, so a compile error here means the public surface changed.
+// Keep the trait imports honest: the example only needs the registration entry
+// points, so a compile error here means the crate's public surface changed in a
+// way the E2E depends on.
 #[allow(dead_code)]
 fn _surface_is_public(peer: &Arc<kkrpc_peer::Peer>) {
     hands::register_hands_handlers(peer);

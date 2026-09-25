@@ -231,7 +231,7 @@ Our shell already carries the machinery but **no scheme string is set**:
 | Interactive p95, idle → loaded | 0.37 ms → 18.85 ms (**51x**) | same lines |
 | p95 after transfer | 0.21 ms (recovers) | same |
 | Mechanism | shell's `write()` holds the writer lock **per frame**, not per file | `docs/hands-host-design.md:229-231`; code at `src-tauri/src/kkrpc_peer.rs:913-921` (`let mut writer = self.writer.lock()…; write_all(encoded); writer.flush()`) |
-| Transfer is 128 MiB, n=100 | probe `docs/probes/hands-e2e/hol.mjs` | run: `cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml && node docs/probes/hands-e2e/hol.mjs` |
+| Transfer is 128 MiB, n=100 | probe `docs/probes/hands-e2e/hol.mjs` | run: `cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e && node docs/probes/hands-e2e/hol.mjs` |
 | Single pipe confirmed | `.stdin(Stdio::piped()).stdout(Stdio::piped())`, one channel | `src-tauri/src/host.rs:1217-1219` |
 | **Cause is NOT separated** | p95 may be head-of-line **queueing** *or* the peer being **busy**; the probe says the two need different fixes and this measurement cannot distinguish them | `hol.mjs` "the competing explanation" block; `docs/hands-host-design.md:242-244` |
 | Loopback is a **lower bound** | cross-machine tail is unmeasured and will be worse | `docs/hands-host-design.md:237-240`; `docs/probes/transport-lab/FINDINGS.md:126-136` |

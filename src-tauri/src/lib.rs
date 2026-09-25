@@ -1,11 +1,22 @@
 mod app_lifecycle;
 mod dialog_opts;
-mod hands;
-mod hands_hello;
+// ⚠ These three are `pub` so the `hands-e2e` EXAMPLE can mount them on a bare
+// stdio loop and exercise the real wire protocol without a webview (see
+// `src-tauri/examples/hands-e2e.rs`). They were `mod` while the driver lived in
+// `docs/probes/hands-e2e/rust/` and pulled the SAME files in with `#[path]` — that
+// compiled the real source, but it built a PRIVATE COPY of the module graph rather
+// than crossing the crate boundary, so nothing verified the modules were reachable
+// the way production reaches them.
+//
+// The exposure is deliberate and narrow: none of the three depends on Tauri, so
+// publishing them adds no capability the shell did not already have — it only
+// lets an example import what production registers.
+pub mod hands;
+pub mod hands_hello;
 mod host;
 mod host_lifecycle;
 mod host_ready;
-mod kkrpc_peer;
+pub mod kkrpc_peer;
 mod notify;
 mod process_tree;
 mod shell_sys;

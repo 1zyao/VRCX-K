@@ -33,7 +33,7 @@
 //   more outstanding credit means more iterations before read_line is reached.
 //
 // Usage:
-//   cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml
+//   cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e
 //   node docs/probes/hands-e2e/hol-credit.mjs [--sizeMiB=64] [--credits=4,8,16,32]
 //
 // ⚠ Loopback only. This measures the MECHANISM (what the delay tracks), not the
@@ -48,9 +48,12 @@ import { fileURLToPath } from "node:url"
 const here = dirname(fileURLToPath(import.meta.url))
 const BIN = join(
   here,
-  "rust",
+  "..",
+  "..",
+  "..",
   "target",
   "release",
+  "examples",
   process.platform === "win32" ? "hands-e2e.exe" : "hands-e2e",
 )
 

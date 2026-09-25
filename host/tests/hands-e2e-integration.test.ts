@@ -14,8 +14,9 @@
 //   mismatch that only CI's other target could see) is the same shape.
 //
 // HOW IT WORKS WITHOUT A TAURI APP
-//   `hands-e2e` compiles `src-tauri/src/hands.rs` and `kkrpc_peer.rs` by `#[path]`
-//   — the production files, not copies — and registers the real handlers. It
+//   `hands-e2e` is a Cargo EXAMPLE of the shell crate. It imports
+//   `tauri_app_lib::{hands, kkrpc_peer, hands_hello}` — the production modules,
+//   reached through the crate boundary — and registers the real handlers. It
 //   needs no `AppHandle`, because the file primitives genuinely have no Tauri
 //   dependency (unlike tray/shortcut/dialog). So a real child process on real
 //   pipes IS the production code path for these four primitives.
@@ -24,14 +25,20 @@
 //   `stdioJsonTransport` production uses (`connectShellStdio`'s default), then
 //   drives `HandsService` through it.
 //
+//   ⚠ It previously lived at `docs/probes/hands-e2e/rust/` and pulled the same
+//   files in with `#[path]`. That compiled production source but built a private
+//   copy of the module graph, so nothing verified the modules were reachable as
+//   production reaches them. Moving it to `src-tauri/examples/` required making
+//   those three modules `pub` (see `src-tauri/src/lib.rs`).
+//
 // ⚠ WHAT THIS STILL DOES NOT COVER
 //   The Rust SHELL (the Tauri app) itself: it needs a webview and cannot run
 //   headless. So the shell's own registration call (`host.rs` →
 //   `register_hands_handlers`) is not exercised here — only that the module it
 //   calls works with the host service on the other end.
 //
-// Runs only when the probe binary exists (built by
-// `cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml`).
+// Runs only when the peer binary exists (built by
+// `cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e`).
 // Absence is a SKIP with a reason, never a silent pass.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
@@ -51,14 +58,15 @@ import type {
 } from "../src/stdio"
 
 const repoRoot = join(import.meta.dir, "..", "..")
+// ⚠ The example builds into the WORKSPACE target dir, not a probe-local one:
+// `cargo build --release --example hands-e2e` from the root puts it in
+// <root>/target/release/examples/. It used to be a standalone probe crate at
+// docs/probes/hands-e2e/rust/ with its own target tree.
 const BIN = join(
   repoRoot,
-  "docs",
-  "probes",
-  "hands-e2e",
-  "rust",
   "target",
   "release",
+  "examples",
   process.platform === "win32" ? "hands-e2e.exe" : "hands-e2e",
 )
 
@@ -87,14 +95,14 @@ if (!binaryAvailable && requireBinary) {
   // instead of surfacing later as a confusing assertion error.
   throw new Error(
     `[hands-e2e-integration] ${BIN} is absent but VRCXK_REQUIRE_HANDS_E2E=1 — ` +
-      `build it with \`cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml\``,
+      `build it with \`cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e\``,
   )
 }
 
 if (!binaryAvailable) {
   console.warn(
     `[hands-e2e-integration] SKIPPED: ${BIN} is absent — build it with ` +
-      `\`cargo build --release --manifest-path docs/probes/hands-e2e/rust/Cargo.toml\``,
+      `\`cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e\``,
   )
 }
 
