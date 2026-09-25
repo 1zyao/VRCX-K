@@ -28,8 +28,22 @@
 //   while the escape hatch was checked** — the exact inversion `#24` exists to
 //   prevent.
 //
-//   Both call sites now go through `overreachVerdict` below, so the rule has one
-//   implementation and a new service cannot silently opt out of it.
+//   Both call sites now go through `overreachWarning` below, so the rule has one
+//   implementation.
+//
+//   ⚠ That is a STATEMENT ABOUT THOSE TWO CALL SITES, NOT A GUARANTEE. An earlier
+//   version of this comment claimed "a new service cannot silently opt out of
+//   it" — which was false the moment it was written: the SAME PR added
+//   `ctx.autostart`, and `ctx.tray` / `ctx.shortcut` were already there, none of
+//   which call this function. Two independent reviewers read that sentence and
+//   were briefly misled by it (one went looking for an identifier,
+//   `overreachVerdict`, that does not exist).
+//
+//   There is no compile-time or runtime enforcement: a new curated service is
+//   checked ONLY if its author calls `overreachWarning` from its own `record`.
+//   The real constraint is the checklist in `capability.ts`'s `record` comment
+//   and the `overreach.test.ts` case that enumerates the covered entry points —
+//   consult those when adding a service, and do not describe this as automatic.
 //
 // ⚠ WHY THE CHECK KEYS ON `entry.id` AND NOT ON `callerName`
 //   `callerName` decorates the id with a `#runtimeName` suffix for humans. The
