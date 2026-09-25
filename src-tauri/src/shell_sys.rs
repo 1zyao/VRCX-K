@@ -384,17 +384,24 @@ pub fn register_shell_handlers(peer: &Arc<Peer>, app: AppHandle) {
         // machine-wide change, not a failed call. A rejected scheme never
         // touches the plugin.
         //
-        // ⚠ The reply deliberately omits `scheme` on rejection: that field is
-        // the proof of what the OS now routes, so echoing an unregistered value
-        // alongside `ok: false` would be a field whose meaning depends on the
-        // other field. Put the offending value in the message instead.
+        // ⚠ `scheme` IS PRESENT ON ALL THREE PATHS, and its meaning is "the value
+        // you asked to register" — NOT "what the OS now routes".
+        //
+        // A first version omitted it on the validation-rejection path, reasoning
+        // that an unregistered value beside `ok: false` would be misleading. The
+        // asymmetric SHAPE was the worse problem: a caller reading
+        // `result.scheme` would get the value on success and on plugin failure but
+        // `undefined` on rejection, so every error handler would have to know
+        // which failure it was looking at to read its own input back. Presence is
+        // now uniform and `ok` carries the outcome.
         peer.on(
             "shell.deepLink.register",
             handler(app.clone(), |app, args| {
                 let scheme = str_arg(args, 0);
                 if let Err(reason) = validate_deep_link_scheme(&scheme) {
                     eprintln!("[shell] deep-link register {scheme:?}: {reason}");
-                    return json!({ "ok": false, "error": reason });
+                    // No `scheme` is registered — `ok: false` says so.
+                    return json!({ "ok": false, "scheme": scheme, "error": reason });
                 }
                 match app.deep_link().register(scheme.clone()) {
                     Ok(()) => json!({ "ok": true, "scheme": scheme }),
