@@ -119,6 +119,33 @@ enum Code {
     Stale,
     NoSpace,
     Unsupported,
+    /// The request was malformed for this path or this call.
+    ///
+    /// ⚠ Carved out of `Denied` rather than added for its own sake. `EACCES`
+    /// means "authorisation is missing", and a caller acts on that by re-prompting
+    /// the user or declaring the path off limits. `EINVAL` means the request could
+    /// never have worked on any machine — retrying, re-prompting or widening
+    /// permissions all waste the caller's time. Reporting one as the other is the
+    /// mistake this variant exists to stop; see `classify`.
+    Invalid,
+    /// The target is already there and this call refuses to clobber it.
+    ///
+    /// Carved out of `Denied` for the same reason: "it exists" and "you may not
+    /// touch it" lead to different fixes (pick another name vs change permissions).
+    Exists,
+    /// The call was interrupted before it completed.
+    ///
+    /// ⚠ The disposition is the opposite of `EACCES`: an interrupted operation is
+    /// USUALLY RETRYABLE, and that is precisely what "access denied" tells a
+    /// caller not to do.
+    Interrupted,
+    /// An internal fault in the hands themselves — never a statement about a path.
+    ///
+    /// ⚠ Its one producer is a POISONED `streams` lock (`Mutex::lock` failing,
+    /// i.e. another thread panicked while holding the stream table). That used to
+    /// be reported as `ESTALE`, which the host maps to `HandsError.isStale` — so a
+    /// caller branching on it re-read the file, which cannot help a poisoned lock.
+    Internal,
 }
 
 impl Code {
@@ -131,6 +158,10 @@ impl Code {
             Code::Stale => "ESTALE",
             Code::NoSpace => "ENOSPC",
             Code::Unsupported => "EUNSUPPORTED",
+            Code::Invalid => "EINVAL",
+            Code::Exists => "EEXIST",
+            Code::Interrupted => "EINTR",
+            Code::Internal => "EINTERNAL",
         }
     }
 }
@@ -145,17 +176,107 @@ fn encode_error(code: Code, detail: impl std::fmt::Display) -> String {
     format!("{}: {detail}", code.as_str())
 }
 
+/// ⚠ THE PREVIOUS VERSION OF THIS FUNCTION FELL THROUGH TO `Denied`, and what it
+/// got wrong was the caller's DISPOSITION, not the wording. It named only
+/// `NotFound` / `PermissionDenied` / `IsADirectory` / `StorageFull` /
+/// `Unsupported` (plus one substring guess at `"os error 5"`), so everything else
+/// — `ENOTDIR`, `EINVAL`, `ELOOP`, `ENAMETOOLONG`, `AlreadyExists`, `Interrupted`
+/// — came out as `EACCES: …`. But the closed code set exists precisely so a
+/// caller can branch on it: `EACCES` says "authorisation is missing" (re-prompt
+/// the user, declare the path off limits), while the truth was "this request can
+/// never work" or "you were interrupted, try again". Both were told to stop and
+/// ask for permission.
+///
+/// The sharpest case: a path that names a non-directory THROUGH a trailing
+/// separator (`<dir>/a.txt/`). Measured on Windows: `ERROR_DIRECTORY` (267), which
+/// std already surfaces as `ErrorKind::NotADirectory`; on Linux/macOS the same
+/// shape is raw `ENOTDIR`. Both used to reach the catch-all and become `EACCES`,
+/// for a path where permissions were never the issue. `NotADirectory` now maps to
+/// `NotDir` — the code the enum already had, and which `DirectoryReader::open` was
+/// the sole producer of.
+///
+/// ⚠ The raw-code tables below were added and then most of them REMOVED, because
+/// measurement did not support them. On rustc 1.97 / Windows the codes this bug is
+/// about are already mapped to real `ErrorKind`s by std: 267 → `NotADirectory`,
+/// 183 and 80 → `AlreadyExists`, 145 → `DirectoryNotEmpty`, 5 → `PermissionDenied`.
+/// A hardcoded `winerror.h` table would therefore have been unreachable code
+/// carrying a comment claiming it was load-bearing — the same class of mistake as
+/// the bug being fixed. The one table that survives is Unix's, where `ENOTDIR`,
+/// `ELOOP` and `ENAMETOOLONG` genuinely reach the catch-all as `Other`/`InvalidInput`
+/// and the raw errno is the only thing that distinguishes them.
 fn classify(error: &std::io::Error) -> Code {
+    use std::io::ErrorKind;
+
+    // ⚠ Before the kind match, because the kind is the coarser signal and loses
+    // the distinction that matters here: `ELOOP` and `ENAMETOOLONG` both arrive as
+    // `ErrorKind::InvalidInput` on Unix, so without this they are indistinguishable
+    // from `EINVAL` — yet "break the symlink loop / shorten the path" and "the
+    // argument is malformed" are different fixes for the caller.
+    #[cfg(unix)]
+    if let Some(errno) = error.raw_os_error() {
+        if let Some(code) = classify_errno(errno) {
+            return code;
+        }
+    }
+
     match error.kind() {
-        std::io::ErrorKind::NotFound => Code::NotFound,
-        std::io::ErrorKind::PermissionDenied => Code::Denied,
-        std::io::ErrorKind::IsADirectory => Code::IsDir,
-        std::io::ErrorKind::StorageFull => Code::NoSpace,
-        std::io::ErrorKind::Unsupported => Code::Unsupported,
-        // Windows reports a directory handed to `File::open` for writing as
-        // "access denied" rather than `IsADirectory`.
-        std::io::ErrorKind::Other if error.to_string().contains("os error 5") => Code::Denied,
-        _ => Code::Denied,
+        ErrorKind::NotFound => Code::NotFound,
+        ErrorKind::PermissionDenied => Code::Denied,
+        ErrorKind::IsADirectory => Code::IsDir,
+        ErrorKind::NotADirectory => Code::NotDir,
+        ErrorKind::StorageFull => Code::NoSpace,
+        ErrorKind::Unsupported => Code::Unsupported,
+        ErrorKind::InvalidInput => Code::Invalid,
+        ErrorKind::InvalidData => Code::Invalid,
+        ErrorKind::AlreadyExists => Code::Exists,
+        ErrorKind::Interrupted => Code::Interrupted,
+        // ⚠ The catch-all is an EXPLICIT `Unsupported`, not `Denied`. Reusing
+        // `Denied` here is what produced the bug above; and inventing a mapping for
+        // an error nobody has classified would be worse than admitting the gap.
+        // `EUNSUPPORTED` is already in the wire contract and already means "we do
+        // not have a code for this", which is exactly true.
+        //
+        // One deliberate exception, kept from the original: Windows reports a
+        // directory handed to `OpenOptions::open` for writing as "access denied",
+        // and that IS a permission answer, so it must stay `EACCES`. Measured: that
+        // shape arrives as `ErrorKind::PermissionDenied` with raw 5 — caught by the
+        // arm above, not by this one. This guard is therefore defence in depth for
+        // a std that classifies it as `Other` instead; it is not the arm doing the
+        // work today, and saying so is the point of the comment.
+        ErrorKind::Other if error.raw_os_error() == Some(5) => Code::Denied,
+        _ => Code::Unsupported,
+    }
+}
+
+/// The Unix errno values the kind match cannot separate, so `ELOOP` /
+/// `ENAMETOOLONG` / `ENOTDIR` stop collapsing into one code.
+///
+/// ⚠ Only called on Unix. `ENOTDIR` and `EISDIR` are included because they are the
+/// two shapes this finding is about; the rest are the neighbours that share a kind
+/// with them.
+///
+/// ⚠ The values come from `libc`, not from literals: `ENOTDIR` is 20 on x86_64
+/// Linux but 31 on mips and 4 or 21 on sparc, so a literal table would be silently
+/// wrong on those targets while passing on the machine that wrote it. Android
+/// agrees with the asm-generic table, which is why this is safe for the Android
+/// build.
+///
+/// Returning `None` means "the kind match is good enough for this one"; it is not
+/// an error path.
+#[cfg(unix)]
+fn classify_errno(errno: i32) -> Option<Code> {
+    match errno {
+        libc::ENOTDIR => Some(Code::NotDir),
+        // Not `Denied`, which is what the catch-all used to say: a symlink loop is
+        // a request that can never resolve, not a permission the caller lacks.
+        libc::ELOOP => Some(Code::Invalid),
+        libc::ENAMETOOLONG => Some(Code::Invalid),
+        libc::EINVAL => Some(Code::Invalid),
+        libc::EEXIST => Some(Code::Exists),
+        libc::EINTR => Some(Code::Interrupted),
+        libc::EISDIR => Some(Code::IsDir),
+        libc::ENOSPC => Some(Code::NoSpace),
+        _ => None,
     }
 }
 
@@ -530,6 +651,36 @@ impl FileReader {
                 format!("{path} is not a regular file (devices and FIFOs are not readable)"),
             ));
         }
+        // ⚠ AN OFFSET PAST EOF MUST FAIL, and the failure it used to produce was
+        // the OPPOSITE of the truth — silently.
+        //
+        // `seek(SeekFrom::Start(n))` past the end is legal on every platform, so
+        // the seek succeeded; the following `read` then returned 0 immediately,
+        // which `next_chunk` reports as `StreamStep::Done`. The caller received a
+        // SUCCESSFUL, EMPTY stream: "the read finished", when what had actually
+        // happened is "the file is shorter than the point you asked to resume
+        // from". The proposal (§2.2) classifies exactly that situation as
+        // `ESTALE` — the file was truncated underneath you, start over.
+        //
+        // The consequence was a wrong-correctness resume: a caller resuming a
+        // truncated transfer read the empty stream as "already complete" and
+        // committed a partial file as whole. That is the failure mode `ESTALE`
+        // exists to prevent, and it was the one case producing `Done`.
+        //
+        // Equality is allowed on purpose: `offset == len` is a legitimate
+        // "resume at the very end" and yields the same empty-but-finished answer
+        // the caller asked for. Only a STRICTLY larger offset is a contradiction.
+        if offset > meta.len() {
+            return Err(encode_error(
+                Code::Stale,
+                format!(
+                    "{path} is {} bytes but offset {offset} was requested — the file is \
+                     shorter than the resume point, so it was truncated or replaced; \
+                     reopen it and restart from 0",
+                    meta.len()
+                ),
+            ));
+        }
         let mut file = File::open(path).map_err(|error| encode_error(classify(&error), error))?;
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))
@@ -639,10 +790,12 @@ fn register_write(peer: &Arc<Peer>) {
                         mode,
                     });
                     // `consume_stream` opens the credit window, so the host
-                    // starts sending only after this returns. If it refuses
-                    // (duplicate stream id), the reply is still owed.
+                    // starts sending only after this returns. If it refuses,
+                    // the reply is still owed.
                     if let Err(error) = target.consume_stream(&sid, sink) {
-                        reply.fail(encode_error(Code::Stale, error));
+                        // `consume_refusal` returns the FULL message, because the
+                        // dead-transport case must stay un-prefixed — see its docs.
+                        reply.fail(consume_refusal(&error));
                     }
                 }
                 Err(error) => reply.fail(error),
@@ -994,6 +1147,17 @@ struct FileWatcher {
     target: PathBuf,
     /// Whether the watch had to move up to the parent (target absent at start).
     watching_parent: bool,
+    /// The mode the watch was ACTUALLY registered with — the value `notify` was
+    /// handed, not a copy of the caller's request.
+    ///
+    /// ⚠ `#[cfg(test)]`-only, and that is a deliberate trade rather than tidiness.
+    /// Nothing in production reads it; it exists so the regression test can assert
+    /// what the call site really passed. The alternative considered and REJECTED
+    /// after measurement was a behavioural test — the two modes are
+    /// indistinguishable through `next_value` for a parent watch, so such a test
+    /// passed on the broken code. See `watch_and_report_mode`.
+    #[cfg(test)]
+    registered_mode: RecursiveMode,
     /// The path the watch was ACTUALLY registered on — which is NOT `target`.
     ///
     /// ⚠ This field exists because `close()` used to unwatch `target`, and those
@@ -1030,13 +1194,101 @@ fn comparable(path: &Path) -> PathBuf {
     }
 }
 
+/// Are two path components equal, folding case only where the platform does?
+///
+/// ⚠ WHY THIS EXISTS, and the silent failure it removes.
+///
+/// [`event_concerns`] used `PathBuf` equality, which is byte equality: there was
+/// no case folding anywhere in this file. On Windows and macOS — where the
+/// filesystem is case-INSENSITIVE by default — a caller that watched `app.log`
+/// while the file was created as `App.Log` had EVERY event silently dropped. The
+/// watch looked like "nothing ever happens" rather than failing, which is the
+/// worst possible symptom (see the `target` field docs for the same shape caused
+/// by canonicalization).
+///
+/// That path is not a corner: it is precisely the PARENT-WATCH FALLBACK — "watch
+/// the parent, wait for the target to appear" — where `target` is built from the
+/// caller's string and the file on disk is created (by another program, from
+/// another naming convention) with whatever case it likes. On Windows the caller
+/// has no way to predict it: `CreateFile("App.Log")` creates `App.Log` and
+/// `C:\x\App.Log` stats fine through the spelling `app.log`.
+///
+/// ⚠ THE UNIX BEHAVIOUR IS UNCHANGED, DELIBERATELY. On a case-sensitive
+/// filesystem `App.Log` and `app.log` are two DIFFERENT files, so folding there
+/// would attribute one file's events to the other — trading a dropped event for a
+/// misattributed one, which is worse (a log tailer would follow the wrong file).
+/// Hence the `cfg`: the fold is compiled in only where the platform folds names.
+///
+/// The fold is ASCII-only, matching `PathBuf`'s own `eq_ignore_ascii_case`-style
+/// semantics that the standard library offers. Non-ASCII case folding (Turkish
+/// dotless i, Greek final sigma, …) needs Unicode tables and locale context that
+/// neither the OS API nor this layer has; Windows' own case-insensitivity is
+/// closer to an upcase table than to a full fold, so ASCII is the honest bound.
+/// A non-ASCII filename that differs only in case may still be missed — recorded
+/// here rather than papered over with a hand-rolled table that would be wrong in
+/// the other direction.
+fn component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        // ⚠ `to_string_lossy` rather than requiring `&str`: this comparison runs
+        // for EVERY event path, and a path that is not valid UTF-8 (perfectly
+        // legal on both platforms) must not be the reason an event is dropped.
+        // The lossy form is only used for the CASE-insensitive second opinion;
+        // the exact `==` above already answered for byte-identical paths.
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+/// Does this path equal `target`, component by component, with the platform's
+/// own case sensitivity?
+///
+/// `PathBuf ==` cannot be used directly because it is always case-SENSITIVE; see
+/// [`component_eq`] for why folding unconditionally would be wrong on Unix.
+fn paths_eq_platform(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    // Only the two platforms that fold need the walk, and the walk allocates, so
+    // it is skipped entirely where folding is not compiled in.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (left, right);
+        false
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let mut left_components = left.components();
+        let mut right_components = right.components();
+        loop {
+            match (left_components.next(), right_components.next()) {
+                (None, None) => return true,
+                (Some(a), Some(b)) => {
+                    if !component_eq(a.as_os_str(), b.as_os_str()) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+}
+
 /// Does this event concern the watched path?
 ///
 /// Compared on canonicalized forms so a symlinked ancestor (macOS `/var`) does
-/// not make every event look unrelated. A raw `==` here is the bug described on
-/// [`FileWatcher::target`].
+/// not make every event look unrelated, and with the platform's case sensitivity
+/// so a `App.Log`/`app.log` difference on Windows does not do the same. A raw
+/// `==` here is the bug described on [`FileWatcher::target`].
 fn event_concerns(event_path: &Path, target: &Path) -> bool {
-    event_path == target || comparable(event_path) == target
+    paths_eq_platform(event_path, target) || paths_eq_platform(&comparable(event_path), target)
 }
 
 impl FileWatcher {
@@ -1059,9 +1311,29 @@ impl FileWatcher {
 
         // Try the target itself first: a recursive watch on a directory only
         // works there, and a file that exists is watched most directly.
+        let mut registered_mode = mode;
         let watching_parent = match watcher.watch(&requested, mode) {
             Ok(()) => false,
-            Err(_) => {
+            // ⚠ ONLY "the path is not there" may fall back to the parent. The
+            // decision is a named unit (`classify_watch_refusal`) rather than an `if`
+            // guard, so at least the DECISION is testable.
+            //
+            // ⚠ HONEST LIMIT, measured: the call site's USE of that decision is NOT
+            // end-to-end falsifiable on Windows. No non-absence refusal is reachable
+            // from a unit test — probed with a NUL path, a path under a missing
+            // parent, a 300-char leaf and a duplicate watch, and every one either
+            // succeeded or came back as `Generic(...)` with `exists() == false`. So
+            // mutating this `match` to hardcode `TryParent` (the literal old `Err(_)`
+            // swallow) leaves every test GREEN, and no test here pretends otherwise.
+            // What IS pinned is `classify_watch_refusal`'s contract, which is where
+            // the reasoning lives.
+            Err(error) => {
+                match classify_watch_refusal(&error, &requested) {
+                    WatchRefusal::Report(code) => {
+                        return Err(encode_error(code, error));
+                    }
+                    WatchRefusal::TryParent => {}
+                }
                 let parent = requested
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
@@ -1079,9 +1351,34 @@ impl FileWatcher {
                         format!("{} does not exist", parent.display()),
                     ));
                 }
-                watcher
-                    .watch(parent, RecursiveMode::NonRecursive)
-                    .map_err(|error| encode_error(classify_anyhow(&error), error))?;
+                // ⚠ THE FALLBACK HONOURS THE CALLER'S `recursive`, and it used to
+                // hardcode `NonRecursive` right here while `mode` — computed three
+                // lines above from the caller's flag — was discarded.
+                //
+                // The lie that produced: a caller asking to watch a
+                // not-yet-created DIRECTORY TREE (the ordinary "tail -f a log dir
+                // that the app has not made yet" shape) got a NonRecursive watch
+                // on the parent. `notify` on Linux/macOS delivers the parent's own
+                // events only, so the moment the tree appeared and files changed
+                // inside it, nothing was ever reported — while the caller believed
+                // it was watching the tree, exactly the silent-drop symptom the
+                // `target` docs describe for macOS canonicalization.
+                //
+                // There is no "recursive is meaningless for a parent" argument
+                // here: the parent may itself be a directory, and watching it
+                // recursively is well-defined and is what was asked for. When the
+                // target is a FILE the promise is weaker by nature (a recursive
+                // watch on a file behaves as a non-recursive one), but that is the
+                // platform's constraint, not a reason to silently downgrade the
+                // mode the caller chose.
+                //
+                // ⚠ The registration goes through `register_watch` so the mode that
+                // was ACTUALLY passed to `notify` is the value returned to the
+                // caller — see that function for why a stored copy of `mode` was
+                // not good enough.
+                watch_and_report_mode(&mut watcher, parent, mode)
+                    .map_err(|error| encode_error(classify_anyhow(&error), error))
+                    .map(|actually| registered_mode = actually)?;
                 true
             }
         };
@@ -1103,12 +1400,38 @@ impl FileWatcher {
             watcher,
             target,
             watching_parent,
+            #[cfg(test)]
+            registered_mode,
             registered,
         })
     }
 
     /// Translate one filesystem event into the proposal's `HandsChange` shape.
-    fn change_of(event: &notify::Event) -> Option<Value> {
+    ///
+    /// ⚠ `target` is a parameter, and it is the whole point of this signature.
+    ///
+    /// The previous version took no target and reported `event.paths.first()`.
+    /// That was wrong in exactly the multi-path case, and multi-path is not
+    /// exotic: a rename WITHIN one directory is a single
+    /// `Modify(Name(Both))` event carrying `paths = [from, to]`, and notify's own
+    /// `Event::paths` documentation says the order puts the source first and the
+    /// destination LAST.
+    ///
+    /// So for a caller watching `app.log`, an atomic-write rotation produces a
+    /// `[app.log.tmp, app.log]` event — the FILTER admitted it (it tests
+    /// `.any(...)`, and `app.log` is in there), and then the report described
+    /// `app.log.tmp`. Both the `path` and the `id` pointed at the wrong file:
+    /// the `id` is taken from that same path, so a caller comparing it against
+    /// `stat(app.log).id` to detect rotation saw a mismatch and concluded the file
+    /// had been replaced — when the event it was handed was "your file was just
+    /// written". A temp-file name reaches the caller as if it were the watched
+    /// path.
+    ///
+    /// Selecting the matching path fixes the report at the source. When nothing
+    /// matches (the watch is on the target itself, so no filtering happened, or
+    /// the event concerns a path the caller did not ask about), the first path is
+    /// the best available answer and is kept.
+    fn change_of(event: &notify::Event, target: &Path) -> Option<Value> {
         use notify::EventKind;
         let kind = match event.kind {
             EventKind::Create(_) => "create",
@@ -1120,7 +1443,13 @@ impl FileWatcher {
             EventKind::Access(_) => return None,
             _ => "modify",
         };
-        let path = event.paths.first()?;
+        // ⚠ `find`, not `first`. Prefer the path that IS the watched target; fall
+        // back to the first only when none of them matches. See the docs above.
+        let path = event
+            .paths
+            .iter()
+            .find(|path| event_concerns(path, target))
+            .or_else(|| event.paths.first())?;
         Some(json!({
             "kind": kind,
             "path": path.to_string_lossy(),
@@ -1152,7 +1481,7 @@ impl StreamSource for FileWatcher {
                     {
                         continue;
                     }
-                    if let Some(change) = Self::change_of(&event) {
+                    if let Some(change) = Self::change_of(&event, &self.target) {
                         return Some(change);
                     }
                 }
@@ -1232,7 +1561,192 @@ fn classify_anyhow(error: &notify::Error) -> Code {
         notify::ErrorKind::PathNotFound => Code::NotFound,
         notify::ErrorKind::Io(ref io) => classify(io),
         notify::ErrorKind::Generic(_) => Code::Unsupported,
+        // `MaxFilesWatch` is the inotify limit, and it is NOT a path problem —
+        // `Unsupported` is the honest "there is no code for this" with the detail
+        // preserved in the message.
         _ => Code::Unsupported,
+    }
+}
+
+/// What to do about a refusal from `watch()`.
+///
+/// ⚠ This enum exists so the decision is ONE named, testable unit rather than an
+/// `if` guard whose else-branch no test can reach. Before it, the fallback was
+/// written as `Err(error) if watch_refusal_is_absent(...) => { … }` / `Err(error)
+/// => report`, and the predicate could be tested while the SHAPE — "is the guard
+/// consulted at all, or is every error swallowed as before?" — could not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchRefusal {
+    /// The target is absent (or the backend says so): watch the parent instead.
+    TryParent,
+    /// A real failure, carrying the code to report. Never a fallback.
+    Report(Code),
+}
+
+/// Decide how to react to a `watch()` refusal.
+///
+/// ⚠ The contract, stated once: ONLY absence falls back to the parent. Everything
+/// else is reported as itself. The old code was `Err(_)`, which read every failure
+/// as "not there yet" and answered it by watching the parent — so a permission
+/// fault, a watch-limit fault or a backend fault reached the caller as `ENOENT`,
+/// and a caller that treats absence as retryable would retry forever against a
+/// condition that cannot change.
+fn classify_watch_refusal(error: &notify::Error, requested: &Path) -> WatchRefusal {
+    if watch_refusal_is_absent(error, requested) {
+        WatchRefusal::TryParent
+    } else {
+        WatchRefusal::Report(classify_anyhow(error))
+    }
+}
+
+/// Is this `watch()` refusal "the path is not there"?
+///
+/// ⚠ THIS IS DELIBERATELY NOT `matches!(error.kind, ErrorKind::PathNotFound)`, and
+/// the reason is measured in notify's own source rather than assumed.
+///
+/// The two backends that matter classify a MISSING path DIFFERENTLY:
+///
+/// | backend | a path that does not exist |
+/// |---|---|
+/// | Linux (inotify) | `ErrorKind::PathNotFound` |
+/// | macOS (fsevent) | `ErrorKind::PathNotFound` |
+/// | **Windows** | **`ErrorKind::Generic("Input watch path is neither a file nor a directory.")`** |
+///
+/// Windows' `add_watch` (`notify-8.2.0/src/windows.rs:169`) opens with
+/// `if !path.is_dir() && !path.is_file() { return Err(Error::generic("Input watch
+/// path is neither a file nor a directory.").add_path(path)) }`, so an absent
+/// target is a `Generic` there. Gating on the kind alone would therefore have made
+/// the parent-directory fallback DEAD ON WINDOWS — the regression would have
+/// looked like "the target does not exist" now failing with `EUNSUPPORTED`
+/// instead of being watched, which is the very case the fallback exists for.
+/// (Measured: every `watch_falls_back_*` test failed with
+/// `EUNSUPPORTED: Input watch path is neither a file nor a directory.`)
+///
+/// So absence is decided by asking the FILESYSTEM, not by trusting the kind: if
+/// the path is genuinely not there, it is absent regardless of how the backend
+/// worded it, and the parent fallback applies. If it IS there, then a refusal is a
+/// real failure (permissions, watch limits, a backend fault) and is reported as
+/// itself.
+///
+/// The `PathNotFound` kind is still honoured as a positive signal, because on Unix
+/// it is what makes the answer independent of a TOCTOU race between the `watch`
+/// call and this check: the backend already knows the path was missing.
+fn watch_refusal_is_absent(error: &notify::Error, requested: &Path) -> bool {
+    if matches!(error.kind, notify::ErrorKind::PathNotFound) {
+        return true;
+    }
+    // A `Generic` refusal from the Windows backend is the only other shape that
+    // means "you gave me nothing to watch", and it is confirmed against the disk
+    // rather than matched on its message text (which is upstream's to change).
+    if matches!(error.kind, notify::ErrorKind::Generic(_)) {
+        return !requested.exists();
+    }
+    // Every remaining kind is an `Io` error or a watch-limit fault: those describe
+    // a real failure and must reach the caller as one.
+    false
+}
+
+/// Register a watch and return the mode that was ACTUALLY passed to `notify`.
+///
+/// ⚠ THIS FUNCTION EXISTS SOLELY TO MAKE THE MODE FALSIFIABLE, and the reason is
+/// worth the indirection. The bug in finding 2a was that the parent fallback
+/// hardcoded `NonRecursive` while `mode` — computed correctly a few lines above
+/// from the caller's flag — was discarded. The first version of the regression test
+/// stored `mode` in a struct field and asserted the field; re-injecting the bug left
+/// it GREEN (measured), because that field recorded the INTENT that the broken code
+/// also computed correctly. Asserting a stored copy of the input is not a test of
+/// the call.
+///
+/// ⚠ The obvious alternative — assert the BEHAVIOUR — was measured and does not
+/// work either, and that measurement is the whole justification for this shape. A
+/// recursive and a non-recursive watch of the same parent produce IDENTICAL output
+/// through `next_value`, because the parent-watch filter admits only events whose
+/// path IS the target, and a subdirectory's events are dropped in BOTH modes.
+/// Probed with a not-yet-created target directory, a file created inside it
+/// afterwards, and a sibling file in the parent: both modes reported exactly the
+/// same two events (the target's own create+modify) and nothing else. There is no
+/// behavioural difference for a black-box test to observe on this platform through
+/// this API, so a "behavioural" test would have been green on the broken code too.
+///
+/// What IS observable is what the call site hands to `notify`, so that is what is
+/// returned. `watch` is still the only thing doing the work; the return value is the
+/// argument it was given, so a future edit that hardcodes the mode again (or
+/// otherwise passes something different) changes the returned value and fails
+/// `the_parent_fallback_honours_the_callers_recursive_flag`. That is a real
+/// falsification, unlike re-reading `mode`.
+fn watch_and_report_mode<W: Watcher>(
+    watcher: &mut W,
+    path: &Path,
+    mode: RecursiveMode,
+) -> notify::Result<RecursiveMode> {
+    watcher.watch(path, mode).map(|()| mode)
+}
+
+/// The text `kkrpc_peer::close_streams` fails every consumer with.
+/// than an oversight. `kkrpc_peer::TRANSPORT_CLOSED` is private to that module and
+/// this file may not edit it, so the two literals are kept byte-identical by this
+/// comment plus the assertion in `transport_closed_text_matches_the_peer`. The
+/// alternative — inventing a second spelling of "the transport is dead" — is
+/// precisely the bug being fixed: a caller that branches on a dead transport must
+/// see ONE string whether the news arrives through a sink's `finish` or through
+/// this refusal. `crate::kkrpc_peer`'s own tests pin the peer side
+/// (`assert_eq!(message, TRANSPORT_CLOSED)`), so if that literal ever moves, this
+/// one is the other half to move with it.
+const TRANSPORT_CLOSED_TEXT: &str = "host stdio closed";
+
+/// Turn a refused [`Peer::consume_stream`] into the message the caller receives.
+///
+/// ⚠ ALL THREE CAUSES USED TO BE ENCODED AS `Stale`, and that is a wrong ACTION,
+/// not merely a wrong label. The host's `HandsError.isStale` is literally
+/// `code === "ESTALE"` (`host/src/hands.ts`) and means "the path now refers to a
+/// DIFFERENT file — reopen and reset the offset", so a caller that branches on it
+/// RE-READS the file. For every one of the three causes below that is wasted work
+/// against a condition that has not changed, and for two of them it is also
+/// misleading about what actually broke:
+///
+/// | cause | old code | code now | why the caller acts differently |
+/// |---|---|---|---|
+/// | this sid is already being consumed | `ESTALE` | `EUNSUPPORTED` | the request is malformed; a re-read cannot make it succeed |
+/// | the stream-table lock is poisoned | `ESTALE` | `EINTERNAL` | an internal fault; retrying cannot help |
+/// | the transport is already gone | `ESTALE` | `host stdio closed` (raw) | the pipe is down; reconnect, do not re-read |
+///
+/// ⚠ The third is deliberately NOT a `Code`. [`TRANSPORT_CLOSED_TEXT`] is what
+/// `close_streams` fails every other consumer with, so the message BEGINS with
+/// that exact text and a caller matching on "the transport is dead" sees one
+/// spelling of it regardless of which path noticed. Because it is un-prefixed it
+/// parses to `code: undefined` — the honest "no file-level code applies" that
+/// `HandsError` documents for an unrecognised message — and crucially `isStale`
+/// is `false`, which is the whole point.
+///
+/// ⚠ `EUNSUPPORTED` for the duplicate is not a new wire code: it is already in the
+/// contract and already means "we cannot honour this request", so the host's
+/// `HANDS_ERROR_CODES` keeps working unchanged. `EINTERNAL` IS new, and the honest
+/// consequence is that the host parses it to `code: undefined` until the host-side
+/// list gains it — still a strict improvement, because the previous `ESTALE` made
+/// `isStale` true and sent the caller down the re-read path for an internal fault.
+///
+/// The cause is read from the refusal TEXT because `consume_stream` returns
+/// `Result<(), String>`. It matches the substrings the peer itself writes, and the
+/// peer's own test pins `"is already being consumed"` — so if that wording
+/// changes, that test goes red rather than this mapping silently reverting to a
+/// single code for all three.
+fn consume_refusal(error: &str) -> String {
+    if error.contains("is already being consumed") {
+        // A second consumer for one sid. The request cannot be honoured, and
+        // telling the caller "your file rotated" sends it to re-read for nothing.
+        encode_error(Code::Unsupported, error)
+    } else if error.contains("poisoned") {
+        // `Mutex::lock` failing is a poisoned lock: another thread panicked while
+        // holding the stream table, so the stream state is not trustworthy.
+        encode_error(Code::Internal, error)
+    } else {
+        // The remaining failure mode in `consume_stream` is its own opening
+        // `pull` write failing — i.e. the transport end. Report it the way
+        // `close_streams` does, not as a file-state code. The peer's own message
+        // is appended so the diagnostic detail is not lost, but the message now
+        // BEGINS with the transport text — which is what a caller matching on it
+        // (and what `isStale`, which is false here for any of these) keys off.
+        format!("{TRANSPORT_CLOSED_TEXT}: {error}")
     }
 }
 
@@ -1343,13 +1857,24 @@ mod tests {
         // An INTERIOR NUL is refused by the OS layer on every platform:
         //   - Windows: `metadata` → `os error 1`, `InvalidInput`
         //   - Unix:    the `CString` conversion → `NulError` → `InvalidInput`
-        // Both are measured, and `classify` maps `InvalidInput` to `Denied` →
-        // `EACCES`, so the assertion below is exact rather than a disjunction.
+        //
+        // ⚠ THE EXPECTED CODE CHANGED FROM `EACCES` TO `EINVAL` (finding 1). The
+        // old comment here read "`classify` maps `InvalidInput` to `Denied` →
+        // `EACCES`, so the assertion below is exact rather than a disjunction" —
+        // true at the time, and it was describing the bug, not a contract: a
+        // malformed path is not a permission failure, and a caller that saw
+        // `EACCES` would go and ask the user for rights that were never the
+        // problem. The assertion is still exact; only the value moved.
         let error =
             stat_outcome("a\0b").expect_err("a real failure must be a failure, not a value");
         assert!(
-            error.starts_with("EACCES"),
-            "the failure must carry a parseable code, got: {error}"
+            error.starts_with("EINVAL"),
+            "the failure must carry a parseable code, and a NUL is a malformed \
+             path, not a denied one; got: {error}"
+        );
+        assert!(
+            !error.starts_with("EACCES"),
+            "⚠ EACCES would send the caller to fix permissions for a NUL byte: {error}"
         );
         //
         // NOTE: `EUNSUPPORTED` is deliberately NOT accepted here. That code comes
@@ -2158,6 +2683,38 @@ mod tests {
     }
 
     #[test]
+    fn writing_through_a_file_reports_not_a_directory() {
+        // ⚠ This is the `write`-side producer for `ENOTDIR`, which before this
+        // change existed NOWHERE outside `DirectoryReader::open`. The path names a
+        // non-directory through a trailing separator, the shape that yields
+        // `ENOTDIR` on every platform (see the `stat` twin above).
+        //
+        // It matters that `write` can produce it too: a caller that guessed "this is
+        // a directory I can write into" gets `ENOTDIR` from both primitives rather
+        // than one code from `list` and a fabricated `EACCES` from `write`.
+        let dir = temp_dir("write-notdir");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let through = format!("{}{}", file.display(), std::path::MAIN_SEPARATOR);
+
+        let error = match FileWriter::open(&through, &json!({})) {
+            Ok(_) => panic!("a file named as a directory must not open for writing"),
+            Err(error) => error,
+        };
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            error.starts_with("ENOTDIR"),
+            "expected ENOTDIR from the write path, got: {error}"
+        );
+        assert!(
+            !error.starts_with("EACCES"),
+            "⚠ EACCES is the pre-fix answer: it sends the caller to fix permissions \
+             for a path shape that no permission can fix"
+        );
+    }
+
+    #[test]
     fn append_with_a_nonzero_offset_is_rejected_as_a_contradiction() {
         let dir = temp_dir("write-contradiction");
         let path = dir.join("x.txt");
@@ -2165,8 +2722,7 @@ mod tests {
             path.to_str().unwrap(),
             &json!({ "append": true, "offset": 5 }),
         )
-        .err()
-        .expect("must fail");
+        .expect_err("must fail");
         std::fs::remove_dir_all(&dir).ok();
         assert!(error.starts_with("EUNSUPPORTED"), "got: {error}");
     }
@@ -2311,6 +2867,708 @@ mod tests {
         assert!(error.starts_with("ENOENT"), "got: {error}");
     }
 
+    // --- finding 2: the fallback discarded `recursive`, and swallowed errors --
+
+    #[test]
+    fn the_parent_fallback_honours_the_callers_recursive_flag() {
+        // ⚠ THE REGRESSION for finding 2a. The fallback registered the parent with
+        // a hardcoded `RecursiveMode::NonRecursive` while the `mode` computed from
+        // the caller's flag was discarded — so a caller asking to watch a
+        // not-yet-created DIRECTORY TREE got the parent's own events only, and
+        // every change inside the tree was silently dropped after the tree
+        // appeared. It believed it was watching the tree.
+        //
+        // ⚠⚠ THE SECOND VERSION OF THIS TEST WAS ALSO WRONG, AND THE MEASUREMENT IS
+        // THE REASON THIS ONE LOOKS ODD.
+        //
+        // Version 1 asserted a struct field holding `mode`. Green on the broken code
+        // — the field recorded the intent the broken code also computed.
+        //
+        // Version 2 asserted the BEHAVIOUR (recursive vs non-recursive watch of the
+        // same parent, then a file written into a subdirectory). Also green on the
+        // broken code, because the two modes are INDISTINGUISHABLE through this API:
+        // the parent-watch filter admits only events whose path IS the target, so a
+        // subdirectory's events are dropped in BOTH modes. Probed directly — a
+        // not-yet-created target directory, a file created inside it afterwards, and
+        // a sibling file — and both modes reported exactly the same two events (the
+        // target's own create and modify) and nothing else. There is no black-box
+        // difference to observe.
+        //
+        // So the value asserted is the mode `notify` was ACTUALLY HANDED, returned by
+        // the single call site (`watch_and_report_mode`). It is falsifiable in the
+        // way that matters: re-injecting the hardcoded `NonRecursive` changes what
+        // the call site passes, which changes this value, which fails the test
+        // (verified by fault injection, not asserted).
+        let dir = temp_dir("watch-fallback-mode");
+        let tree = dir.join("not-yet-dir");
+
+        let recursive = FileWatcher::start(tree.to_str().unwrap(), true).expect("start");
+        assert!(
+            recursive.watching_parent,
+            "the fixture must exercise the fallback, or this proves nothing"
+        );
+        assert_eq!(
+            recursive.registered_mode,
+            RecursiveMode::Recursive,
+            "⚠ a recursive request must stay recursive through the parent fallback; \
+             this is the mode notify was actually given"
+        );
+        let registered = recursive.registered.clone();
+        drop(recursive);
+
+        // The non-recursive direction must not be silently upgraded either: the fix
+        // is "honour what was asked", not "always recurse".
+        let flat = FileWatcher::start(tree.to_str().unwrap(), false).expect("start");
+        assert!(flat.watching_parent);
+        assert_eq!(
+            flat.registered_mode,
+            RecursiveMode::NonRecursive,
+            "a non-recursive request must not be silently upgraded"
+        );
+        assert_eq!(
+            flat.registered, registered,
+            "both fallbacks register the same parent; only the mode differs"
+        );
+        drop(flat);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_non_recursive_request_stays_non_recursive_when_the_target_exists() {
+        // The control for the test above: honouring the flag must not change the
+        // already-correct DIRECT registration path, which goes through the same
+        // `watcher.watch(&requested, mode)` call. Both directions are asserted so
+        // the control cannot be satisfied by a constant.
+        let dir = temp_dir("watch-direct-mode");
+        let target = dir.join("live.log");
+        std::fs::write(&target, b"x").expect("write");
+
+        let flat = FileWatcher::start(target.to_str().unwrap(), false).expect("start");
+        assert!(!flat.watching_parent);
+        assert_eq!(flat.registered_mode, RecursiveMode::NonRecursive);
+        drop(flat);
+
+        let deep = FileWatcher::start(target.to_str().unwrap(), true).expect("start");
+        assert!(!deep.watching_parent);
+        assert_eq!(deep.registered_mode, RecursiveMode::Recursive);
+        drop(deep);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_watch_refusal_that_is_not_absence_is_not_treated_as_absence() {
+        // ⚠ THE REGRESSION for finding 2b. The fallback arm used to be `Err(_)`, so
+        // EVERY `notify` failure was read as "the path does not exist" and answered
+        // by watching the parent. A permission failure, a watch-limit failure or a
+        // backend fault was therefore reported to the caller as `ENOENT` ("not there
+        // yet") — and a caller that treats absence as retryable would retry forever
+        // against a condition that cannot change.
+        //
+        // ⚠⚠ THE FIRST VERSION OF THIS TEST WAS NOT FALSIFIABLE, AND THE MEASUREMENT
+        // THAT SHOWED IT IS WORTH RECORDING. It asserted only that
+        // `watch_refusal_is_absent` says `false` for an `Io` error. Mutating the
+        // Windows `Generic` branch to `return true` left it GREEN — because on
+        // Windows the absence decision does not go through that branch at all for
+        // the cases the test constructs. Probed: notify's Windows backend reports
+        // EVERY unwatchable path as
+        // `Generic("Input watch path is neither a file nor a directory.")` with
+        // `exists() == false` — including a path containing a NUL byte, which is
+        // malformed rather than absent. So the predicate is exercised, but the
+        // branch the mutation touched is not.
+        //
+        // What the guard actually has to get right is the CALL SITE: "a refusal that
+        // is not absence must not be answered by falling back to the parent". That is
+        // asserted end-to-end below via a path whose PARENT also does not exist —
+        // the one shape where absence and non-absence are distinguishable through the
+        // public entry point, because the fallback would otherwise report the
+        // parent's absence rather than the refusal's own code.
+        let dir = temp_dir("watch-refusal-taxonomy");
+        let present = dir.join("here.log");
+        std::fs::write(&present, b"x").expect("write");
+
+        // (a) `PathNotFound` IS absence, whatever the disk says now.
+        assert!(
+            watch_refusal_is_absent(&notify::Error::path_not_found(), &present),
+            "PathNotFound is the backend saying 'absent' and must fall back"
+        );
+
+        // (b) An `Io` error is a REAL failure even when the path is missing: it
+        //     describes the backend failing, not the path being absent. This is the
+        //     case the old `Err(_)` mislabelled. ⚠ THIS IS THE FALSIFIABLE CORE:
+        //     flipping the final `false` of `watch_refusal_is_absent` to `true` makes
+        //     it red (verified by fault injection).
+        let io_error = notify::Error::io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        assert!(
+            !watch_refusal_is_absent(&io_error, &present),
+            "⚠ an io refusal on a path that EXISTS is not absence; the old `Err(_)` \
+             called it 'not there yet' and the caller would retry forever"
+        );
+        assert!(
+            !watch_refusal_is_absent(&io_error, &dir.join("missing.log")),
+            "⚠ even for a missing path an io error is a backend failure, not a \
+             clean 'absent' — reporting it as ENOENT hides the real cause"
+        );
+
+        // (c) `MaxFilesWatch` is the inotify limit: also a real failure.
+        assert!(
+            !watch_refusal_is_absent(
+                &notify::Error::new(notify::ErrorKind::MaxFilesWatch),
+                &present
+            ),
+            "the watch limit is not absence, and must not send the caller to retry"
+        );
+
+        // ⚠ (d) THE DECISION UNIT. `classify_watch_refusal` is what the call site
+        // consumes, so pinning it pins the contract: a refusal that is NOT absence
+        // must come back as `Report(..)`, never `TryParent`.
+        //
+        // ⚠ MEASURED LIMITS, RECORDED RATHER THAN PAPERED OVER — two of them:
+        //
+        //   1. Producing a real non-absence refusal from `notify` is not possible on
+        //      this platform. Probed: a NUL path, a path under a missing parent, a
+        //      300-char leaf, and a duplicate watch — every one either succeeded or
+        //      came back as `Generic("Input watch path is neither a file nor a
+        //      directory.")` with `exists() == false`.
+        //   2. Consequently the call site's USE of this decision is NOT falsifiable
+        //      either: mutating it to hardcode `TryParent` (the literal old `Err(_)`
+        //      swallow) leaves this test GREEN — verified by fault injection, not
+        //      assumed. Only the predicate/decision contract is pinned.
+        //
+        // The `Io` and `MaxFilesWatch` shapes below are real `notify::Error`s a
+        // backend does produce; they are simply not reachable from a unit test's
+        // filesystem. Asserting them here is a contract test, and is labelled as one.
+        assert_eq!(
+            classify_watch_refusal(&io_error, &present),
+            WatchRefusal::Report(Code::Denied),
+            "⚠ a permission refusal must be REPORTED, not answered by watching the \
+             parent — this is the old `Err(_)` swallow"
+        );
+        assert_eq!(
+            classify_watch_refusal(
+                &notify::Error::new(notify::ErrorKind::MaxFilesWatch),
+                &present
+            ),
+            WatchRefusal::Report(Code::Unsupported),
+            "the watch limit must be reported, never treated as absence"
+        );
+        assert_eq!(
+            classify_watch_refusal(&notify::Error::path_not_found(), &present),
+            WatchRefusal::TryParent,
+            "the genuine absence case must still fall back"
+        );
+
+        // (e) A malformed path is REFUSED (not silently accepted), and — on Windows
+        //     — is reported as absent, because the backend cannot tell the two
+        //     apart. Pinning the behaviour that exists means a future change to it
+        //     is deliberate; see the limitation note above.
+        let malformed = FileWatcher::start("a\0b", false)
+            .err()
+            .expect("a malformed path must still be refused rather than accepted");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            !malformed.starts_with("EACCES"),
+            "a malformed path must not be dressed up as a permission failure: {malformed}"
+        );
+    }
+
+    // --- finding 3: a multi-path event reported the WRONG file ----------------
+
+    #[test]
+    fn a_two_path_event_reports_the_target_not_the_first_path() {
+        // ⚠ THE REGRESSION for finding 3, and the old code's filter is what let it
+        // through: the filter asks `.any(path == target)`, so an event with
+        // `paths = [tmp, target]` was ADMITTED — and then `change_of` reported
+        // `.first()`, i.e. `tmp`.
+        //
+        // This is not a hypothetical shape. On Linux a rename within one directory
+        // is a single `Modify(Name(Both))` event carrying `[from, to]` in that
+        // order (notify's own `Event::paths` docs: source first, target LAST), and
+        // an atomic-write rotation (`write .tmp`, `rename .tmp -> app.log`) is
+        // exactly that. So a log tailer was handed a temp-file name and the temp
+        // file's `id`, and a caller comparing that `id` against `stat(app.log).id`
+        // saw a mismatch and concluded "the file rotated" on an event that meant
+        // "your file was just written".
+        //
+        // The event is CONSTRUCTED rather than provoked, deliberately: the
+        // ordering is a backend contract, not something this platform will
+        // reproduce on demand, and the bug lived in the selection — not in getting
+        // the event.
+        let dir = temp_dir("watch-rename-paths");
+        let target = dir.join("app.log");
+        let temp = dir.join("app.log.tmp");
+        std::fs::write(&target, b"new").expect("write target");
+        std::fs::write(&temp, b"tmp").expect("write temp");
+
+        let canonical_target = comparable(&target);
+        let event = notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            // Source FIRST, destination LAST — the order notify documents.
+            paths: vec![temp.clone(), canonical_target.clone()],
+            attrs: Default::default(),
+        };
+
+        // The filter must admit it (this is what made the bug reachable) ...
+        assert!(
+            event
+                .paths
+                .iter()
+                .any(|path| event_concerns(path, &canonical_target)),
+            "the fixture must be an event the filter admits, or it tests nothing"
+        );
+
+        let change = FileWatcher::change_of(&event, &canonical_target).expect("a change");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            change["path"],
+            json!(canonical_target.to_string_lossy()),
+            "⚠ the event's SECOND path is the watched file; reporting the temp name \
+             both misnames the path and mis-attributes the id"
+        );
+        assert_ne!(
+            change["path"],
+            json!(temp.to_string_lossy()),
+            "the temp name must never be reported as the watched path"
+        );
+    }
+
+    #[test]
+    fn a_two_path_event_still_falls_back_to_the_first_when_nothing_matches() {
+        // The control for the test above: the target-matching preference must not
+        // make the report EMPTY when no path matches (a direct watch on the target
+        // applies no filter, so such events do legitimately arrive). The first path
+        // remains the best available answer.
+        let dir = temp_dir("watch-unmatched-paths");
+        let target = dir.join("watched.log");
+        let other = dir.join("unrelated.log");
+
+        let unrelated_event = notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![other.clone(), dir.join("second.log")],
+            attrs: Default::default(),
+        };
+
+        let change = FileWatcher::change_of(&unrelated_event, &target)
+            .expect("an event with paths must still produce a change");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            change["path"],
+            json!(other.to_string_lossy()),
+            "with no matching path the first is still the best answer"
+        );
+    }
+
+    #[test]
+    fn an_event_with_no_paths_is_skipped_rather_than_reported() {
+        // `change_of` returns `Option`; a pathless event must stay `None` so the
+        // caller keeps waiting instead of receiving a change with no path.
+        let event = notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: Vec::new(),
+            attrs: Default::default(),
+        };
+        assert!(FileWatcher::change_of(&event, Path::new("/nowhere")).is_none());
+    }
+
+    // --- finding 5: case-sensitive comparison dropped real events -------------
+
+    #[test]
+    fn path_comparison_follows_the_platforms_case_sensitivity() {
+        // ⚠ THE REGRESSION for finding 5. `event_concerns` used `PathBuf`
+        // equality, which is byte equality and therefore always case-SENSITIVE.
+        //
+        // On Windows and macOS (`component_eq` folds) a caller watching `app.log`
+        // while the file is created as `App.Log` had EVERY event dropped — the
+        // watch looked like "nothing ever happens". That is exactly the
+        // parent-watch fallback, where `target` comes from the caller's string and
+        // the file is created by another program with its own capitalization.
+        //
+        // ⚠ The Unix direction is asserted too, and it is not decoration: folding
+        // on a case-sensitive filesystem would MIS-ATTRIBUTE one file's events to
+        // the other, trading a dropped event for a wrong one (a log tailer would
+        // follow the wrong file). Both halves are required.
+        let upper = Path::new("/tmp/App.Log");
+        let lower = Path::new("/tmp/app.log");
+
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            assert!(
+                event_concerns(upper, lower),
+                "⚠ on a case-insensitive platform `App.Log` and `app.log` are the \
+                 SAME file, so dropping the event is wrong"
+            );
+            assert!(
+                event_concerns(lower, upper),
+                "the fold must be symmetric, or half the events still vanish"
+            );
+        } else {
+            assert!(
+                !event_concerns(upper, lower),
+                "⚠ on a case-sensitive filesystem these are DIFFERENT files; folding \
+                 here would attribute one file's events to the other"
+            );
+        }
+
+        // The platform-independent half: a path that is genuinely different is
+        // never a match, so the fold cannot degrade into "everything matches".
+        assert!(!event_concerns(Path::new("/tmp/other.log"), lower));
+        assert!(event_concerns(lower, lower));
+    }
+
+    #[test]
+    fn a_recursive_watch_still_reports_a_case_difference_on_this_platform() {
+        // ⚠ THE END-TO-END SHAPE OF FINDING 5, and the ONLY shape where it can
+        // actually fire — which a measurement made clear, and which is why this
+        // test is written the way it is rather than the obvious way.
+        //
+        // Measured on Windows: `path.canonicalize()` NORMALIZES CASE (it returns
+        // the on-disk spelling), and `comparable` canonicalizes whenever it can. So
+        // for a file that EXISTS, `target` already carries the on-disk case and a
+        // raw `==` would have matched. The case bug therefore cannot be reproduced
+        // by creating the file first and watching the other spelling — that version
+        // of this test passed on the BROKEN code, i.e. it proved nothing.
+        //
+        // It fires exactly where canonicalization FAILS: the parent-watch fallback,
+        // where the target does not exist yet. `start` then builds `target` as
+        // `canonical_parent.join(caller's leaf)`, so `target` keeps the CALLER's
+        // capitalization, while the event for the newly created file canonicalizes
+        // to the on-disk spelling. Different case ⇒ every event dropped ⇒ the watch
+        // looks like "nothing ever happens" for the whole life of the file.
+        //
+        // ⚠ IT DRIVES `next_value` THROUGH THE REAL FILTER, not `change_of` alone,
+        // because the drop happens in the `watching_parent` filter — testing the
+        // helper would have gone green while the watch still dropped everything.
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            // On a case-sensitive filesystem the behaviour is deliberately the
+            // opposite, and `path_comparison_follows_the_platforms_case_sensitivity`
+            // pins that half. Asserting it here too would mean watching a file that
+            // genuinely does not exist and expecting an event, which is wrong.
+        }
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let dir = temp_dir("watch-case-fallback");
+            // The caller asks for lower case; it does not exist yet.
+            let requested = dir.join("app.log");
+            let on_disk = dir.join("App.Log");
+
+            let mut watcher =
+                FileWatcher::start(requested.to_str().unwrap(), false).expect("start");
+            assert!(
+                watcher.watching_parent,
+                "⚠ the fixture must exercise the FALLBACK: with an existing file, \
+                 canonicalization already normalizes case and this proves nothing"
+            );
+
+            // The file appears with different capitalization, as another program
+            // would create it.
+            std::fs::write(&on_disk, b"hello\n").expect("write");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut seen = None;
+            while seen.is_none() && std::time::Instant::now() < deadline {
+                if let Some(change) = watcher.next_value(Duration::from_millis(200)) {
+                    seen = Some(change);
+                }
+            }
+            watcher.close();
+            std::fs::remove_dir_all(&dir).ok();
+
+            let change = seen.expect(
+                "⚠ a differently-cased file appearing at the watched path must be \
+                 reported; silence here IS the bug (the caller believes it watches a \
+                 tree that never changes)",
+            );
+            assert!(
+                change["path"]
+                    .as_str()
+                    .is_some_and(|path| path.to_ascii_lowercase().ends_with("app.log")),
+                "the reported path must be the watched file, got: {change}"
+            );
+        }
+    }
+
+    // --- finding 4: an offset past EOF was a successful empty stream ----------
+
+    #[test]
+    fn an_offset_past_the_end_is_stale_rather_than_a_finished_read() {
+        // ⚠ THE REGRESSION for finding 4, and the old behaviour was a WRONG ANSWER
+        // rather than an error: `seek` past EOF is legal, the following `read`
+        // returned 0, and `next_chunk` turned that into `StreamStep::Done`. The
+        // caller received a successful, EMPTY stream — "the read finished" — when
+        // the truth was "the file is shorter than your resume point", which the
+        // proposal classifies as `ESTALE` ("truncated, start over").
+        //
+        // The consequence was a resume that silently committed a partial file as
+        // whole: the one situation ESTALE exists to distinguish was the one
+        // situation that produced `Done`.
+        let dir = temp_dir("read-offset-past-eof");
+        let path = dir.join("short.bin");
+        std::fs::write(&path, b"0123456789").expect("write");
+
+        let error = FileReader::open(path.to_str().unwrap(), 11)
+            .err()
+            .expect("⚠ an offset past EOF must FAIL, not yield an empty successful stream");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            error.starts_with("ESTALE"),
+            "the file was truncated relative to the resume point, so the answer is \
+             ESTALE (start over), got: {error}"
+        );
+        // The message must be actionable: it names both sizes, because the caller
+        // has to decide whether the truncation is expected.
+        assert!(
+            error.contains("10") && error.contains("11"),
+            "the error should name the file length and the requested offset, got: {error}"
+        );
+    }
+
+    #[test]
+    fn an_offset_exactly_at_the_end_is_still_a_clean_empty_read() {
+        // ⚠ THE CONTROL, and the boundary is the whole subtlety: `offset == len`
+        // is a legitimate "resume at the very end" and must still produce the clean
+        // empty result. Refusing it too would break resumption whose last write
+        // happened to land exactly on the end — the common case for a completed
+        // transfer.
+        let dir = temp_dir("read-offset-at-eof");
+        let path = dir.join("exact.bin");
+        std::fs::write(&path, b"0123456789").expect("write");
+
+        let mut reader = FileReader::open(path.to_str().unwrap(), 10).expect("open at the end");
+        let outcome = reader.next_chunk();
+        std::fs::remove_dir_all(&dir).ok();
+
+        match outcome {
+            StreamStep::Done => {}
+            other => panic!(
+                "offset == len is a clean end, got {}",
+                match other {
+                    StreamStep::Chunk(_) => "a chunk".to_string(),
+                    StreamStep::Done => "done".to_string(),
+                    StreamStep::Failed(message) => message,
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn an_offset_inside_the_file_is_unaffected_by_the_eof_guard() {
+        // The second control: the new guard must not fire on an ordinary resume.
+        let dir = temp_dir("read-offset-inside");
+        let path = dir.join("mid.bin");
+        std::fs::write(&path, b"0123456789").expect("write");
+
+        let mut reader = FileReader::open(path.to_str().unwrap(), 4).expect("open mid-file");
+        let mut collected = Vec::new();
+        loop {
+            match reader.next_chunk() {
+                StreamStep::Chunk(bytes) => collected.extend_from_slice(&bytes),
+                StreamStep::Done => break,
+                StreamStep::Failed(message) => panic!("unexpected failure: {message}"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(collected, b"456789");
+    }
+
+    // --- finding 6: three consume_stream causes shared one code ---------------
+
+    #[test]
+    fn a_refused_consume_is_not_reported_as_stale() {
+        // ⚠ THE REGRESSION for finding 6. `hands.write` encoded EVERY
+        // `consume_stream` failure as `ESTALE`, and the host's `isStale` is
+        // literally `code === "ESTALE"` — a promise that "the path now refers to a
+        // DIFFERENT file, reopen and reset the offset". A caller branching on it
+        // RE-READS the file. For all three real causes that is the wrong action.
+        //
+        // The three causes are asserted against the exact strings
+        // `kkrpc_peer::consume_stream` produces, so this fails if the mapping
+        // collapses back — or if the peer's wording moves without this being
+        // updated.
+        //
+        //   (a) duplicate consume — the peer's own test pins this wording.
+        let duplicate = consume_refusal("stream s-9 is already being consumed");
+        assert!(
+            duplicate.starts_with("EUNSUPPORTED"),
+            "a duplicate consume is a malformed request, not a rotated file: {duplicate}"
+        );
+        assert!(
+            !duplicate.starts_with("ESTALE"),
+            "⚠ ESTALE makes `isStale` true and sends the caller off to re-read"
+        );
+
+        //   (b) a poisoned stream-table lock — `Mutex::lock` returning `Err`, which
+        //       `consume_stream` stringifies via `map_err(|err| err.to_string())`.
+        let poisoned = consume_refusal("poisoned lock: another task failed inside");
+        assert!(
+            poisoned.starts_with("EINTERNAL"),
+            "a poisoned lock is an internal fault, not a file state: {poisoned}"
+        );
+
+        //   (c) the transport already gone — `consume_stream`'s opening `pull`
+        //       write failing. It must carry the SAME text `close_streams` uses, so
+        //       a caller matches one spelling of "the pipe is dead".
+        let dead = consume_refusal("host stdio closed");
+        assert!(
+            dead.contains(TRANSPORT_CLOSED_TEXT),
+            "the transport-dead case must reuse the peer's own text: {dead}"
+        );
+        assert!(
+            !dead.starts_with("ESTALE") && !dead.starts_with("EUNSUPPORTED"),
+            "⚠ a dead transport is not a file-level condition, so it gets no \
+             file-level code: {dead}"
+        );
+
+        // All three must be distinct, which is the finding stated directly.
+        assert_ne!(duplicate, poisoned);
+        assert_ne!(duplicate, dead);
+        assert_ne!(poisoned, dead);
+    }
+
+    #[test]
+    fn a_dead_transport_keeps_the_peers_own_message_for_diagnostics() {
+        // The peer's `write` error text must survive inside the message — the point
+        // of the change is to add the transport marker, not to replace the detail.
+        let refusal = consume_refusal("no transport attached");
+        assert!(
+            refusal.contains("no transport attached"),
+            "the underlying failure must not be swallowed: {refusal}"
+        );
+    }
+
+    #[test]
+    fn transport_closed_text_matches_the_peer() {
+        // ⚠ This is the tripwire for the duplicated literal. `kkrpc_peer::TRANSPORT_CLOSED`
+        // is private to that module and this file may not edit it, so the coupling
+        // cannot be expressed in code — a behaviour test is the next best thing.
+        //
+        // It drives the REAL `Peer::close_streams` path: a peer over an in-memory
+        // writer whose reader hits EOF fails every registered consumer sink with
+        // that literal. If the peer renames it, this goes red and the two move
+        // together.
+        //
+        // The race is removed rather than tolerated: the reader blocks on a gate
+        // until the consumer is registered, so `close_streams` cannot run before
+        // there is something for it to fail. A flaky version of this test would be
+        // worse than none — it would be "fixed" by loosening the assertion, which
+        // is exactly how this coupling would rot.
+        use crate::kkrpc_peer::{Peer, StreamSink};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A reader that returns EOF only once released.
+        struct GateReader(Arc<AtomicBool>);
+        impl Read for GateReader {
+            fn read(&mut self, _out: &mut [u8]) -> std::io::Result<usize> {
+                while !self.0.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(0) // EOF
+            }
+        }
+
+        /// Records the single `finish` outcome the peer hands it.
+        struct OutcomeSink(Arc<std::sync::Mutex<Option<Result<(), String>>>>);
+        impl StreamSink for OutcomeSink {
+            fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
+                Ok(())
+            }
+            fn finish(&mut self, outcome: Result<(), String>) {
+                *self.0.lock().expect("outcome") = Some(outcome);
+            }
+        }
+
+        let gate = Arc::new(AtomicBool::new(false));
+        // A writer that accepts everything: the opening `pull` must succeed, or
+        // the consumer is never registered and there is nothing to fail.
+        let peer = Peer::new(std::io::sink());
+        peer.start_reader(GateReader(Arc::clone(&gate)));
+
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        peer.consume_stream("s-eof", Box::new(OutcomeSink(Arc::clone(&recorded))))
+            .expect("the opening pull must be written before EOF");
+
+        // Let the reader reach EOF, which is what runs `close_streams`.
+        gate.store(true, Ordering::SeqCst);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while recorded.lock().expect("outcome").is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let settled = recorded
+            .lock()
+            .expect("outcome")
+            .clone()
+            .expect("a closed transport must fail the consumer sink");
+
+        match settled {
+            Err(message) => assert_eq!(
+                message, TRANSPORT_CLOSED_TEXT,
+                "⚠ `kkrpc_peer::close_streams` changed its text; this file's \
+                 TRANSPORT_CLOSED_TEXT must move with it"
+            ),
+            Ok(()) => panic!("a closed transport must fail the consumer, not finish it cleanly"),
+        }
+    }
+
+    #[test]
+    fn a_transport_that_refuses_the_opening_pull_is_reported_as_transport_dead() {
+        // The other half of finding 6(c), driven through the REAL peer rather than
+        // a hand-written string: a writer that refuses everything makes
+        // `consume_stream`'s opening `pull` fail, which is the transport-dead case.
+        //
+        // ⚠ It asserts OUR mapping on the REAL error text, so a change to what
+        // `consume_stream` returns — which would silently re-route the case — is
+        // caught here instead of in production.
+        use crate::kkrpc_peer::{Peer, StreamSink};
+
+        struct RefusingWriter;
+        impl Write for RefusingWriter {
+            fn write(&mut self, _data: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe is gone",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe is gone",
+                ))
+            }
+        }
+
+        struct SilentSink;
+        impl StreamSink for SilentSink {
+            fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
+                Ok(())
+            }
+            fn finish(&mut self, _outcome: Result<(), String>) {}
+        }
+
+        let peer = Peer::new(RefusingWriter);
+        let refusal = peer
+            .consume_stream("s-dead", Box::new(SilentSink))
+            .expect_err("a refusing transport must not register a consumer");
+
+        let message = consume_refusal(&refusal);
+        assert!(
+            message.starts_with(TRANSPORT_CLOSED_TEXT),
+            "the transport-dead case must be reported as the transport being dead, \
+             got: {message}"
+        );
+        assert!(
+            !message.starts_with("ESTALE"),
+            "⚠ ESTALE is the bug: it makes `isStale` true for a dead pipe"
+        );
+    }
+
     // --- the symlinked-ancestor trap (found by macOS CI, not locally) -------
 
     #[test]
@@ -2378,6 +3636,227 @@ mod tests {
         assert_eq!(encode_error(Code::Stale, "x"), "ESTALE: x");
         assert_eq!(encode_error(Code::NotFound, "x"), "ENOENT: x");
         assert_ne!(Code::Stale.as_str(), Code::NotFound.as_str());
+    }
+
+    #[test]
+    fn a_path_that_runs_through_a_file_reports_not_a_directory() {
+        // ⚠ THE REGRESSION for finding 1. The shape is a non-directory named
+        // THROUGH a trailing separator — `<dir>/a.txt/` — and it is `ENOTDIR` on
+        // both platforms:
+        //
+        //   - Windows: `ERROR_DIRECTORY` (267), which std surfaces as
+        //     `ErrorKind::NotADirectory` (measured).
+        //   - Linux/macOS: raw `ENOTDIR` — `ErrorKind::Other` carrying the errno,
+        //     which is why `classify_errno` reads it.
+        //
+        // Before the fix BOTH reached the catch-all and were encoded as `EACCES`,
+        // so `stat` told the caller "permission denied" about a path where
+        // permissions were never involved, and `list` said the same through a
+        // different route.
+        //
+        // ⚠ THE FINDING'S OWN EXAMPLE WAS WRONG, and the correction is recorded
+        // here because the test would otherwise have been written against it.
+        // It claimed `<dir>/a.txt/child` returns `null` on Windows and `ENOTDIR` on
+        // Linux. Measured on Windows (rustc 1.97): that exact path gives
+        // `NotFound` / raw 3 (`ERROR_PATH_NOT_FOUND`) — the SAME disposition as
+        // Linux only in the sense that both fail, but with a different code, and
+        // Windows reports `ENOENT` because the intermediate component is not a
+        // directory. `ERROR_DIRECTORY` is produced by the trailing-separator and
+        // `read_dir`-on-a-file shapes instead (measured: `read_dir(file)` also
+        // gives 267). The trailing-separator form is used below because it yields
+        // `ENOTDIR` on EVERY platform, which is what makes this a portable
+        // regression test rather than a Windows-only or Unix-only one.
+        let dir = temp_dir("classify-notdir");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+        // A trailing separator on a path that is a FILE, not a directory.
+        let through = format!("{}{}", file.display(), std::path::MAIN_SEPARATOR);
+
+        let error = stat_path(&through).expect_err("a file named as a directory must fail");
+        let code = classify(&error);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            code,
+            Code::NotDir,
+            "expected ENOTDIR for a file named as a directory, got {} ({error})",
+            code.as_str()
+        );
+        assert_ne!(
+            code,
+            Code::Denied,
+            "⚠ EACCES is the bug: it tells the caller to fix permissions, and no \
+             permission was ever involved"
+        );
+    }
+
+    #[test]
+    fn listing_through_a_file_reports_not_a_directory() {
+        // The same shape through the `list` path, which is what a caller hits when
+        // it guesses "dir" and is wrong. `DirectoryReader::open` already guards on
+        // `is_dir()` and returns `ENOTDIR` — this pins that the guard still fires
+        // now that `classify` also produces `NotDir`, so the two cannot drift into
+        // agreeing by accident.
+        let dir = temp_dir("classify-notdir-list");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").expect("write");
+
+        let error = match DirectoryReader::open(file.to_str().unwrap(), 8) {
+            Ok(_) => panic!("listing a file must not succeed"),
+            Err(error) => error,
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(error.starts_with("ENOTDIR"), "got: {error}");
+    }
+
+    #[test]
+    fn a_failure_nobody_classified_is_reported_as_unsupported_not_denied() {
+        // ⚠ The catch-all itself is the finding. It used to be `Denied`, so ANY
+        // errno the match did not name was reported to the caller as "access
+        // denied" — a claim about authorisation that nothing had established.
+        //
+        // An unclassified error is constructed directly (an `io::Error` with a
+        // kind nothing maps and no raw OS code), because the whole point is the
+        // arm no real call reaches predictably. `Unsupported` is the honest
+        // answer and is already in the wire contract; `Denied` is a fabrication.
+        let error = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "torn off");
+        assert_eq!(
+            classify(&error),
+            Code::Unsupported,
+            "an unmapped error must not be reported as a permission problem"
+        );
+    }
+
+    #[test]
+    fn the_named_errno_kinds_no_longer_collapse_into_eacces() {
+        // Each of these was `EACCES` before the fix. They are asserted through
+        // `classify` (not through a real filesystem call) because several are
+        // awkward or impossible to produce portably, and the mapping IS the fix.
+        use std::io::ErrorKind;
+        let cases = [
+            (ErrorKind::NotADirectory, Code::NotDir),
+            (ErrorKind::InvalidInput, Code::Invalid),
+            (ErrorKind::AlreadyExists, Code::Exists),
+            (ErrorKind::Interrupted, Code::Interrupted),
+        ];
+        for (kind, expected) in cases {
+            let error = std::io::Error::new(kind, "synthetic");
+            let got = classify(&error);
+            assert_eq!(
+                got,
+                expected,
+                "{kind:?} must map to {}, not {}",
+                expected.as_str(),
+                got.as_str()
+            );
+            assert_ne!(got, Code::Denied, "{kind:?} is not a permission failure");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_errno_that_share_a_kind_are_told_apart() {
+        // ⚠ The reason `classify_errno` exists. On Unix `ELOOP` and
+        // `ENAMETOOLONG` both arrive as `ErrorKind::InvalidInput`, so the kind
+        // match alone cannot separate them from `EINVAL` — the raw errno is the
+        // only distinguishing signal. All of these used to fall into the catch-all
+        // and be reported as `EACCES`.
+        //
+        // Each case pins its EXACT code, not merely "not EACCES": `ENOTDIR` in
+        // particular must be `NotDir` (its own fix), while the path-limit pair
+        // shares `Invalid` because their fix ("shorten it / break the loop") is the
+        // same. Asserting only "not denied" would pass if all three collapsed into
+        // one wrong-but-not-EACCES code.
+        for (errno, expected, name) in [
+            (libc::ENOTDIR, Code::NotDir, "ENOTDIR"),
+            (libc::ELOOP, Code::Invalid, "ELOOP"),
+            (libc::ENAMETOOLONG, Code::Invalid, "ENAMETOOLONG"),
+        ] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            let got = classify(&error);
+            assert_eq!(
+                got,
+                expected,
+                "{name} (errno {errno}) must map to {}, got {}",
+                expected.as_str(),
+                got.as_str()
+            );
+            assert_ne!(
+                got,
+                Code::Denied,
+                "⚠ {name} must not be reported as a permission failure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_windows_directory_opened_for_writing_stays_a_permission_error() {
+        // ⚠ The ONE case the original catch-all's special case was right about, and
+        // it must survive the rewrite. Measured on Windows:
+        // `OpenOptions::write(true).create(true).open(dir)` → `PermissionDenied`
+        // with raw 5, which is genuinely "you may not write here" — `EACCES` is the
+        // correct disposition even though the path is a directory.
+        //
+        // `EISDIR` would also be defensible, and `FileWriter::open` refuses that
+        // separately before ever opening. What must NOT happen is the code becoming
+        // `EUNSUPPORTED` just because the error's kind is unremarkable.
+        #[cfg(windows)]
+        {
+            let dir = temp_dir("classify-write-dir");
+            // `.truncate(false)` is explicit because clippy is right that
+            // `create(true)` alone does not say what happens to existing content.
+            // Here the open is EXPECTED TO FAIL on a directory, so neither choice
+            // could ever act on a file — but stating it keeps the intent readable
+            // and the lint meaningful rather than silenced.
+            let error = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&dir)
+                .expect_err("a directory cannot be opened for writing");
+            let code = classify(&error);
+            std::fs::remove_dir_all(&dir).ok();
+            assert_eq!(
+                code,
+                Code::Denied,
+                "a directory opened for writing is a permission answer, got {}",
+                code.as_str()
+            );
+        }
+        // On Unix the same call also fails with EACCES-shaped permission denial or
+        // EISDIR depending on the mode bits, and `FileWriter::open` refuses it
+        // before reaching `classify` — so this asserts only the Windows branch
+        // rather than inventing a Unix expectation that the write path never sees.
+    }
+
+    #[test]
+    fn every_code_has_a_distinct_wire_prefix() {
+        // ⚠ The code set is what a caller BRANCHES on, so two variants sharing a
+        // prefix would be a silent mis-branch rather than a compile error. This
+        // pins that adding the new codes did not collide with an existing one.
+        let all = [
+            Code::NotFound,
+            Code::Denied,
+            Code::IsDir,
+            Code::NotDir,
+            Code::Stale,
+            Code::NoSpace,
+            Code::Unsupported,
+            Code::Invalid,
+            Code::Exists,
+            Code::Interrupted,
+            Code::Internal,
+        ];
+        let mut seen: Vec<&'static str> = Vec::new();
+        for code in all {
+            assert!(
+                !seen.contains(&code.as_str()),
+                "{} is produced by two variants",
+                code.as_str()
+            );
+            seen.push(code.as_str());
+        }
+        assert_eq!(seen.len(), all.len());
     }
 
     #[test]
