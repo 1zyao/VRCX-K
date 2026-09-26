@@ -796,7 +796,24 @@ fn write_intent(opts: &Value) -> Result<WriteIntent, String> {
         ));
     }
     if truncate && offset.is_some_and(|offset| offset > 0) {
-        return Ok(WriteIntent { offset, truncate, append });
+        // ⚠ REFUSED, and the earlier version of this code ALLOWED it on a wrong
+        // premise. It claimed this was a legitimate "cut the tail" operation.
+        // Measured through a real peer: `{truncate: true, offset: 5}` on a 20-byte
+        // file, 3 bytes written, produced `00 00 00 00 00 42 42 42` — the head is
+        // ZEROED, not preserved, because `O_TRUNC` empties the whole file and the
+        // subsequent `seek(5)` only leaves a NUL hole. There is no "truncate at
+        // the write position" primitive here; truncation is always to zero.
+        //
+        // So the combination's only real meaning would be "write NULs then my
+        // data", which is not something a caller should get by accident. Refused
+        // rather than documented, because a doc cannot stop the corruption.
+        return Err(encode_error(
+            Code::Unsupported,
+            "hands.write: `truncate: true` with `offset > 0` zero-fills everything \
+             before the offset (truncation is always to zero, not to the write \
+             position). Pass `truncate: false` to patch in place, or omit `offset` \
+             to rewrite the whole file",
+        ));
     }
 
     Ok(WriteIntent {
@@ -1971,6 +1988,32 @@ mod tests {
             json!(1024 * 1024 + 5),
             "`endOffset` stays the cursor position, which is what a resumer needs"
         );
+    }
+
+    #[test]
+    fn truncate_with_an_offset_is_refused_because_it_zero_fills_the_head() {
+        // ⚠ THE CORRUPTION REGRESSION, and the earlier code ALLOWED this on a
+        // wrong premise: its comment called the pair a legitimate "cut the tail".
+        // Measured through a real peer — a 20-byte file, `{truncate: true,
+        // offset: 5}`, 3 bytes written, gave `00 00 00 00 00 42 42 42`: the head
+        // is ZEROED, not preserved, because `O_TRUNC` empties the whole file and
+        // the following `seek(5)` leaves a NUL hole. There is no "truncate at the
+        // write position" primitive; truncation is always to zero.
+        let error = write_intent(&json!({ "truncate": true, "offset": 5 }))
+            .expect_err("truncate + offset must be refused, not zero-fill the head");
+        assert!(
+            error.starts_with("EUNSUPPORTED"),
+            "the refusal must carry a parseable code, got: {error}"
+        );
+        assert!(
+            error.contains("truncate: false"),
+            "the error must name the fix (patch in place), got: {error}"
+        );
+        // The two legitimate neighbours must still work: patch in place, or
+        // rewrite the whole file.
+        assert!(write_intent(&json!({ "truncate": false, "offset": 5 })).is_ok());
+        assert!(write_intent(&json!({ "truncate": true })).is_ok());
+        assert!(write_intent(&json!({ "offset": 5 })).is_ok());
     }
 
     #[test]

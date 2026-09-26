@@ -208,23 +208,28 @@ export type HandsReadOptions = {
 
 export type HandsWriteOptions = {
   /**
-   * Start offset. Omitted = 0.
+   * Start offset. Omitted = 0, and a rewrite of the whole file.
    *
-   * ⚠ Combine with `truncate: false` to RESUME a transfer from the `endOffset`
-   * a previous `read`/`write` reported. Leaving the default `truncate` on while
-   * passing an offset cuts the file at that offset, which is almost never what a
-   * resumer means.
+   * ⚠ Supplying an offset flips the `truncate` default to `false` (see below), so
+   * `{offset: N}` means "write N bytes in, in place" — which is how a transfer
+   * resumes from the `endOffset` a previous `read`/`write` reported.
    */
   offset?: number
   /**
-   * Cut the file at the write position before writing. **Defaults to `true`.**
+   * Cut the file to **zero** before writing.
    *
-   * ⚠ This default is the fix for a corruption, not a preference. It used to be
+   * **Defaults to `offset === undefined`** — i.e. a bare call rewrites the file,
+   * while a call with an offset patches in place. An explicit `true` combined with
+   * `offset > 0` is REFUSED rather than honoured: truncation is always to zero, so
+   * the pair would zero-fill everything before the offset (measured
+   * `00 00 00 00 00 42 42 42`), destroying the head rather than cutting the tail.
+   *
+   * ⚠ The default is the fix for a corruption, not a preference. It used to be
    * implemented as `mode: "create"`, which did NOT truncate while the contract
    * documented "overwrite from 0" — so rewriting a file with shorter content left
    * the old tail behind. Measured through a real peer: writing 11 bytes over a
    * 20-byte JSON file produced `{"alpha":9}"beta":2}`, invalid JSON, reported as
-   * SUCCESS. Pass `false` when appending or resuming.
+   * SUCCESS.
    */
   truncate?: boolean
   /**

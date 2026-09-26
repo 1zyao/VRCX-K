@@ -118,16 +118,27 @@ export type HandsReadOptions = {
 }
 
 export type HandsWriteOptions = {
-  /** 起始偏移。省略 = 0。⚠ 续传要配 `truncate: false`。 */
+  /**
+   * 起始偏移。省略 = 0，且表示**重写整个文件**。
+   *
+   * ⚠ 传了 offset 会把 `truncate` 的默认翻成 `false`（见下），
+   * 所以 `{offset: N}` 的语义是「在 N 处原地写」——续传就用这个。
+   */
   offset?: number
   /**
-   * 写入前在写入位置截断文件。**默认 `true`。**
+   * 写入前把文件**截断到 0**。
+   *
+   * **默认 = `offset === undefined`**：不带 offset 重写，带 offset 原地写。
+   *
+   * ⚠ **不是**「按写入位置截断」—— 截断**永远是到 0**。所以显式 `true` 配
+   * `offset > 0` 会**被拒绝**而不是照做：`O_TRUNC` 先清空整个文件，随后的
+   * `seek(offset)` 只留下一个 NUL 洞（实测 20 字节文件 + `{truncate:true, offset:5}`
+   * + 写 3 字节 ⇒ `00 00 00 00 00 42 42 42`，**头被清零**而非"剪尾"）。
    *
    * ⚠ 这个默认值是一次**损坏修复**的结果，不是偏好。它原本由
    * `mode: "create"` 实现，而 `create` **不截断**，契约却写着「从 0 覆盖」——
    * 于是用更短的内容重写文件会留下旧尾巴。真 peer 实测：11 字节覆盖 20 字节 JSON
    * 得到 `{"alpha":9}"beta":2}`（非法 JSON），而回复是**成功**。
-   * 追加或续传时传 `false`。
    */
   truncate?: boolean
   /**
