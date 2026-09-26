@@ -14,6 +14,43 @@ edition = "2021"
 name = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# ⚠ `dead_code` DENIED FOR THIS CRATE ONLY, and the reason is a measured blind spot
+# rather than tidiness.
+#
+# The crate is full of `#[cfg(desktop)]` blocks (the tray / shortcut / autostart /
+# deep-link handlers), and helpers reached ONLY from them. On a configuration
+# where that cfg is FALSE — i.e. Android, since tauri's build script defines
+# `desktop = !(ios || android)` — those helpers compile with no caller and rustc
+# reports `never used`. On Windows/Linux/macOS `desktop` is TRUE, so the same
+# code is live and NOTHING is reported.
+#
+# That asymmetry is what let a real defect hide: `component_eq` was gated on
+# `any(windows, macos)`, so it was dead on **Linux** — where CI's one clippy run
+# happens — and the Linux job caught it. But the `#[cfg(desktop)]` family is dead
+# only on **mobile**, and no local run and no clippy invocation ever compiles that
+# shape. Measured before this line existed: removing one `#[cfg(desktop)]` gate
+# left Windows/Linux clippy at `exit 0` while the Android target errored.
+#
+# The mobile job ALREADY builds the Android shape (`tauri android build --apk`
+# compiles `aarch64-linux-android` and friends), so denying this lint there costs
+# ZERO extra steps and zero extra compile time: it converts a warning that job was
+# already printing — and ignoring, because `tauri android build` does not treat
+# warnings as errors — into a failure.
+#
+# ⚠ Why `[lints]` and not `RUSTFLAGS=-D dead_code` on the mobile step: RUSTFLAGS
+# is part of the cargo/rust-cache fingerprint, so setting it would invalidate the
+# 511 cached dependencies for all four ABIs and recompile everything — the mobile
+# job's own comment records that LTO alone costs ~45 s per target. `[lints]`
+# applies to this crate only, so only `tauri-app` recompiles.
+#
+# ⚠ Scope check before adding this: it applies to EVERY configuration, including
+# macOS. Grepped for a macOS-ONLY `cfg` item that could be dead there — the only
+# `target_os = "macos"` occurrence is an `assert_eq!` inside a test body, not an
+# item, so nothing can be dead on macOS. If a macOS-only helper is ever added, it
+# must be `#[cfg(target_os = "macos")]`-gated like the others.
+[lints.rust]
+dead_code = "deny"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
