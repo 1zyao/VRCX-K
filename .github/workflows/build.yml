@@ -25,6 +25,21 @@ on:
   pull_request:
     branches: [rewrite]
   workflow_dispatch:
+    inputs:
+      # ⚠ 默认 0 = 「照常构建 debuggable 变体」。语义上这不是「开一个开关」，
+      # 而是「关掉一个默认行为」：push / pull_request 触发时 `inputs` 取不到值，
+      # `inputs.android_release_apk` 求值为空字符串，下面的判据把它一律当作 0，
+      # 于是三种触发方式里只有 `=1` 这一种走 release 形态。默认值写在 schema 里
+      # 只是为了让 Actions 界面显示 0，判据本身不依赖它。
+      android_release_apk:
+        description: |
+          设为 1 = 构建 release 形态的 APK（不加 -d），即【不可调试】的那种。
+          留 0（默认）= 构建 debuggable 形态，模拟器里的 e2e 才能 adb forward 进去。
+          ⚠ 需要人工验证 release 形态时才用 1 —— 用 1 跑的那次，Android 真机 e2e
+          会自己跳过（因为 app 拒绝监听），这是设计而非失败。
+        required: false
+        default: "0"
+        type: string
 
 # 同一分支/PR 的旧 run 自动取消（避免过时构建叠满队列、浪费分钟数）
 concurrency:
@@ -369,18 +384,92 @@ jobs:
       # Android 下 beforeBuildCommand 已由 tauri.android.conf.json 覆盖为纯前端 build
       # `--apk` 是 tauri 自己的选项（生成 APK），不能放 `--` 后面（那会把
       # --apk 原样转发给 cargo 而报 "unexpected argument '--apk'"）。
+      #
+      # ⚠ `-d` 的取舍，以及为什么默认【加】它。
+      #
+      # `-d`（= `tauri android build --debug`）让 gradle 产出 debuggable 的包。
+      # 这不是为了调试符号，而是**一个安全边界的开关**：Android 上"外部能不能
+      # 伸进这个 app"的权威谓词就是 FLAG_DEBUGGABLE —— 实测同一台设备上
+      #   run-as io.github.qauxv          → "package not debuggable"   （伸不进去）
+      #   run-as unity.SUPERHOT_...       → uid=10107(...)              （伸得进去）
+      # 而 app 侧要判断"我现在是否可被调试"，读的也是同一个 flag。两者是同一件事。
+      #
+      # 判据侧的两条事实（取自 tauri CLI 的 gradle 模板，非推断）：
+      #   · debug buildType 里写着 `isDebuggable = true`（且 `isJniDebuggable = true`）
+      #     ⇒ `-d` 确实产出"可被调试"的包，这是整个方案成立的前提。
+      #   · 模板里的 `applicationIdSuffix` 由 `android-debug-application-id-suffix`
+      #     变量控制；**本仓库没有设置它**（`tauri.conf.json` 只有
+      #     `"identifier": "com.vrcxk.app"`）⇒ **`-d` 不改变包名**，
+      #     仍然是 `com.vrcxk.app`。任何"debug 包名会变成 xxx.debug"的说法都是错的。
+      #
+      # 所以默认加 `-d`，是为了让模拟器里的 e2e 能走 `adb forward` 进到 app 进程里 ——
+      # 即被测的是**app 自己的 uid、自己的私有目录**，而不是一个 adb 推上去的
+      # `uid=2000(shell)` 二进制。后者读得到的东西比 app 多，会让 e2e 在真机上必然
+      # 失败的权限问题上"通过"（用 root/shell 跑测试是这个仓库明确要避免的掩盖）。
+      #
+      # ⚠ 代价必须说清：`-d` 的包**不是发布形态**（debug_assertions 开、优化级别不同）。
+      # 于是本 job 的冒烟验证的是"debug 形态能在设备上跑起来"，**不再**逐字节验证
+      # release 形态。这是刻意的取舍，不是疏漏。
+      #
+      # 需要人工核 release 形态时：workflow_dispatch 把 `android_release_apk` 设成 1。
+      # 判据写成「非 1 即加 -d」而不是「等于 1 才加 -d」，这样 push / pull_request
+      # 这些**根本取不到 inputs 的触发方式**也自然落到默认分支上，不必给它们特判。
       - name: Build universal APK (all 4 ABIs, one package)
-        run: bun run tauri android build --apk
+        env:
+          ANDROID_RELEASE_APK: ${{ inputs.android_release_apk }}
+        run: |
+          set -euo pipefail
+          if [ "${ANDROID_RELEASE_APK:-0}" = "1" ]; then
+            echo "::notice::android_release_apk=1 → building the RELEASE form (no -d)."
+            echo "::notice::The on-device e2e will SKIP this run by design: the app is not"
+            echo "::notice::debuggable, so it refuses to listen. That is the check working."
+            bun run tauri android build --apk
+          else
+            echo "::notice::android_release_apk!=1 → building the DEBUGGABLE form (-d)."
+            bun run tauri android build --apk -d
+          fi
 
+      # ⚠ 这一步刻意**不**去猜 debug 形态的文件名。
+      #
+      # 之前这里写的是「按本次构建形态精确匹配」：release 用 `*universal-release*.apk`、
+      # debug 用 `*universal-debug*.apk`。**`*universal-debug*` 是我的臆测** —— 我没有
+      # 任何证据证明 AGP 在 `-d` 下产出的文件名长这样（本机无 NDK，无法构建来实证）。
+      # 把一个未证实的字符串写成硬判据，最坏情况是"构建成功但这一步找不到文件"，
+      # 并且报错会把注意力引向错误的方向。
+      #
+      # 换成不依赖具体文件名的判据：**一次运行只会构建一种形态**（`tauri android init`
+      # 每次都从 gitignore 的空目录重新生成，本 run 内只有一次 `tauri android build`），
+      # 所以"universal APK 恰好一个"就是正确状态。
+      #   · 0 个 → 构建没产出，或产物在别处 ⇒ 硬失败，并列出实际找到的所有 APK
+      #   · 1 个 → 就是它（并把文件名打印出来，让日志自己记录真实命名）
+      #   · 多个 → 形态或残留有问题 ⇒ 硬失败，列出全部，**不猜**
+      # 这样无论 AGP 怎么命名，判据都成立；而真实文件名会被日志记录下来。
       - name: Locate APK
         id: apk
         run: |
-          # 精确匹配 universal 包（未来 --split-per-abi 产生多个时不会抓错）
-          APK=$(find src-tauri/gen/android -name '*universal*.apk' | head -1)
-          echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          echo "APK: $APK"
-          # 构建成功但找不到 APK 视为失败（防止静默通过）
-          test -n "$APK"
+          set -euo pipefail
+
+          LIST=$(find src-tauri/gen/android -name '*universal*.apk' 2>/dev/null || true)
+          COUNT=$(printf '%s' "$LIST" | grep -c . || true)
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::no universal APK under src-tauri/gen/android"
+            echo "  all APKs present:"
+            find src-tauri/gen/android -name '*.apk' 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+            exit 1
+          fi
+
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::expected exactly ONE universal APK, found $COUNT"
+            printf '%s\n' "$LIST" | sed 's/^/    /'
+            echo "  → one run builds one form; more than one means stale output or a build"
+            echo "    that produced several. Refusing to guess which one to sign."
+            exit 1
+          fi
+
+          echo "apk=$LIST" >> "$GITHUB_OUTPUT"
+          echo "apk_filename=$(basename "$LIST")" >> "$GITHUB_OUTPUT"
+          echo "APK: $LIST"
 
       # release APK 默认是 **unsigned** 的，而 Android 平台层【强制要求已签名】
       # 才能安装 —— adb 没有任何"忽略签名"的开关（pm install 的 -r/-t/-d/-g/-i
