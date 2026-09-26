@@ -31,7 +31,7 @@
 
 use base64::Engine as _;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -72,12 +72,28 @@ pub enum StreamStep {
 
 /// A byte source the peer pumps on the host's credit.
 ///
-/// `next_chunk` runs on the peer's reader thread, so credit is what keeps a fast
-/// disk from outrunning a slow consumer — not a background thread.
+/// ⚠ `next_chunk` runs on the PRODUCER's OWN thread, not the reader thread.
+/// This comment used to say the opposite ("runs on the peer's reader thread …
+/// not a background thread"), and that was true until the head-of-line-blocking
+/// fix: batching on the reader thread starved `read_line` for the whole credit,
+/// so an interactive request waited out the remainder of the batch (measured —
+/// `hol-credit.mjs`: p95 linear in outstanding credit, ~1.7 ms/chunk, which is
+/// also what produced `hol.mjs`'s 51–70x tail). Producers now run on a thread of
+/// their own, exactly as `open_event_stream` already did for watches.
+///
+/// Two consequences for an implementor, because they are easy to assume away:
+///   1. **`close` runs on that same thread**, so it must be safe to call from
+///      there — the reader NEVER closes a producer directly (that would race a
+///      thread possibly inside `next_chunk`); it only signals.
+///   2. **`&mut self` is not exclusive to a caller**: only the owning thread
+///      touches this object's methods, but it does so while the reader is
+///      concurrently mutating the stream TABLE.
 pub trait StreamProducer: Send {
     fn next_chunk(&mut self) -> StreamStep;
     /// Called when the stream stops for any reason other than a clean end
     /// (host cancelled, transport died). Releases handles.
+    ///
+    /// Runs on the producer's own thread, and is called exactly once per stream.
     fn close(&mut self) {}
 }
 
@@ -180,12 +196,6 @@ struct StreamTable {
     consumers: HashMap<String, Consumer>,
     /// Event streams (watches), which run on their OWN thread. See [`StreamSource`].
     events: HashMap<String, Arc<EventStream>>,
-    /// Stream ids cancelled while they were mid-pump.
-    ///
-    /// Kept for the window where a producer has been taken off the table but its
-    /// thread has not yet observed the cancellation, so a late `return` is not
-    /// lost.
-    cancelled: HashSet<String>,
 }
 
 /// Shared control block for one event stream: the host's credit and a stop flag,
@@ -850,12 +860,17 @@ impl Peer {
                         // let it close the file. Closing here would race with the
                         // thread still inside `next_chunk`.
                         producer.cancel();
-                    } else {
-                        // Already finished, or removed by the ending path. Record
-                        // it so a thread that has not yet observed the cancel
-                        // cannot resurrect the stream.
-                        streams.cancelled.insert(sid.to_string());
                     }
+                    // ⚠ No `else` arm, and that is deliberate rather than an
+                    // omission. The old code recorded the sid in a `cancelled` set
+                    // to stop a mid-pump producer from being RE-INSERTED — but that
+                    // set was only ever written, never read, and the resurrect it
+                    // guarded against is now structurally impossible: a producer is
+                    // inserted into the table exactly once (here, in `open_stream`)
+                    // and is never put back. An absent entry means "already
+                    // finished, or the ending path claimed it", and both are
+                    // terminal. Removing the set also removes a map that grew for
+                    // the life of the process.
                 }
                 let acknowledgement = if op == "return" {
                     json!({ "t": "sr", "id": control_id, "sid": sid, "d": true })
@@ -1076,7 +1091,6 @@ impl Peer {
                 .sink
                 .finish(Err("stream interrupted by transport failure".into()));
         }
-        streams.cancelled.insert(sid.to_string());
     }
 
     /// Tell the host to stop producing a stream we no longer want. Best-effort:
