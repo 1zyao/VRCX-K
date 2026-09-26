@@ -57,13 +57,35 @@ function logPath(): string | undefined {
   return target
 }
 
+/**
+ * Our best knowledge of the log file's current size, or `undefined` if unknown.
+ *
+ * `rotate` used to call `statSync` on EVERY line. That is worth removing on its own
+ * terms — it is one syscall per line to answer a question whose answer changes by
+ * a few hundred bytes — but ⚠ **do not credit it with more than it is worth**:
+ * measured A/B at a fixed line count, caching the size saved **~23%**
+ * (24000 lines: 4288 ms → 3316 ms). It is NOT what made the Windows CI test time
+ * out; see the note on the rotation test in `host/tests/host-log.test.ts`, where
+ * the real cost is per-line work × line count.
+ *
+ * Tracking the size in-process is EXACT, not an approximation, because this module
+ * is the only writer of this file and every write goes through `write` below.
+ * `undefined` means "we have not looked yet" — the first write of a process stats
+ * once to learn the existing size, and after a rotation we stat once more. So the
+ * steady state is one `statSync` per `MAX_BYTES`, not one per line.
+ */
+let knownSize: number | undefined
+
 /** Rotate `host.log` → `.1` → `.2` … keeping the newest `KEEP` files. */
 function rotate(path: string): void {
-  try {
-    if (statSync(path).size < MAX_BYTES) return
-  } catch {
-    return // No file yet, or unreadable: nothing to rotate.
+  if (knownSize === undefined) {
+    try {
+      knownSize = statSync(path).size
+    } catch {
+      knownSize = 0 // No file yet: the next append creates it.
+    }
   }
+  if (knownSize < MAX_BYTES) return
   try {
     rmSync(`${path}.${KEEP}`, { force: true })
     for (let index = KEEP - 1; index >= 1; index -= 1) {
@@ -74,8 +96,10 @@ function rotate(path: string): void {
       }
     }
     renameSync(path, `${path}.1`)
+    knownSize = 0
   } catch {
     // Rotation is best-effort. Losing a rotation is better than losing the write.
+    knownSize = undefined // Resync from the filesystem on the next line.
   }
 }
 
@@ -88,8 +112,10 @@ function write(line: string): void {
   try {
     rotate(path)
     appendFileSync(path, stamped)
+    if (knownSize !== undefined) knownSize += Buffer.byteLength(stamped)
   } catch {
     // See above: never let logging break the host.
+    knownSize = undefined
   }
 }
 

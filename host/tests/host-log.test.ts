@@ -128,12 +128,28 @@ describe("the host log file", () => {
     // A log that grows forever is a disk-space bug in a long-lived desktop app.
     // 2 MiB is the cap; writing past it must produce `host.log.1`, not a bigger
     // `host.log`.
+    //
+    // ⚠ TWO things about this test are deliberate, both learned from CI.
+    //
+    // 1. **It writes FEWER, LARGER lines than a naive "fill 2 MiB" loop.** The first
+    //    version did `for (24000) log("x".repeat(100))` — the same ~2.4 MiB — and
+    //    measured **3877 ms locally**, right against bun's 5000 ms default. On the
+    //    windows-latest runner it crossed the line and failed with
+    //    `this test timed out after 5000ms`, NOT with a rotation assertion.
+    //
+    //    ⚠ My first explanation for that — "`rotate()` stats on every line" — was
+    //    WRONG, and an A/B at a FIXED line count disproved it: caching the size
+    //    saved only ~23% (24000 lines: 4288 → 3316 ms). The dominant cost is
+    //    **per-line work × line count** (each line does an ISO timestamp, a
+    //    `console.error` to the captured stderr, and an `appendFileSync`), which is
+    //    why the fix that actually works is writing **fewer lines**, not fewer
+    //    bytes. 600 lines × 4 KiB ≈ 2.4 MiB reaches the same cap in ~244 ms.
+    //    (`rotate`'s per-line `statSync` was still removed on its own merit — see
+    //    `log.ts` — but it was never the thing that broke CI.)
+    // 2. **The timeout is raised anyway**, because a loaded CI runner is not this
+    //    machine: the point is to assert rotation, not to benchmark `appendFileSync`.
     const dir = tempDir()
-    const { exitCode } = runWithLogDir(
-      dir,
-      // ~2.4 MiB of lines: enough to trip the cap and rotate once.
-      `for (let i = 0; i < 24000; i++) log("x".repeat(100))`,
-    )
+    const { exitCode } = runWithLogDir(dir, `for (let i = 0; i < 600; i++) log("x".repeat(4096))`)
     expect(exitCode).toBe(0)
     const names = readdirSync(dir).filter((name) => name.startsWith("host.log"))
     expect(names).toContain("host.log")
@@ -141,5 +157,5 @@ describe("the host log file", () => {
       names.some((name) => /^host\.log\.\d+$/.test(name)),
       `expected a rotated generation, saw: ${names.join(", ")}`,
     )
-  })
+  }, 30_000)
 })
