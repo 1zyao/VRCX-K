@@ -14,18 +14,26 @@
 //   What it DOES buy: accidental misuse and undeclared access become VISIBLE
 //   instead of silent, which is `#24`'s stated honest scope.
 //
-// ⚠ BUT "VISIBLE" CURRENTLY MEANS "VISIBLE TO A DEVELOPER", AND ONLY ON A
-//   CONSOLE. The warn goes to `log()` → `console.error` → the host's **stderr**.
-//   In a RELEASE build the shell is `windows_subsystem = "windows"`
-//   (`src-tauri/src/main.rs`), so there is no console attached and **nothing
-//   receives it** — and the host writes no log file anywhere. So on a user's
-//   machine a detected overreach is still, in practice, silent.
+// ⚠ "VISIBLE" HAD A DELIVERY GAP, AND IT IS NOW CLOSED — read both halves, because
+//   the first one was true for a while and this file was written during it.
 //
-//   This is a REAL gap against `#24`'s intent, not a wording quibble, and it is
-//   tracked rather than papered over: until the warn reaches a channel a user or
-//   a support bundle can read (the shell's snapshot/event stream, or a rotating
-//   log file), do NOT describe this feature as "the user can see it". The
-//   mechanism is correct; the delivery is not yet wired.
+//   The warn goes to `log()` → `console.error` → the host's **stderr**. In a
+//   RELEASE build the shell is `windows_subsystem = "windows"`
+//   (`src-tauri/src/main.rs`) and the host is spawned with `stderr(inherit)` into
+//   a handle that leads nowhere, so for a time the warn was written and discarded:
+//   on a user's machine a detected overreach was silent, while `#24` promises the
+//   opposite. That gap was real, and it was reported by a reviewer.
+//
+//   It is CLOSED as of the rotating log file: the shell passes `VRCXK_LOG_DIR`
+//   (it owns the app data directory; a sidecar must not guess it) and `log.ts`
+//   appends every line there as well, capped at 2 MiB with 3 generations kept.
+//   `host/tests/host-log.test.ts` pins it.
+//
+//   ⇒ So the honest sentence is now: "a detected overreach is visible in the
+//   host log file, and on stderr when one is attached." Do NOT resurrect the old
+//   claim that the delivery is unwired — and do NOT overclaim either: the file is
+//   the channel, so if logging is disabled (`VRCXK_LOG_DIR` unset, e.g. a dev
+//   run) the warn really does go only to a stderr a human is watching.
 //
 // THE TWO PATHS THAT MUST BOTH BE COVERED (#24 §2)
 //   1. the curated services (`ctx.notify`, `ctx.dialog`, …) — attribution is
