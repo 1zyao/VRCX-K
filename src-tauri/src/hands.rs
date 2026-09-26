@@ -666,14 +666,15 @@ fn register_write(peer: &Arc<Peer>) {
 ///
 /// | caller intent | offset | truncate |
 /// |---|---|---|
-/// | rewrite a file (config, export) | 0 | **true** |
-/// | resume a transfer (from `endOffset`) | told by `read` | **false** |
-/// | patch bytes in place | told by the caller | **false** |
-/// | append to a rolling log | end, **atomically** | **false** |
+/// | rewrite a file (config, export) | omitted | **implied true** |
+/// | resume a transfer (from `endOffset`) | given | **implied false** |
+/// | patch bytes in place | given, explicit `false` also fine | false |
+/// | append to a rolling log | — | **`append: true`** |
 ///
-/// So the default is now `truncate: true` (matching the documented contract), and
-/// RESUME — which must never truncate — says so explicitly by passing
-/// `truncate: false`. Neither intent has to guess what the other's default is.
+/// So `truncate` DEFAULTS TO "truncate IFF no offset was given": a plain rewrite
+/// (the corrupting case) truncates, while `{offset: N}` — the natural way to
+/// resume — is read as "in place" rather than refused. Either intent can still
+/// override, and an explicit contradiction is refused below.
 ///
 /// ⚠ `append` stays its own flag rather than being "offset = end": it opens with
 /// `O_APPEND`, which makes concurrent writers race-free. `seek(end)` then `write`
@@ -684,7 +685,12 @@ fn register_write(peer: &Arc<Peer>) {
 struct WriteIntent {
     /// Where to start writing. `None` = 0 (or the end, for `append`).
     offset: Option<u64>,
-    /// Cut the file at the write position before writing.
+    /// Cut the file to ZERO before writing. ⚠ Not "at the write position" —
+    /// truncation here is always to zero, which is why `truncate` with a
+    /// nonzero `offset` is refused rather than documented.
+    ///
+    /// Defaults to `offset.is_none()`: an offset means "in place", a bare
+    /// rewrite means "replace". See the struct docs for the table.
     truncate: bool,
     /// Open with `O_APPEND` instead of seeking.
     append: bool,
@@ -706,6 +712,32 @@ impl WriteIntent {
 /// Parse `{ offset, truncate, append }`, refusing contradictions rather than
 /// silently picking a winner.
 fn write_intent(opts: &Value) -> Result<WriteIntent, String> {
+    // ⚠ A STALE `mode` KEY MUST BE REFUSED, NOT IGNORED — measured, and the
+    // consequence is data loss.
+    //
+    // `mode` was this API's request key until it was replaced by the flags above.
+    // Ignoring it is NOT a compatible no-op: the old default was "do not
+    // truncate", while the new default is "rewrite", so an unchanged caller
+    // sending `{mode: "append"}` silently got the opposite of what it asked for.
+    // Measured through a real peer: a 44-byte file, `{mode: "append"}`, 5 bytes
+    // sent ⇒ reply `{bytes: 5, mode: "truncate"}` and the file on disk was
+    // **5 bytes** — the caller's existing content was gone.
+    //
+    // Refusing keeps the promise made one function away: "a malformed option is
+    // refused, never guessed at". A loud failure is the only safe answer for a
+    // request whose meaning changed underneath it.
+    if let Some(stale) = opts.get("mode") {
+        return Err(encode_error(
+            Code::Unsupported,
+            format!(
+                "hands.write: `mode` was replaced by `truncate`/`offset`/`append` and is no \
+                 longer read; ignoring it would change what this call does. Replace \
+                 {stale} with the equivalent flags (append: `{{ \"append\": true }}`, \
+                 overwrite-in-place: `{{ \"truncate\": false, \"offset\": N }}`)"
+            ),
+        ));
+    }
+
     let offset = match opts.get("offset") {
         None | Some(Value::Null) => None,
         Some(value) => Some(value.as_u64().ok_or_else(|| {
@@ -716,7 +748,15 @@ fn write_intent(opts: &Value) -> Result<WriteIntent, String> {
         })?),
     };
     let truncate = match opts.get("truncate") {
-        None | Some(Value::Null) => true, // The documented default: rewrite the file.
+        // ⚠ An EXPLICIT offset implies "in place", so the rewrite default must not
+        // apply. Otherwise `{offset: 5}` — the natural way to resume — would be
+        // refused by the contradiction check below, and the only working spelling
+        // would be `{offset: 5, truncate: false}`. That is a footgun: the safe
+        // reading of "write at this offset" is "do not destroy what is before it".
+        //
+        // The corrupting case this default exists for never passes an offset: it
+        // is a plain rewrite, where truncation is what the caller wants.
+        None | Some(Value::Null) => offset.is_none(),
         Some(Value::Bool(flag)) => *flag,
         Some(other) => {
             return Err(encode_error(
@@ -756,15 +796,7 @@ fn write_intent(opts: &Value) -> Result<WriteIntent, String> {
         ));
     }
     if truncate && offset.is_some_and(|offset| offset > 0) {
-        // Truncating at the end of the file (rather than at the write position)
-        // is a legitimate "cut the tail" operation, so this is allowed — but a
-        // caller resuming a transfer almost always means `truncate: false`, so
-        // the combination is worth naming in the docs rather than guessing.
-        return Ok(WriteIntent {
-            offset,
-            truncate,
-            append,
-        });
+        return Ok(WriteIntent { offset, truncate, append });
     }
 
     Ok(WriteIntent {
@@ -1939,6 +1971,36 @@ mod tests {
             json!(1024 * 1024 + 5),
             "`endOffset` stays the cursor position, which is what a resumer needs"
         );
+    }
+
+    #[test]
+    fn a_stale_mode_key_is_refused_rather_than_silently_ignored() {
+        // ⚠ THE DATA-LOSS REGRESSION. `mode` was the request key before the flags
+        // replaced it, and ignoring it is NOT a compatible no-op: the old default
+        // did not truncate while the new default rewrites. Measured through a real
+        // peer — a 44-byte file, `{mode: "append"}`, 5 bytes sent ⇒ the file on
+        // disk was 5 bytes. The caller's existing content was destroyed while it
+        // believed it was appending.
+        let error = write_intent(&json!({ "mode": "append" }))
+            .expect_err("a stale `mode` must be refused, not ignored");
+        assert!(
+            error.starts_with("EUNSUPPORTED"),
+            "the refusal must carry a parseable code, got: {error}"
+        );
+        // The message must be actionable: it names the replacement flags, because
+        // the caller has to change its request either way.
+        assert!(
+            error.contains("append") && error.contains("truncate"),
+            "the error should name the replacements, got: {error}"
+        );
+        // Every stale value is refused, including one that would have been valid
+        // before: `create` was the old default and is not a flag now.
+        for stale in ["append", "create", "truncate", ""] {
+            assert!(
+                write_intent(&json!({ "mode": stale })).is_err(),
+                "stale mode {stale:?} must be refused"
+            );
+        }
     }
 
     #[test]
