@@ -399,13 +399,184 @@ fn decode_chunk(value: Option<&Value>) -> Result<Vec<u8>, String> {
 /// a user-visible string.
 const TRANSPORT_CLOSED: &str = "host stdio closed";
 
+/// How many consecutive read failures of one kind the reader tolerates before
+/// it declares the link dead.
+///
+/// ⚠ The number exists because `Ok(0)` and `Err(_)` used to share ONE arm, and
+/// the two are not the same event. `Ok(0)` is the peer closing its end: final,
+/// and retrying is pointless. `Err(kind)` is the read CALL failing — and the
+/// interesting kinds are transient for a pipe. `InvalidData` is what
+/// `BufRead::read_line` returns for a line that is not UTF-8 (a binary or
+/// truncated frame), and `Interrupted` is a signal interrupting the syscall.
+/// Treating either as EOF declared the bridge dead on ONE malformed line while
+/// the child was alive and the port still worked — with no log line, no
+/// supervisor notification, and `HostState` left at `Ready`, so the shell
+/// reconnected to nothing and never restarted.
+///
+/// A byte cap is not available as a second bound: `InvalidData` can be raised
+/// *after* the buffer has grown, and `BufReader` keeps the offending bytes on
+/// the next `read_line`, so a single huge non-UTF-8 line would be re-read (and
+/// re-billed) forever. Three failures is what a real stream of good frames
+/// survives (it flushes the bad bytes and carries on) while a persistently
+/// broken line still terminates the link promptly rather than burning the
+/// reader thread for the life of the process.
+///
+/// Deliberately small: the cost of being WRONG in the other direction (keeping
+/// a bridge that emits nothing alive while the supervisor stays silent) is the
+/// bug this whole mechanism exists to remove.
+const MAX_CONSECUTIVE_READ_FAILURES: u32 = 3;
+
+/// ⚠ How much unparseable-but-complete input the read side tolerates before it
+/// declares the protocol desynchronised. 1 MiB of lines that parse to nothing is
+/// far above any legitimate frame: `hands.*` chunks are capped at 256 KiB and
+/// travel base64 (about 342 KiB of one JSON string, still ONE line under the
+/// default), and an event value is smaller still. The cap exists so a stream of
+/// good frames can never be reachable by a bad one — the counters that make
+/// transient failures survivable must themselves be able to run out, or the
+/// tolerance is really an infinite retry loop.
+///
+/// ⚠ There is deliberately NO byte cap on READ ERRORS, and that is a correction
+/// to this change's first draft rather than an omission. It reported "bytes
+/// discarded" by measuring the growth of `BufReader`'s internal buffer across a
+/// failed `read_line`, and that number is ALWAYS ZERO: `read_line` consumes the
+/// bytes out of the reader into the `String` and only THEN validates UTF-8, so
+/// the growth this code could see was nil while the discard was real. A cap on a
+/// number that is always zero is dead code wearing a safety label. Read failures
+/// are therefore bounded by ATTEMPT COUNT alone ([`MAX_CONSECUTIVE_READ_FAILURES`]),
+/// which is also what the fix asks for. Each failed attempt does consume from the
+/// reader, so three strikes is bounded damage (a few 8 KiB `BufReader` fills), not
+/// a spin.
+const MAX_SKIPPED_LINE_TOTAL: u64 = 1024 * 1024;
+
+/// What the read side counts, hands to the peer, and (in tests) observes.
+///
+/// Shared rather than merely local because the counters are the evidence: a
+/// failure report that says "the port kept failing" is worth a lot less than
+/// one that says which failure and how many times.
+#[derive(Debug, Default)]
+struct Hiccups {
+    /// Consecutive `Err` from `read_line` since the last complete line.
+    read_failures: u32,
+    /// Consecutive complete lines that reached JSON parsing and did not become
+    /// a value.
+    bad_frames: u32,
+    /// Bytes of complete-but-unparseable lines dropped in this streak.
+    bad_frame_bytes: u64,
+}
+
+impl Hiccups {
+    /// Reset every streak counter. Called from both good outcomes: a complete
+    /// line that parsed, and a clean read that ended a line.
+    fn clear(&mut self) {
+        self.read_failures = 0;
+        self.bad_frames = 0;
+        self.bad_frame_bytes = 0;
+    }
+}
+
+/// Why the reader thread ended. Published through [`Peer::link_failure`] so a
+/// reader death is never indistinguishable from a healthy idle bridge again.
+///
+/// ⚠ `Read` is NOT a sub-case of `Closed`, and collapsing them is the bug
+/// finding #2 describes. The caller can act on the difference: `Read` means the
+/// child may well be alive with a wedged stdout port, which is exactly the
+/// state `host.rs`'s `try_wait` can never see (it only fires once the child is
+/// GONE), while `Closed` means the port is gone.
+#[derive(Debug, Clone)]
+pub enum LinkFailure {
+    /// `Ok(0)`: the peer closed its end. Final by definition.
+    Closed,
+    /// The read call kept failing. The child may still be alive.
+    Read {
+        kind: std::io::ErrorKind,
+        message: String,
+        consecutive: u32,
+    },
+    /// Lines arrived but none of them made sense, for `MAX_SKIPPED_LINE_TOTAL`
+    /// bytes.
+    Unreadable {
+        consecutive: u32,
+        dropped_bytes: u64,
+        last: String,
+    },
+}
+
+impl LinkFailure {
+    /// One line, for the shell's stderr (there is no console in a release
+    /// build, but a dev run and the log redirect both see it).
+    pub fn describe(&self) -> String {
+        match self {
+            LinkFailure::Closed => "host stdio closed (EOF)".into(),
+            LinkFailure::Read {
+                kind,
+                message,
+                consecutive,
+            } => format!(
+                "host stdout read failed {consecutive}x in a row ({kind:?}: {message}) — \
+                 the host process may still be alive with a dead stdout port"
+            ),
+            LinkFailure::Unreadable {
+                consecutive,
+                dropped_bytes,
+                last,
+            } => format!(
+                "host stdout carried {consecutive} consecutive unparseable line(s) \
+                 ({dropped_bytes} bytes dropped, last: {last}) — the protocol is \
+                 desynchronised though the process may still be alive"
+            ),
+        }
+    }
+}
+
+/// The link's terminal state, readable at any time from any thread.
+#[derive(Debug, Clone, Default)]
+pub struct LinkState {
+    failure: Option<LinkFailure>,
+}
+
+impl LinkState {
+    pub fn failure(&self) -> Option<&LinkFailure> {
+        self.failure.as_ref()
+    }
+
+    pub fn is_down(&self) -> bool {
+        self.failure.is_some()
+    }
+}
+
 pub type Handler = Arc<dyn Fn(Vec<Value>) -> Value + Send + Sync>;
+
+/// The one-shot "the link died" callback registered through
+/// [`Peer::link_failure_notify`].
+pub type LinkFailureNotify = Box<dyn Fn(LinkFailure) + Send + Sync>;
 
 pub struct Peer {
     writer: Mutex<Box<dyn Write + Send>>,
     pending: Mutex<HashMap<String, Sender<Result<Value, String>>>>,
     handlers: Mutex<HashMap<String, HandlerEntry>>,
     streams: Mutex<StreamTable>,
+    /// Why the reader thread stopped, if it has. `None` while the link is up.
+    ///
+    /// Exists because the reader's exit used to be a PRIVATE `break`: the loop
+    /// drained the pending table and closed the streams, and then nothing in
+    /// the process knew the bridge was dead. `host.rs`'s supervisor only learns
+    /// of a dead host from `try_wait`, which fires when the CHILD is gone — so
+    /// "child alive, stdout port persistently broken" was a state no component
+    /// could observe, and the shell never restarted.
+    link_failure: Mutex<LinkState>,
+    /// Optional supervisor notification: subscribed by whoever owns the
+    /// lifecycle, notified once per link failure.
+    ///
+    /// ⚠ The smallest honest mechanism available INSIDE this file. This module
+    /// deliberately knows nothing about processes, supervisors or Tauri (see
+    /// the transport-parameter note at the top), so it cannot mark a
+    /// `HostState` failed itself. A callback is the seam the owner already has:
+    /// `Peer` is built by the spawn path that owns the lifecycle, so no new
+    /// plumbing and no cross-file dependency is needed. Until an owner
+    /// subscribes, the failure is still recorded (and logged) rather than
+    /// silently dropped — the callback is how it becomes actionable, not how it
+    /// becomes visible.
+    link_failure_notify: Mutex<Option<LinkFailureNotify>>,
 }
 
 impl Peer {
@@ -419,7 +590,59 @@ impl Peer {
             pending: Mutex::new(HashMap::new()),
             handlers: Mutex::new(HashMap::new()),
             streams: Mutex::new(StreamTable::default()),
+            link_failure: Mutex::new(LinkState::default()),
+            link_failure_notify: Mutex::new(None),
         })
+    }
+
+    /// Why the reader thread stopped, or `None` while the link is up.
+    ///
+    /// The public read side of [`Peer::link_failure_notify`]: a callback can be
+    /// added at any time, but a component that would rather poll (the tray
+    /// snapshot, a watchdog thread) can ask directly instead of racing a
+    /// subscription.
+    pub fn link_failure(&self) -> Option<LinkFailure> {
+        self.link_failure
+            .lock()
+            .expect("link failure")
+            .failure
+            .clone()
+    }
+
+    /// Whether the reader thread has ended, for any reason.
+    pub fn is_link_down(&self) -> bool {
+        self.link_failure.lock().expect("link failure").is_down()
+    }
+
+    /// Install the callback that runs ONCE when the reader thread ends because
+    /// of a failure (see [`LinkFailure`]).
+    ///
+    /// The callback runs on the reader thread, after the pending table has been
+    /// drained and the streams closed, so a hand-over is free to touch this peer
+    /// again (a notification is a write, not a read). Keep it short: it runs
+    /// before the thread exits, but nothing waits on that thread.
+    pub fn link_failure_notify(&self, notify: impl Fn(LinkFailure) + Send + Sync + 'static) {
+        *self.link_failure_notify.lock().expect("link notify") = Some(Box::new(notify));
+    }
+
+    /// Publish a reader exit and notify the owner.
+    ///
+    /// The FIRST failure wins: a reader thread publishes exactly once before it
+    /// returns, but making the state monotonic means a later, weaker reason can
+    /// never overwrite the real cause.
+    fn publish_link_failure(&self, failure: LinkFailure) {
+        {
+            let mut state = self.link_failure.lock().expect("link failure");
+            if state.failure.is_some() {
+                return;
+            }
+            state.failure = Some(failure.clone());
+        }
+        eprintln!("[shell] kkrpc reader stopped: {}", failure.describe());
+        let notify = self.link_failure_notify.lock().expect("link notify").take();
+        if let Some(notify) = notify {
+            notify(failure);
+        }
     }
 
     /// Spawn the read loop over the transport's inbound half.
@@ -427,44 +650,143 @@ impl Peer {
     /// Takes any `Read`, not a `ChildStdout`: the loop owns the reader for the
     /// lifetime of the thread and only ever calls `read_line`, so a pipe, a
     /// socket and an in-memory buffer are equally valid.
+    ///
+    /// # ⚠ `Ok(0)` and `Err(_)` are different events
+    ///
+    /// They used to share one arm (`Ok(0) | Err(_) => { … break }`), which made
+    /// a malformed line or an interrupted read indistinguishable from "the host
+    /// vanished". Measured consequence: one non-UTF-8 line (an `InvalidData`
+    /// from `read_line`) killed the bridge with no log line, no notification
+    /// and `HostState` still `Ready`, and because a genuine child death IS
+    /// caught by the supervisor's `try_wait` in `host.rs`, the zombie state was
+    /// the one nothing could see — host alive, stdout port persistently
+    /// failing, no periodic heartbeat, so it never restarted.
+    ///
+    /// Now:
+    ///   - `Ok(0)` is EOF: final, retrying is pointless, declare it.
+    ///   - `Err` is counted and the loop CONTINUES, up to
+    ///     [`MAX_CONSECUTIVE_READ_FAILURES`]; only then is the link declared
+    ///     dead. A stray `InvalidData` or `Interrupted` is survived.
+    ///   - A line that never parses (blank, not JSON, no line ending) is skipped
+    ///     and counted the same way, capped by
+    ///     [`MAX_SKIPPED_LINE_BYTES`]/[`MAX_SKIPPED_LINE_TOTAL`] so a stream of
+    ///     good frames stays reachable by a bad one.
+    ///
+    /// Every exit path goes through `end_link`, so a dead reader is never
+    /// silent again: it fails the pending waiters, fails the consumers, and
+    /// publishes why.
     pub fn start_reader<R: Read + Send + 'static>(self: &Arc<Self>, reader: R) {
         let reader_peer = Arc::clone(self);
         thread::spawn(move || {
             let mut reader = BufReader::new(reader);
+            let mut hiccups = Hiccups::default();
             loop {
                 let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => {
-                        // The other end is gone. Fail every waiter now rather
-                        // than letting each hit its own timeout: the
-                        // distinction between "slow" and "closed" is what the
-                        // supervisor acts on.
-                        let mut pending = reader_peer.pending.lock().expect("pending");
-                        for (_, sender) in pending.drain() {
-                            let _ = sender.send(Err(TRANSPORT_CLOSED.into()));
-                        }
-                        drop(pending);
-                        // Streams are owned by the same connection. Leaving a
-                        // producer open would hold a file handle on a peer that
-                        // can never pull again, and a consumer's deferred reply
-                        // would never be sent.
-                        reader_peer.close_streams();
-                        break;
+                let read = reader.read_line(&mut line);
+                match read {
+                    Ok(0) => {
+                        reader_peer.end_link(&hiccups, LinkFailure::Closed);
+                        return;
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // ⚠ ONLY the read-failure streak ends here, NOT the
+                        // bad-frame one. The port just delivered a complete
+                        // line, so "the read call keeps failing" is over —
+                        // whatever the line turns out to contain. Clearing
+                        // everything here was this change's own bug: it reset
+                        // the bad-frame counters on every line, so the
+                        // desynchronisation cap was unreachable and a stream of
+                        // garbage would have been skipped forever. The
+                        // bad-frame streak is ended by a line that PARSES
+                        // (`hiccups.clear()` below).
+                        hiccups.read_failures = 0;
+                    }
+                    Err(error) => {
+                        hiccups.read_failures += 1;
+                        // Symmetrically, a read error ends the "consecutive
+                        // LINES" streak: what comes after it is not a
+                        // consecutive line any more.
+                        hiccups.bad_frames = 0;
+                        hiccups.bad_frame_bytes = 0;
+                        // Interrupted is not a judgement on the stream at all —
+                        // a signal only postponed the syscall, so it must never
+                        // count toward the cap. (In practice `read_line` swallows
+                        // it internally, but the arm has to be right whether or
+                        // not that holds.)
+                        let transient = error.kind() == std::io::ErrorKind::Interrupted;
+                        if !transient && hiccups.read_failures >= MAX_CONSECUTIVE_READ_FAILURES {
+                            let failure = LinkFailure::Read {
+                                kind: error.kind(),
+                                message: error.to_string(),
+                                consecutive: hiccups.read_failures,
+                            };
+                            reader_peer.end_link(&hiccups, failure);
+                            return;
+                        }
+                        if transient {
+                            hiccups.read_failures = 0;
+                        }
+                        continue;
+                    }
                 }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                // A malformed line is skipped, not fatal: one bad frame must not
-                // take down every later request on the same transport.
+                // A malformed line is skipped, not fatal on its own: one bad
+                // frame must not take down every later request on the same
+                // transport. But it is COUNTED, because "skipped quietly" was
+                // how a desynchronised protocol kept looking healthy.
                 let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
+                    hiccups.bad_frames += 1;
+                    hiccups.bad_frame_bytes += line.len() as u64;
+                    if hiccups.bad_frame_bytes >= MAX_SKIPPED_LINE_TOTAL {
+                        let failure = LinkFailure::Unreadable {
+                            consecutive: hiccups.bad_frames,
+                            dropped_bytes: hiccups.bad_frame_bytes,
+                            last: format!("{}…", trimmed.chars().take(80).collect::<String>()),
+                        };
+                        reader_peer.end_link(&hiccups, failure);
+                        return;
+                    }
                     continue;
                 };
+                // A line that PARSED is the only thing that ends the bad-frame
+                // streak, and it ends the read streak for free (`Ok(_)` already
+                // did that).
+                hiccups.clear();
                 reader_peer.dispatch(message);
             }
         });
+    }
+
+    /// The single exit path of the reader thread.
+    ///
+    /// Every waiter is failed NOW rather than each hitting its own timeout — the
+    /// distinction between "slow" and "closed" is what the supervisor acts on.
+    /// Streams are owned by the same connection, so producers are signalled and
+    /// every consumer sink is failed. ⚠ `close_streams` does the sink I/O with
+    /// the stream table lock RELEASED (see that function); `Ok(0)` can arrive
+    /// while a sink holds a slow file, and this thread must not be the thing
+    /// that blocks behind it.
+    ///
+    /// The failure is then PUBLISHED (see [`Peer::link_failure`]), which is the
+    /// part that used to be missing entirely.
+    fn end_link(&self, hiccups: &Hiccups, failure: LinkFailure) {
+        let mut pending = self.pending.lock().expect("pending");
+        for (_, sender) in pending.drain() {
+            let _ = sender.send(Err(TRANSPORT_CLOSED.into()));
+        }
+        drop(pending);
+        self.close_streams();
+        if !matches!(failure, LinkFailure::Closed) || hiccups.bad_frames > 0 {
+            eprintln!(
+                "[shell] kkrpc reader exiting: {} ({} bad line(s) this streak)",
+                failure.describe(),
+                hiccups.bad_frames,
+            );
+        }
+        self.publish_link_failure(failure);
     }
 
     pub fn on(&self, method: &str, handler: Handler) {
@@ -750,7 +1072,23 @@ impl Peer {
                         streams.producers.remove(&sid).is_some()
                     };
                     if owned {
-                        let _ = peer.write(&frame);
+                        // ⚠ The terminal frame is the LAST thing the host can
+                        // hear from this stream, so a failed write means it will
+                        // wait for a `done` that can never come — kkrpc's remote
+                        // iterable never completes and the `hands.read` caller
+                        // hangs until its own timeout. This used to be `let _ =`,
+                        // which is the same silent-loss shape finding #3 is
+                        // about. There is nothing left to fail the reply WITH
+                        // (the reply was the stream reference, already sent), so
+                        // the honest floor is the console line below; failing
+                        // the pending waiters is the transport layer's job and
+                        // `end_link`/the producer's own error path already do it.
+                        if let Err(error) = peer.write(&frame) {
+                            eprintln!(
+                                "[shell] kkrpc: terminal frame for stream {sid} could not \
+                                 be written ({error}); the host cannot see the stream end"
+                            );
+                        }
                     }
                     break;
                 }
@@ -779,6 +1117,25 @@ impl Peer {
     ///
     /// `sid` comes from the request's stream-ref argument; the host only starts
     /// sending once it receives the `pull`, so this must run before the reply.
+    ///
+    /// # ⚠ A failed opening pull must UNDO the registration
+    ///
+    /// The sink is inserted first (it has to be: a chunk may arrive the instant
+    /// the host sees the pull) and only then is the `pull` frame written. That
+    /// write used to be unchecked, and an unchecked failure here is worse than
+    /// it looks: the transport is already dead, so no chunk will ever arrive to
+    /// end the stream, and the inserted consumer keeps holding its sink — which
+    /// for `hands.write` is an open `File` plus a clone of the deferred reply —
+    /// until the connection ends. On Windows that file stays locked. When the
+    /// transport does close, `close_streams` calls `finish(Err)` on that
+    /// leftover sink and emits a SECOND reply frame for the same request id
+    /// (the host drops it as an unknown pending sender, so it is noise rather
+    /// than corruption, but the leak is real).
+    ///
+    /// So the failure is handled with the same shape as the replenish branch of
+    /// [`Peer::dispatch_stream_data`]: drop the lock first, then take the
+    /// consumer back out, then finish it — `finish` is sink I/O and holds a
+    /// file, so it must never run under the stream table lock (finding #1).
     pub fn consume_stream(&self, sid: &str, sink: Box<dyn StreamSink>) -> Result<(), String> {
         {
             let mut streams = self.streams.lock().map_err(|err| err.to_string())?;
@@ -793,13 +1150,24 @@ impl Peer {
                 },
             );
         }
-        self.write(&json!({
+        if let Err(error) = self.write(&json!({
             "t": "sq",
             "id": next_id("p"),
             "sid": sid,
             "op": "pull",
             "n": INITIAL_CREDIT,
-        }))
+        })) {
+            // Reuse the single "remove a consumer" helper so there is ONE place
+            // that knows a consumer can only be taken out, never peeked at
+            // mutably from outside.
+            if let Some(mut consumer) = self.take_consumer(sid) {
+                consumer
+                    .sink
+                    .finish(Err(format!("stream not opened: {error}")));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Handle `t:"sq"` from the host: pull credit, or cancel a producer.
@@ -969,9 +1337,18 @@ impl Peer {
                 streams.events.remove(&thread_sid).is_some()
             };
             if owned {
-                let _ = peer.write(&json!({
+                // Same reasoning as the producer's terminal frame above: this is
+                // the host's only signal that the watch ended, so swallowing the
+                // error leaves the remote iterable hanging. Nothing else can be
+                // failed for it here, so log rather than discard.
+                if let Err(error) = peer.write(&json!({
                     "t": "sr", "id": next_id("x"), "sid": thread_sid, "d": true,
-                }));
+                })) {
+                    eprintln!(
+                        "[shell] kkrpc: terminal event frame for stream {thread_sid} could \
+                         not be written ({error}); the host cannot see the watch end"
+                    );
+                }
             }
         });
 
@@ -1017,59 +1394,101 @@ impl Peer {
             }
         };
 
-        // Write with the lock RELEASED: a sink does file I/O, and holding the
-        // stream table across it would block every other stream (and any
-        // `return` trying to cancel this one).
-        let outcome = {
+        // ⚠ THE LOCK IS RELEASED BEFORE THE SINK WRITES. That sentence was here
+        // before and was FALSE: `consumer.sink.write(&bytes)` ran inside the
+        // `let mut streams = …` block, so a sink doing file I/O held the whole
+        // stream table — and every other stream on the same reader thread
+        // (establishing or cancelling a watch, `consume_stream`, every inbound
+        // dispatch) waited behind a slow disk, a network disk or a full one.
+        //
+        // The shape is now: do the table bookkeeping under the lock, TAKE the
+        // sink out, drop the lock, then write. Same shape as the replenish
+        // failure branch below it, which was already correct.
+        let taken = {
             let mut streams = self.streams.lock().expect("streams");
-            match streams.consumers.get_mut(&sid) {
-                Some(consumer) => {
-                    consumer.since_pull += 1;
-                    let replenish = if consumer.since_pull >= REPLENISH {
-                        consumer.since_pull = 0;
-                        true
-                    } else {
-                        false
-                    };
-                    Some((consumer.sink.write(&bytes), replenish))
-                }
-                None => None,
+            streams.consumers.remove(&sid)
+        };
+        let Some(mut consumer) = taken else {
+            // The stream is already gone (cancel, error, or a frame for a sid we
+            // never opened). Nothing to write and nothing to answer.
+            return;
+        };
+
+        // Re-borrow for the credit bookkeeping only — `consumer` is ours now, so
+        // this touches the TABLE, never the sink.
+        let replenish = {
+            consumer.since_pull += 1;
+            if consumer.since_pull >= REPLENISH {
+                consumer.since_pull = 0;
+                true
+            } else {
+                false
             }
         };
 
-        match outcome {
+        // ⚠ Lock NOT held: this is the file write. `finish` below is the other
+        // one, and both must stay outside the `streams` scope.
+        match consumer.sink.write(&bytes) {
             // The sink failed: end the stream and honour the cancellation.
-            Some((Err(message), _)) => {
-                if let Some(mut consumer) = self.take_consumer(&sid) {
-                    consumer.sink.finish(Err(message));
-                }
+            Err(message) => {
+                consumer.sink.finish(Err(message));
                 self.cancel_remote_stream(&sid);
             }
-            Some((Ok(()), true)) => {
-                // ⚠ The replenish write MUST be checked, and this is the only
-                // ignored write in the consume path.
-                //
-                // If it fails the transport is gone, so no further chunks will
-                // ever arrive — and the sink is what owns the consumer's deferred
-                // reply. Leaving it unfinished means `hands.write`'s caller waits
-                // out kkrpc's 30s timeout instead of being told the write died.
-                //
-                // `close_streams` is not a safety net here: it runs on reader EOF,
-                // which may never come if only the WRITE side is broken. The
-                // read-side path already does this correctly (it finishes the sink
-                // with the sink's own error above); this is the mirror of it.
-                if let Err(error) = self.write(&json!({
-                    "t": "sq", "id": next_id("p"), "sid": sid,
-                    "op": "pull", "n": REPLENISH,
-                })) {
-                    if let Some(mut consumer) = self.take_consumer(&sid) {
-                        consumer
-                            .sink
-                            .finish(Err(format!("stream interrupted: {error}")));
+            // Still inside the window: put it back, then replenish if due.
+            Ok(()) => {
+                // ⚠ The entry is absent from the table for the duration of the
+                // sink write. Dispatch is single-threaded on the reader thread,
+                // so no other frame can race this — but `forget_stream` (called
+                // from a PRODUCER thread whose write died) and `close_streams`
+                // take the same lock, so the restore is guarded rather than
+                // blind: an entry that reappeared under this sid is the live
+                // stream and must not be clobbered. The one that lost is
+                // finished, so an abandoned sink still gets its single `finish`.
+                let orphan = {
+                    let mut streams = self.streams.lock().expect("streams");
+                    if streams.consumers.contains_key(&sid) {
+                        Some(consumer)
+                    } else {
+                        streams.consumers.insert(sid.clone(), consumer);
+                        None
                     }
-                }
+                };
+                let Some(mut orphan) = orphan else {
+                    // Restored: the stream is live again, so credit may be owed.
+                    if replenish {
+                        // ⚠ The replenish write MUST be checked, and this is the
+                        // only ignored write in the consume path.
+                        //
+                        // If it fails the transport is gone, so no further chunks
+                        // will ever arrive — and the sink is what owns the
+                        // consumer's deferred reply. Leaving it unfinished means
+                        // `hands.write`'s caller waits out kkrpc's 30s timeout
+                        // instead of being told the write died.
+                        //
+                        // `close_streams` is not a safety net here: it runs on
+                        // reader EOF, which may never come if only the WRITE side
+                        // is broken. The read-side path already does this
+                        // correctly (it finishes the sink with the sink's own
+                        // error above); this is the mirror of it.
+                        if let Err(error) = self.write(&json!({
+                            "t": "sq", "id": next_id("p"), "sid": sid,
+                            "op": "pull", "n": REPLENISH,
+                        })) {
+                            if let Some(mut consumer) = self.take_consumer(&sid) {
+                                consumer
+                                    .sink
+                                    .finish(Err(format!("stream interrupted: {error}")));
+                            }
+                        }
+                    }
+                    return;
+                };
+                // Superseded while writing: `finish` runs with the lock
+                // released, like every other sink call in this file.
+                orphan
+                    .sink
+                    .finish(Err("stream superseded while its sink was writing".into()));
             }
-            _ => {}
         }
     }
 
@@ -1079,14 +1498,24 @@ impl Peer {
 
     /// Drop local state for a stream. Used when the transport fails mid-stream.
     fn forget_stream(&self, sid: &str) {
-        let mut streams = self.streams.lock().expect("streams");
-        if let Some(producer) = streams.producers.remove(sid) {
+        // ⚠ One lock scope, one I/O: the sink is taken OUT under the lock and
+        // finished after it is released. The previous version called
+        // `finish` — which for `hands.write` flushes a file and writes a reply
+        // frame — while holding the stream table, so a slow disk here blocked
+        // every other stream and every other inbound dispatch.
+        let (producer, consumer) = {
+            let mut streams = self.streams.lock().expect("streams");
+            let producer = streams.producers.remove(sid);
+            let consumer = streams.consumers.remove(sid);
+            (producer, consumer)
+        };
+        if let Some(producer) = producer {
             // Signal only: the producer's own thread is very likely inside
             // `next_chunk` right now, so it must be the one to close the handle.
             // Closing here would be a data race on the file.
             producer.cancel();
         }
-        if let Some(mut consumer) = streams.consumers.remove(sid) {
+        if let Some(mut consumer) = consumer {
             consumer
                 .sink
                 .finish(Err("stream interrupted by transport failure".into()));
@@ -1102,19 +1531,42 @@ impl Peer {
     }
 
     /// Drop every stream (transport end). Producers are signalled; consumers fail.
+    ///
+    /// ⚠ The stream table is dropped BEFORE any sink is finished. Draining into
+    /// locals under the lock and doing the I/O after is what keeps a slow (or
+    /// hung) `finish` from holding the table — and this runs on the reader
+    /// thread at EOF, so holding it there would block every later inbound
+    /// dispatch behind one unwritable file.
     fn close_streams(&self) {
-        let mut streams = self.streams.lock().expect("streams");
-        for (_, producer) in streams.producers.drain() {
+        let (producers, consumers, events) = {
+            let mut streams = self.streams.lock().expect("streams");
+            // `drain` returns owned values, so the table is already empty when
+            // the guard drops; nothing below can observe a half-closed table.
+            (
+                streams
+                    .producers
+                    .drain()
+                    .map(|(_, p)| p)
+                    .collect::<Vec<_>>(),
+                streams
+                    .consumers
+                    .drain()
+                    .map(|(_, c)| c)
+                    .collect::<Vec<_>>(),
+                streams.events.drain().map(|(_, e)| e).collect::<Vec<_>>(),
+            )
+        };
+        for producer in producers {
             // Signal, do not close: each producer's own thread owns its handle and
             // may be mid-`next_chunk`. It observes this flag and closes itself.
             producer.cancel();
         }
-        for (_, mut consumer) in streams.consumers.drain() {
+        for mut consumer in consumers {
             consumer.sink.finish(Err(TRANSPORT_CLOSED.to_string()));
         }
         // Event threads own their sources, so they release the watch themselves;
         // this flag is what tells them to.
-        for (_, event) in streams.events.drain() {
+        for event in events {
             event.cancelled.store(true, Ordering::SeqCst);
         }
     }
@@ -2202,6 +2654,55 @@ mod tests {
         }
     }
 
+    /// A sink that records whether the `streams` TABLE lock was free when it ran.
+    ///
+    /// ⚠ THE REGRESSION PROBE FOR FINDING #1. The comment above the sink write
+    /// claimed the lock was released; the code held it. `try_lock` turns that
+    /// claim into something falsifiable — if the caller still holds the table,
+    /// `try_lock` fails and the recorded value is `false`.
+    ///
+    /// Both hooks are probed, because `write` and `finish` are fixed in
+    /// different functions (`dispatch_stream_data` / `forget_stream` /
+    /// `close_streams` / `consume_stream`) and fixing one says nothing about the
+    /// others.
+    struct LockProbeSink {
+        peer: Arc<Peer>,
+        unlocked_on_write: Arc<Mutex<Option<bool>>>,
+        unlocked_on_finish: Arc<Mutex<Option<bool>>>,
+        outcome: Arc<Mutex<Option<Result<(), String>>>>,
+    }
+
+    impl StreamSink for LockProbeSink {
+        fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            let free = self.peer.streams.try_lock().is_ok();
+            *self.unlocked_on_write.lock().unwrap() = Some(free);
+            Ok(())
+        }
+        fn finish(&mut self, outcome: Result<(), String>) {
+            let free = self.peer.streams.try_lock().is_ok();
+            *self.unlocked_on_finish.lock().unwrap() = Some(free);
+            *self.outcome.lock().unwrap() = Some(outcome);
+        }
+    }
+
+    fn lock_probe_sink(
+        peer: &Arc<Peer>,
+    ) -> (
+        Box<dyn StreamSink>,
+        Arc<Mutex<Option<bool>>>,
+        Arc<Mutex<Option<bool>>>,
+    ) {
+        let unlocked_on_write = Arc::new(Mutex::new(None));
+        let unlocked_on_finish = Arc::new(Mutex::new(None));
+        let sink = Box::new(LockProbeSink {
+            peer: Arc::clone(peer),
+            unlocked_on_write: Arc::clone(&unlocked_on_write),
+            unlocked_on_finish: Arc::clone(&unlocked_on_finish),
+            outcome: Arc::new(Mutex::new(None)),
+        });
+        (sink, unlocked_on_write, unlocked_on_finish)
+    }
+
     #[test]
     fn consuming_a_stream_opens_the_credit_window_before_any_data() {
         // kkrpc's producer sends nothing until it sees a pull, so a consumer
@@ -2291,6 +2792,15 @@ mod tests {
     #[test]
     fn a_sink_failure_ends_the_stream_and_tells_the_producer_to_stop() {
         // A full disk must not leave the host pumping forever into a dead sink.
+        //
+        // ⚠ This test also covers a call site finding #1 lists by name: the
+        // sink-FAILURE arm of `dispatch_stream_data`. That arm was
+        // `take_consumer` + `finish` in the OLD code too, and `take_consumer`
+        // takes and releases the lock internally — so this path was already
+        // correct and the fix did not change it. It is kept as a behaviour pin
+        // across the rewrite; the probes that actually fail on the old shape are
+        // the four `*_with_the_stream_table_unlocked` tests, which is why
+        // finding #1's fix is evidenced by those and not by this one.
         struct FailingSink;
         impl StreamSink for FailingSink {
             fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
@@ -2345,6 +2855,525 @@ mod tests {
             Some(Err(message)) => assert_eq!(message, TRANSPORT_CLOSED),
             other => panic!("EOF must fail a waiting consumer, got {other:?}"),
         }
+    }
+
+    // --- streaming: sink I/O must not run under the streams lock -----------
+    //
+    // ⚠ FINDING #1, pinned. The old code ran `consumer.sink.write(&bytes)` (and
+    // the two `finish` paths, and `close_streams`) INSIDE the `streams` mutex,
+    // so a sink doing file I/O held the entire stream table: every other stream,
+    // and every other inbound dispatch on the same reader thread, waited behind
+    // a slow disk. Each test below fails on the old code and passes on the new
+    // one; the probe is `try_lock`, so it is a fact about the lock, not a timing
+    // race.
+
+    #[test]
+    fn a_sink_writes_chunks_with_the_stream_table_unlocked() {
+        let mut h = Harness::new();
+        let (sink, unlocked_on_write, _) = lock_probe_sink(&h.peer);
+        h.peer.consume_stream("s-9", sink).expect("consume");
+        h.next_frame(); // the opening pull
+
+        h.feed("{\"t\":\"sr\",\"id\":\"x\",\"sid\":\"s-9\",\"d\":false,\"v\":\"AAE=\"}\n");
+        assert!(
+            wait_until(Duration::from_secs(2), || unlocked_on_write
+                .lock()
+                .unwrap()
+                .is_some()),
+            "the sink was never asked to write"
+        );
+        assert_eq!(
+            *unlocked_on_write.lock().unwrap(),
+            Some(true),
+            "the sink's `write` ran with the streams table LOCKED — a sink does \
+             file I/O, so one slow disk would block every other stream and every \
+             inbound dispatch on the reader thread"
+        );
+    }
+
+    #[test]
+    fn a_terminal_frame_finishes_the_sink_with_the_stream_table_unlocked() {
+        let mut h = Harness::new();
+        let (sink, _, unlocked_on_finish) = lock_probe_sink(&h.peer);
+        h.peer.consume_stream("s-9", sink).expect("consume");
+        h.next_frame();
+
+        h.feed("{\"t\":\"sr\",\"id\":\"x\",\"sid\":\"s-9\",\"d\":true}\n");
+        assert!(
+            wait_until(Duration::from_secs(2), || unlocked_on_finish
+                .lock()
+                .unwrap()
+                .is_some()),
+            "the sink's `finish` never ran"
+        );
+        assert_eq!(
+            *unlocked_on_finish.lock().unwrap(),
+            Some(true),
+            "`finish` ran with the streams table LOCKED"
+        );
+    }
+
+    #[test]
+    fn a_failed_sink_write_finishes_it_with_the_stream_table_unlocked() {
+        // The error branch of `dispatch_stream_data` finishes the sink too, and
+        // it is a different call site from the terminal-frame one above.
+        struct FailingProbeSink {
+            peer: Arc<Peer>,
+            unlocked_on_finish: Arc<Mutex<Option<bool>>>,
+        }
+        impl StreamSink for FailingProbeSink {
+            fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
+                Err("ENOSPC: no space left on device".into())
+            }
+            fn finish(&mut self, _outcome: Result<(), String>) {
+                *self.unlocked_on_finish.lock().unwrap() =
+                    Some(self.peer.streams.try_lock().is_ok());
+            }
+        }
+
+        let mut h = Harness::new();
+        let unlocked_on_finish = Arc::new(Mutex::new(None));
+        h.peer
+            .consume_stream(
+                "s-9",
+                Box::new(FailingProbeSink {
+                    peer: Arc::clone(&h.peer),
+                    unlocked_on_finish: Arc::clone(&unlocked_on_finish),
+                }),
+            )
+            .expect("consume");
+        h.next_frame();
+
+        h.feed("{\"t\":\"sr\",\"id\":\"x\",\"sid\":\"s-9\",\"d\":false,\"v\":\"AAE=\"}\n");
+        assert!(
+            wait_until(Duration::from_secs(2), || unlocked_on_finish
+                .lock()
+                .unwrap()
+                .is_some()),
+            "the failing sink's `finish` never ran"
+        );
+        assert_eq!(
+            *unlocked_on_finish.lock().unwrap(),
+            Some(true),
+            "the sink-failure path finished its sink with the table LOCKED"
+        );
+    }
+
+    #[test]
+    fn a_transport_end_fails_sinks_with_the_stream_table_unlocked() {
+        // `close_streams` is the fourth call site, and it runs on the reader
+        // thread at EOF — holding the table there would block every later
+        // dispatch behind one unwritable file.
+        let mut h = Harness::new();
+        let (sink, _, unlocked_on_finish) = lock_probe_sink(&h.peer);
+        h.peer.consume_stream("s-9", sink).expect("consume");
+        h.next_frame();
+        h.close_inbound();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || unlocked_on_finish
+                .lock()
+                .unwrap()
+                .is_some()),
+            "EOF did not finish the consumer's sink"
+        );
+        assert_eq!(
+            *unlocked_on_finish.lock().unwrap(),
+            Some(true),
+            "`close_streams` finished a sink with the table LOCKED"
+        );
+    }
+
+    #[test]
+    fn forget_stream_finishes_a_consumer_with_the_table_unlocked() {
+        // `forget_stream` is the fifth call site, and the one finding #1 lists by
+        // name. It is reached from a PRODUCER thread whose write died, and it
+        // finishes every consumer on the sid it is given.
+        //
+        // ⚠ Its first version in this test tried to reach it the "natural" way —
+        // a dead producer write — but that cannot work: our producer sids are
+        // `s-N` (allocated here) while a consumer's sid is allocated by the HOST,
+        // so the two never share a sid in practice and `forget_stream` had no
+        // consumer to fail. The call is therefore made directly, which is what
+        // actually pins the lock discipline of this function.
+        let mut h = Harness::new();
+        let (sink, _, unlocked_on_finish) = lock_probe_sink(&h.peer);
+        h.peer.consume_stream("s-9", sink).expect("consume");
+        h.next_frame(); // the opening pull
+
+        h.peer.forget_stream("s-9");
+
+        assert_eq!(
+            *unlocked_on_finish.lock().unwrap(),
+            Some(true),
+            "`forget_stream` finished a sink with the table LOCKED"
+        );
+        assert!(
+            h.peer.streams.lock().unwrap().consumers.is_empty(),
+            "`forget_stream` must remove the consumer it failed"
+        );
+    }
+
+    // --- streaming: a failed opening pull must not leak a consumer ---------
+
+    #[test]
+    fn a_failed_opening_pull_removes_the_consumer_and_finishes_it() {
+        // ⚠ FINDING #3, pinned. The sink is inserted BEFORE the `pull` frame is
+        // written, and that write used to be unchecked. On a dead transport no
+        // chunk can ever arrive, so the inserted consumer — holding, for
+        // `hands.write`, an open `File` plus the deferred reply — sat in the
+        // table until the connection ended, and `close_streams` then produced a
+        // SECOND reply frame for the same request id.
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let peer = Peer::new(BrokenWriter);
+        let (sink, _, outcome) = recording_sink();
+        let error = peer.consume_stream("s-9", sink).expect_err("must fail");
+        assert!(
+            error.contains("closed"),
+            "the write error must survive: {error}"
+        );
+
+        assert!(
+            peer.streams.lock().unwrap().consumers.is_empty(),
+            "a consumer whose opening pull failed must be taken back OUT — \
+             otherwise it holds an open file and a deferred reply until the \
+             connection ends"
+        );
+        // Cloned into a local first: the guard's temporary would otherwise
+        // outlive the match on it.
+        let reported = outcome.lock().unwrap().clone();
+        match reported {
+            Some(Err(message)) => assert!(
+                message.contains("stream not opened"),
+                "the abandoned sink must be finished exactly once, with why: {message}"
+            ),
+            other => panic!("the leaked consumer's sink was never finished: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_consumer_left_by_a_failed_pull_is_finished_exactly_once() {
+        // The second half of finding #3: once the failed pull has taken the
+        // consumer out, nothing that ends the connection later may find it again
+        // and `finish` it a second time (a duplicate reply frame for the same
+        // request id).
+        //
+        // ⚠ THIS TEST'S FIRST VERSION WAS NOT FALSIFIABLE, and the reinjection
+        // check is what caught it. It asserted "finished exactly once" after
+        // `close_streams()` — but the sink is DROPPED when the leaked consumer is
+        // dropped, so its `finish` never runs on the old code either and the
+        // count was 1 there too. Counting invocations is the wrong instrument
+        // when dropping is one of the alternatives. What discriminates is WHEN
+        // and WITH WHAT the sink is told, both observable from the sink itself.
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct TracingSink {
+            log: Arc<Mutex<Vec<String>>>,
+        }
+        impl StreamSink for TracingSink {
+            fn write(&mut self, _bytes: &[u8]) -> Result<(), String> {
+                self.log.lock().unwrap().push("write".into());
+                Ok(())
+            }
+            fn finish(&mut self, outcome: Result<(), String>) {
+                self.log.lock().unwrap().push(match outcome {
+                    Ok(()) => "finish(Ok)".into(),
+                    Err(message) => format!("finish(Err: {message})"),
+                });
+            }
+        }
+
+        let peer = Peer::new(BrokenWriter);
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        peer.consume_stream(
+            "s-9",
+            Box::new(TracingSink {
+                log: Arc::clone(&log),
+            }),
+        )
+        .expect_err("the opening pull cannot succeed");
+
+        // The failed pull must ALREADY have told the sink, and told it why. On
+        // the old code nothing has run at this point — the sink is merely sitting
+        // in the table holding an open File and a clone of the deferred reply.
+        let after_consume = log.lock().unwrap().clone();
+        assert_eq!(
+            after_consume.len(),
+            1,
+            "the abandoned sink must be finished by the failed pull itself, got: {after_consume:?}"
+        );
+        assert!(
+            after_consume[0].contains("finish(Err: stream not opened"),
+            "and with the write error that caused it, got: {after_consume:?}"
+        );
+
+        // Whatever ends the connection later must find nothing left to answer.
+        peer.close_streams();
+        peer.forget_stream("s-9");
+        let final_log = log.lock().unwrap().clone();
+        assert_eq!(
+            final_log.len(),
+            1,
+            "the consumer was finished more than once — each extra finish is a \
+             duplicate reply frame for the same request id, got: {final_log:?}"
+        );
+    }
+
+    #[test]
+    fn a_consumer_that_outlives_its_sink_write_is_restored_with_its_credit_count() {
+        // The cost of releasing the lock across the sink write is that the entry
+        // is briefly absent from the table. What must NOT change: the credit
+        // counter survives, so replenishment still happens on exactly the
+        // REPLENISH-th chunk rather than restarting from zero every time.
+        let mut h = Harness::new();
+        let (sink, bytes, _) = recording_sink();
+        h.peer.consume_stream("s-9", sink).expect("consume");
+        h.next_frame();
+
+        for _ in 0..REPLENISH {
+            h.feed(&format!(
+                "{}\n",
+                json!({ "t": "sr", "id": "x", "sid": "s-9", "d": false, "v": "AAE=" })
+            ));
+        }
+        // Each chunk leaves the table and is put back, so this is REPLENISH
+        // remove/insert cycles rather than one contiguous borrow.
+        assert!(
+            wait_until(Duration::from_secs(2), || bytes.lock().unwrap().len()
+                == REPLENISH * 2),
+            "expected {} bytes, got {}",
+            REPLENISH * 2,
+            bytes.lock().unwrap().len()
+        );
+
+        let pull = h.next_frame();
+        assert_eq!(pull["op"], json!("pull"));
+        assert_eq!(pull["n"], json!(REPLENISH));
+        assert_eq!(bytes.lock().unwrap().len(), REPLENISH * 2);
+    }
+
+    // --- the reader must not confuse "EOF" with "a bad line" ---------------
+
+    /// A reader that fails `n` times with `kind`, then behaves normally.
+    struct FlakyReader {
+        failures: usize,
+        kind: io::ErrorKind,
+        payload: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for FlakyReader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(io::Error::new(self.kind, "simulated read failure"));
+            }
+            if self.pos >= self.payload.len() {
+                return Ok(0);
+            }
+            let n = (self.payload.len() - self.pos).min(out.len());
+            out[..n].copy_from_slice(&self.payload[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_transient_read_error_does_not_kill_the_bridge() {
+        // ⚠ FINDING #2, pinned. `Ok(0)` and `Err(_)` shared one arm, so a single
+        // interrupted read (or a stray `InvalidData`) was treated as "the host
+        // vanished": no log, no notification, `HostState` still `Ready` — and
+        // because a real child death IS caught by the supervisor's `try_wait`,
+        // this zombie state was the one nothing could see.
+        let frame = b"{\"t\":\"q\",\"id\":\"r1\",\"op\":\"call\",\"p\":[\"probe\"]}\n";
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let peer = Peer::new(test_support::SharedSink(Arc::clone(&sink)));
+        peer.on("probe", Arc::new(|_| json!("ok")));
+        peer.start_reader(FlakyReader {
+            failures: 2, // below MAX_CONSECUTIVE_READ_FAILURES
+            kind: io::ErrorKind::InvalidData,
+            payload: frame.to_vec(),
+            pos: 0,
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                String::from_utf8_lossy(&sink.lock().unwrap()).contains("r1")
+            }),
+            "two failed reads must be survived; the frame after them must be served"
+        );
+        // ⚠ The assertion is about the FAILURE KIND, not merely "the link is
+        // still up": this reader ends with `Ok(0)`, so the link DOES go down —
+        // as `Closed`, which is the truth about this scenario. What must never
+        // happen is the two `InvalidData` errors being billed as the host
+        // vanishing. Asserting `is_none()` here was this test's first version and
+        // it failed, because that is a state the scenario cannot produce.
+        assert!(
+            !matches!(peer.link_failure(), Some(LinkFailure::Read { .. })),
+            "two failed reads must not be published as a read failure: {:?}",
+            peer.link_failure().map(|f| f.describe())
+        );
+    }
+
+    #[test]
+    fn persistent_read_errors_are_counted_and_published() {
+        // The other half: the tolerance must RUN OUT, or the loop above is an
+        // infinite retry. The counter is consecutive, and the reason is
+        // published so the shell can act on it instead of leaving `HostState` at
+        // Ready over a dead port.
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let peer = Peer::new(test_support::SharedSink(Arc::clone(&sink)));
+        let notified = Arc::new(Mutex::new(None::<String>));
+        let captured = Arc::clone(&notified);
+        peer.link_failure_notify(move |failure| {
+            *captured.lock().unwrap() = Some(failure.describe());
+        });
+        peer.start_reader(FlakyReader {
+            failures: usize::MAX,
+            kind: io::ErrorKind::InvalidData,
+            payload: Vec::new(),
+            pos: 0,
+        });
+
+        assert!(
+            wait_until(Duration::from_secs(3), || peer.is_link_down()),
+            "a permanently failing stdout port must be declared dead"
+        );
+        match peer.link_failure() {
+            Some(LinkFailure::Read {
+                kind, consecutive, ..
+            }) => {
+                assert_eq!(kind, io::ErrorKind::InvalidData);
+                assert_eq!(
+                    consecutive, MAX_CONSECUTIVE_READ_FAILURES,
+                    "the failure must report how many consecutive errors it took"
+                );
+            }
+            other => panic!("expected LinkFailure::Read, got {other:?}"),
+        }
+        assert!(
+            notified
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|text| text.contains("read failed")),
+            "the supervisor callback must be told, with a description"
+        );
+    }
+
+    #[test]
+    fn a_clean_eof_is_published_as_closed_not_as_a_read_failure() {
+        // The distinction the fix is about: `Ok(0)` is final and expected, an
+        // `Err` is not. Collapsing them is what made a bad line look like a
+        // dead host.
+        let mut h = Harness::new();
+        h.close_inbound();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || h.peer.is_link_down()),
+            "EOF must be recorded as the link going down"
+        );
+        assert!(
+            matches!(h.peer.link_failure(), Some(LinkFailure::Closed)),
+            "clean EOF must be `Closed`, not a read failure: {:?}",
+            h.peer.link_failure().map(|f| f.describe())
+        );
+    }
+
+    #[test]
+    fn unparseable_lines_are_counted_and_only_a_flood_ends_the_link() {
+        // A malformed line is still skipped rather than fatal on its own — the
+        // contract the old test pinned — but it is now COUNTED, and a stream of
+        // them (a desynchronised protocol, which is the state a silent
+        // `continue` used to hide) ends the link instead of spinning.
+        let mut h = Harness::new();
+        h.peer.on("probe", Arc::new(|_| json!("ok")));
+
+        h.feed("this is not json\n");
+        h.feed("{\"t\":\"q\",\"id\":\"k1\",\"op\":\"call\",\"p\":[\"probe\"]}\n");
+        assert_eq!(
+            h.next_frame()["id"],
+            json!("k1"),
+            "one bad line must still be survivable"
+        );
+
+        // Now flood: past the byte cap in lines that parse to nothing.
+        let line = format!("{}\n", "x".repeat(4096));
+        let mut fed = 0u64;
+        while fed < MAX_SKIPPED_LINE_TOTAL + 4096 {
+            h.feed(&line);
+            fed += line.len() as u64;
+        }
+        assert!(
+            wait_until(Duration::from_secs(10), || h.peer.is_link_down()),
+            "a flood of unparseable lines must end the link, not be skipped forever"
+        );
+        match h.peer.link_failure() {
+            Some(LinkFailure::Unreadable { dropped_bytes, .. }) => assert!(
+                dropped_bytes >= MAX_SKIPPED_LINE_TOTAL,
+                "the report must carry the dropped byte count: {dropped_bytes}"
+            ),
+            other => panic!("expected LinkFailure::Unreadable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_line_that_is_followed_by_good_ones_does_not_end_the_link() {
+        // ⚠ This is the regression for a bug in THIS change's first draft: the
+        // bad-frame counters were cleared by the `Ok(_)` read arm, i.e. by the
+        // very next line, so the desynchronisation cap was unreachable and a
+        // stream of garbage would have been skipped forever.
+        //
+        // ⚠ The byte math needs care to be falsifiable at all. The cap is 1 MiB,
+        // so alternating a 9-byte bad line with a good one would need ~116000
+        // rounds to trip it under the broken behaviour — a test that slow would
+        // not be run. Padding each bad line to ~64 KiB and alternating puts the
+        // trip at ~16 rounds, so `rounds` below is comfortably past the cap if
+        // the counts accumulate and comfortably under it if they reset.
+        let rounds = 32usize;
+        let bad_line = format!("{}\n", "x".repeat(64 * 1024));
+        let good_line = "{\"t\":\"q\",\"id\":\"probe\",\"op\":\"call\",\"p\":[\"probe\"]}\n";
+        let mut h = Harness::new();
+        h.peer.on("probe", Arc::new(|_| json!("ok")));
+
+        let mut good_frames = 0usize;
+        for _ in 0..rounds {
+            h.feed(&bad_line);
+            h.feed(good_line);
+            // Drain this round's reply before the next, so the two counters are
+            // genuinely interleaved rather than the whole flood landing in one
+            // buffer.
+            if h.next_frame()["id"] == json!("probe") {
+                good_frames += 1;
+            }
+        }
+
+        assert_eq!(
+            good_frames, rounds,
+            "every good frame must be served even when bad ones are interleaved"
+        );
+        assert!(
+            !matches!(h.peer.link_failure(), Some(LinkFailure::Unreadable { .. })),
+            "a bad line followed by good ones must not end the link: {:?}",
+            h.peer.link_failure().map(|f| f.describe())
+        );
     }
 
     // --- streaming: deferred replies ---------------------------------------
