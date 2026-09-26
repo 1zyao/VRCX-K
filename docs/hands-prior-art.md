@@ -207,12 +207,12 @@ Our shell already carries the machinery but **no scheme string is set**:
 - `src-tauri/Cargo.toml:84-89` — `tauri-plugin-deep-link = "2"`, with a comment documenting exactly the
   platform split we care about: "Windows/Linux support runtime registration; **macOS/Android/iOS require
   the scheme to be declared in config** and cannot register at runtime."
-- `src-tauri/src/shell_sys.rs:282-299` — `shell.deepLink.register(scheme)` and `shell.deepLink.isRegistered(scheme)`.
-- `src-tauri/src/lib.rs:321-327` wires `app.deep_link().on_open_url(...)` → `forward_deep_link`.
-- `src-tauri/src/lib.rs:144-164` `forward_deep_link` notifies the host as `deepLink.opened` and mirrors to
+- `src-tauri/src/shell_sys.rs` — the `shell.deepLink.register` / `shell.deepLink.isRegistered` handlers.
+- `src-tauri/src/lib.rs` — the single `.setup()` wires `app.deep_link().on_open_url(...)` → `forward_deep_link`.
+- `src-tauri/src/lib.rs` — `fn forward_deep_link` notifies the host as `deepLink.opened` and mirrors to
   the frontend as `deep-link-opened` — with the deliberate design note that "the brain owns what a URL
   MEANS; the shell only proves it arrived."
-- `src-tauri/src/lib.rs:172-197` handles second-instance redirect and emits `single-instance-redirect`,
+- `src-tauri/src/lib.rs` — the second-instance redirect emits `single-instance-redirect`,
   documenting the plugin behaviour that a missing event means the redirect never arrived.
 - Host side: `host/src/stdio.ts` (`deepLink.opened` → fanout) and `onOpen`, plus
   `host/src/capability.ts` — which exposes **`deepLink.isRegistered` only**.
@@ -237,9 +237,9 @@ Our shell already carries the machinery but **no scheme string is set**:
 | Interactive p50, idle → loaded | 0.15 ms → 0.19 ms (**1.28x**) | `docs/hands-capability-proposal.md:245`; `docs/hands-host-design.md:224` |
 | Interactive p95, idle → loaded | 0.37 ms → 18.85 ms (**51x**) | same lines |
 | p95 after transfer | 0.21 ms (recovers) | same |
-| Mechanism | shell's `write()` holds the writer lock **per frame**, not per file | `docs/hands-host-design.md:229-231`; code at `src-tauri/src/kkrpc_peer.rs:913-921` (`let mut writer = self.writer.lock()…; write_all(encoded); writer.flush()`) |
+| Mechanism | shell's `write()` holds the writer lock **per frame**, not per file | `docs/hands-host-design.md:229-231`; code at `src-tauri/src/kkrpc_peer.rs`, the `self.writer.lock()` → `write_all` → `flush` site |
 | Transfer is 128 MiB, n=100 | probe `docs/probes/hands-e2e/hol.mjs` | run: `cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e && node docs/probes/hands-e2e/hol.mjs` |
-| Single pipe confirmed | `.stdin(Stdio::piped()).stdout(Stdio::piped())`, one channel | `src-tauri/src/host.rs:1217-1219` |
+| Single pipe confirmed | `.stdin(Stdio::piped()).stdout(Stdio::piped())`, one channel | `src-tauri/src/host.rs`, the `.stdin(Stdio::piped()).stdout(Stdio::piped())` pair |
 | **Cause is NOT separated** | p95 may be head-of-line **queueing** *or* the peer being **busy**; the probe says the two need different fixes and this measurement cannot distinguish them | `hol.mjs` "the competing explanation" block; `docs/hands-host-design.md:242-244` |
 | Loopback is a **lower bound** | cross-machine tail is unmeasured and will be worse | `docs/hands-host-design.md:237-240`; `docs/probes/transport-lab/FINDINGS.md:126-136` |
 
@@ -475,8 +475,8 @@ force-clears**. Registering into a container nobody iterates is the failure mode
    `shell\open\command = "<exe>" /uri="%1"`; delete the key on uninstall.
 4. **Declare the scheme in `tauri.conf.json`** — we currently have none (§2.6), which is why
    macOS/Android/iOS cannot work. Windows/Linux can register at runtime via
-   `shell.deepLink.register` (`src-tauri/src/shell_sys.rs:282-299`).
-5. **Keep the second-launch path we already have** (`lib.rs:172-197` → `forward_deep_link` →
+   `shell.deepLink.register` (the handler in `src-tauri/src/shell_sys.rs`).
+5. **Keep the second-launch path we already have** (the redirect in `src-tauri/src/lib.rs` → `forward_deep_link` →
    `deepLink.opened`), since VRCX needed *two different* mechanisms (a per-user named pipe on Windows,
    `requestSingleInstanceLock` on Electron) and we get one from `tauri-plugin-single-instance`.
 

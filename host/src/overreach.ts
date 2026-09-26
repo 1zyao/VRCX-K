@@ -63,8 +63,16 @@
 //   There is no compile-time or runtime enforcement: a new curated service is
 //   checked ONLY if its author calls `overreachWarning` from its own `record`.
 //   The real constraint is the checklist in `capability.ts`'s `record` comment
-//   and the `overreach.test.ts` case that enumerates the covered entry points —
-//   consult those when adding a service, and do not describe this as automatic.
+//   and the end-to-end cases in `overreach.test.ts` that drive each covered entry
+//   point through a REAL loader entry — `the RAW ctx.shell path is covered too`
+//   and `the CURATED ctx.hands path IS checked`. Consult those when adding a
+//   service, and do not describe this as automatic.
+//
+//   ⚠ An earlier version of this comment cited "the `overreach.test.ts` case that
+//   enumerates the covered entry points". NO SUCH CASE EXISTS, and never did —
+//   the pointer sent readers looking for a test that was not there. The two names
+//   above are real and were checked against the file; keep them that way, or drop
+//   the pointer rather than describing a test that does not exist.
 //
 // ⚠ WHY THE CHECK KEYS ON `entry.id` AND NOT ON `callerName`
 //   `callerName` decorates the id with a `#runtimeName` suffix for humans. The
