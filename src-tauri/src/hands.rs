@@ -1227,11 +1227,19 @@ fn comparable(path: &Path) -> PathBuf {
 /// A non-ASCII filename that differs only in case may still be missed — recorded
 /// here rather than papered over with a hand-rolled table that would be wrong in
 /// the other direction.
+///
+/// ⚠ The `cfg` gates the WHOLE FUNCTION, not just its body. Gating only the body
+/// compiles the function on Unix where nothing calls it, and `-D warnings` then
+/// fails the Linux build with `function component_eq is never used` — measured on
+/// CI (`static gates / Rust clippy`), while a Windows-local clippy stayed green
+/// because the Windows arm DOES call it. This is the same shape as the Android
+/// `never used` warnings on `shell_sys.rs`'s scheme helpers: a `cfg` that removes
+/// a CALLER but leaves the callee must remove the callee too.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
     if left == right {
         return true;
     }
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         // ⚠ `to_string_lossy` rather than requiring `&str`: this comparison runs
         // for EVERY event path, and a path that is not valid UTF-8 (perfectly
@@ -1240,10 +1248,6 @@ fn component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
         // the exact `==` above already answered for byte-identical paths.
         left.to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy())
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        false
     }
 }
 
@@ -2624,6 +2628,36 @@ mod tests {
         assert!(!intent.truncate);
         assert_eq!(intent.offset, Some(4096));
         assert_eq!(intent.label(), "overwrite");
+    }
+
+    #[test]
+    fn an_offset_alone_means_write_in_place_not_rewrite() {
+        // ⚠ THE SURVIVING-MUTANT REGRESSION. A reviewer found that the DEFAULT for
+        // `{offset: N}` was only pinned indirectly, by
+        // `assert!(write_intent(&json!({ "offset": 5 })).is_ok())` in the refusal
+        // test — which asserts the call SUCCEEDS, never what it MEANS.
+        //
+        // Measured: reverting the default to `true` while ALSO relaxing the refusal
+        // to fire only on an EXPLICIT `truncate` leaves the whole suite green (69/69
+        // in `hands::`), and `{offset: 5}` goes back to O_TRUNC-then-seek — a 20-byte
+        // file written with 3 bytes becomes `size=8`, `hex=0000000000424242`, head
+        // zeroed. That is exactly the corruption `e95ba827` fixed, silently
+        // returning. Both halves have to be pinned, and this is the missing one.
+        let intent = write_intent(&json!({ "offset": 5 })).expect("in place");
+        assert!(
+            !intent.truncate,
+            "an offset with no explicit `truncate` must mean IN PLACE — defaulting to \
+             truncate here zero-fills everything before the offset"
+        );
+        assert_eq!(intent.offset, Some(5));
+        assert_eq!(intent.label(), "overwrite");
+
+        // And the bare call still rewrites: the two defaults must stay opposites, so
+        // this asserts the CONTRAST rather than either value alone.
+        assert!(
+            write_intent(&json!({})).expect("rewrite").truncate,
+            "a bare call must still rewrite the whole file"
+        );
     }
 
     #[test]

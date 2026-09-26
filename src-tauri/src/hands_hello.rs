@@ -75,24 +75,134 @@ fn environment() -> Value {
     Value::Object(map)
 }
 
+/// The characters that separate word-tokens inside an environment variable name.
+///
+/// ⚠ Defined ONCE and used by both matching rules in [`looks_secret`]. They must
+/// agree: rule 1 joins exactly what rule 2 splits, so if the two lists ever
+/// disagree — one strips `:` and the other does not — a name can be normalised
+/// into a marker that its own tokens never reveal. Sharing one list makes that
+/// impossible, and `clippy::manual_pattern_char_comparison` is satisfied by
+/// passing the slice rather than a closure.
+const NAME_SEPARATORS: [char; 4] = ['_', '-', '.', ' '];
+
 /// Whether a variable name suggests a credential.
 ///
 /// Deliberately a NAME heuristic and not a value scan: this cannot be perfect,
 /// and pretending otherwise would be worse than admitting the limit. It is a
 /// redaction aid for logs, NOT a security boundary — the brain shares this
 /// environment already when both run on one machine.
+///
+/// # ⚠ Why matching is done in two different ways
+///
+/// The first version was one rule — `upper.contains(marker)` over a list holding
+/// `APIKEY` and `PRIVATE_KEY` — and that single rule was wrong in **both**
+/// directions at once:
+///
+///   **It missed the most common spelling in the wild.** `OPENAI_API_KEY` does
+///   not contain `APIKEY`, because the underscore breaks the substring. The most
+///   recognizable API-key name there is travelled with its value intact. The
+///   mirror case proves the fragility: `AWS_PRIVATE_KEY` matched only because the
+///   marker happened to be spelled with the same single separator, so
+///   `AWS_PRIVATEKEY` would have missed instead. One marker list was encoding one
+///   separator convention as though it were the rule.
+///
+///   **Making `contains` more permissive would break it the other way.** Adding
+///   the abbreviations the reviewer asked for (`PWD`, `PAT`, `PASS`, `SESSION`)
+///   as plain substrings is not an option, because `PAT` as a substring matches
+///   **`PATH`** — the single most load-bearing variable in the environment would
+///   be redacted — and with `PWD`/`PASS` the same trick hits `PWDLASTSET` and
+///   `BYPASS_PROXY`. Substring matching cannot tell a word from a coincidence
+///   inside a word.
+///
+/// So two rules, each chosen for the shape of its markers:
+///
+///   1. **Long, word-shaped markers match anywhere**, on a form with separators
+///      stripped — `API_KEY`, `APIKEY`, `api-key` and `Api Key` all collapse to
+///      `APIKEY`. These are long enough that an accidental substring is not
+///      realistic, and stripping is what lets one marker cover every separator
+///      convention. The markers are spelled in the **stripped** alphabet
+///      (`PRIVATEKEY`, not `PRIVATE_KEY`); a marker containing a separator would
+///      be unmatchable, which is precisely the bug being fixed.
+///
+///   2. **Short abbreviations must be a whole token**, where a token is what
+///      lies between separators. `GITHUB_PAT` has the token `PAT`; `PATH` has the
+///      token `PATH`. That distinction is the entire reason `PATH` survives.
+///      Requiring only *suffix* equality would be stricter but would miss
+///      `MY_PAT_VALUE`; whole-token equality covers it while still refusing to
+///      find `PAT` inside `PATH`.
+///
+/// # What is still not covered (⚠ the honest boundary)
+///
+///   - A marker-free name is invisible to this: `OPENAI_KEY`, `DOCKER_CONFIG`,
+///     `NPM_CONFIG__AUTH` is covered by the `AUTH` token but a bespoke
+///     `SOMETHING_IMPORTANT` is not. A NAME heuristic cannot recover intent from
+///     a name, and pretending otherwise is the failure this comment exists to
+///     prevent.
+///   - A short abbreviation glued into a word with no separator is invisible:
+///     `MYPATVALUE` is not redacted. That is deliberate — the alternative is
+///     redacting `PATH` — and it is the residual gap this design accepts.
+///   - Both rules produce FALSE POSITIVES, which is the safe direction:
+///     `TOKENIZER_PATH` (contains `TOKEN`) and `SSH_AUTH_SOCK` (token `AUTH`)
+///     are redacted although neither is a secret. That costs a useless
+///     `<redacted>` in a log; the opposite error leaks a credential.
+///   - Names are compared ASCII-case-insensitively only, so a name spelled with
+///     non-ASCII letters matches nothing. Env var names are effectively ASCII on
+///     every platform we target.
 fn looks_secret(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    const MARKERS: [&str; 7] = [
+    // Rule 1's input: separators removed, then uppercased. `+` is deliberately
+    // NOT stripped — `C++` and `SHA256` must not be restructured into a new word
+    // that happens to contain a marker.
+    let normalised: String = key
+        .chars()
+        .filter(|c| !NAME_SEPARATORS.contains(c))
+        .collect::<String>()
+        .to_ascii_uppercase();
+
+    // ⚠ Spelled in the NORMALISED alphabet. Writing `PRIVATE_KEY` here would
+    // make it unmatchable, since the input has had its underscores removed.
+    const LONG_MARKERS: [&str; 14] = [
         "TOKEN",
         "SECRET",
         "PASSWORD",
         "PASSWD",
         "CREDENTIAL",
-        "PRIVATE_KEY",
+        "PRIVATEKEY",
         "APIKEY",
+        "ACCESSKEY",
+        "SECRETKEY",
+        "BEARER",
+        "SIGNATURE",
+        "CERTIFICATE",
+        "ENCRYPTIONKEY",
+        "SALT",
     ];
-    MARKERS.iter().any(|marker| upper.contains(marker))
+    if LONG_MARKERS
+        .iter()
+        .any(|marker| normalised.contains(marker))
+    {
+        return true;
+    }
+
+    // Rule 2: whole-token equality on the ORIGINAL name, so the separators that
+    // bound a word are still available. Redacting all of `PAT`/`PATH` alike is
+    // the bug this rule exists to avoid.
+    //
+    // ⚠ There is deliberately no bare `KEY` token here. `AWS_ACCESS_KEY_ID` is
+    // the name the reviewer asked for and it is already covered by the `ACCESSKEY`
+    // long marker, while a bare `KEY` token would redact `PUBLIC_KEY` and
+    // `SSH_KEY_PATH` — neither of which is a secret — and buy nothing.
+    const SHORT_MARKERS: [&str; 8] = [
+        "PWD",     // Windows/Unix shells; `MYSQL_PWD`, `PGPASSWORD` is rule 1
+        "PAT",     // GitHub/Azure personal access token
+        "PASS",    // `DB_PASS`
+        "SESSION", // session ids and cookies are bearer credentials
+        "AUTH",    // `NPM_CONFIG__AUTH`
+        "OTP", "PIN", "CERT", // `CLIENT_CERT`
+    ];
+    key.split(NAME_SEPARATORS).any(|token| {
+        let token = token.to_ascii_uppercase();
+        !token.is_empty() && SHORT_MARKERS.contains(&token.as_str())
+    })
 }
 
 /// Build the hello payload.
@@ -225,6 +335,128 @@ mod tests {
             payload["env"]["VRCXK_TEST_SECRET_TOKEN"],
             json!("<redacted>"),
             "a token-shaped name must not carry its value"
+        );
+    }
+
+    /// The exact name the reviewer used to show the old check was broken.
+    ///
+    /// `OPENAI_API_KEY` does not contain the substring `APIKEY`, so the old
+    /// `contains` rule let the most common API-key spelling through with its
+    /// value. This test fails against that implementation and passes against
+    /// separator-stripping, which is what makes it a regression guard rather
+    /// than a restatement.
+    #[test]
+    fn an_underscored_api_key_is_redacted_like_the_glued_spelling() {
+        // The pair matters more than either half: if these two ever disagree,
+        // the separator normalisation has been broken.
+        assert!(looks_secret("OPENAI_API_KEY"));
+        assert!(looks_secret("OPENAI_APIKEY"));
+        // And the same convention in other separators, since the original bug
+        // was one rule silently encoding one separator convention.
+        assert!(looks_secret("openai-api-key"));
+        assert!(looks_secret("Openai.Api.Key"));
+        assert!(looks_secret("Openai Api Key"));
+    }
+
+    /// Each short abbreviation the reviewer named as entirely unmatched.
+    #[test]
+    fn the_short_abbreviations_the_reviewer_flagged_are_now_covered() {
+        for name in [
+            "MYSQL_PWD",
+            "DB_PWD",
+            "GITHUB_PAT",
+            "AZURE_DEVOPS_PAT",
+            "DB_PASS",
+            "REDIS_PASS",
+            "SESSION_ID",
+            "PHP_SESSION",
+        ] {
+            assert!(looks_secret(name), "{name} must be redacted");
+        }
+    }
+
+    /// The AWS pair: `AWS_ACCESS_KEY_ID` was unmatched entirely, and
+    /// `AWS_SECRET_ACCESS_KEY` only by luck of the `SECRET` substring.
+    #[test]
+    fn the_aws_credential_names_are_covered() {
+        assert!(looks_secret("AWS_ACCESS_KEY_ID"));
+        assert!(looks_secret("AWS_SECRET_ACCESS_KEY"));
+        // `ACCESSKEY` is a LONG marker, so it matches across separators.
+        assert!(looks_secret("aws-access-key-id"));
+        assert!(looks_secret("AWS_ACCESSKEY_ID"));
+    }
+
+    /// ⚠ The counterweight to the test above, and the reason `PAT`/`KEY` could
+    /// not simply be added as substrings.
+    ///
+    /// `PATH` contains `PAT`. A naive widening of the marker list — the obvious
+    /// way to "cover `*_PAT`" — would have redacted `PATH`, i.e. destroyed the
+    /// most useful variable in the payload to protect one of the least common.
+    /// `KEY` as a substring would likewise hit `KEYBOARD_LAYOUT`. This test pins
+    /// the whole-token rule that keeps them apart.
+    #[test]
+    fn widening_the_list_did_not_swallow_path_or_other_ordinary_names() {
+        assert!(
+            !looks_secret("PATH"),
+            "PATH contains PAT but is not a token"
+        );
+        assert!(!looks_secret("Path"));
+        assert!(!looks_secret("PATHEXT"));
+        assert!(!looks_secret("KEYBOARD_LAYOUT"));
+        assert!(!looks_secret("PUBLIC_KEY_PATH"));
+        // Real, non-secret variables that a too-eager rule would eat.
+        assert!(!looks_secret("HOME"));
+        assert!(!looks_secret("USERPROFILE"));
+        assert!(!looks_secret("TEMP"));
+        assert!(!looks_secret("COMPUTERNAME"));
+        assert!(!looks_secret("PROCESSOR_ARCHITECTURE"));
+    }
+
+    /// The whole-token rule accepts the abbreviation at any separator boundary,
+    /// not only as a suffix — `MY_PAT_VALUE` is a real shape.
+    #[test]
+    fn a_short_abbreviation_is_matched_as_a_whole_token_anywhere_in_the_name() {
+        assert!(looks_secret("MY_PAT_VALUE"));
+        assert!(looks_secret("pat"));
+        assert!(looks_secret("MY-PWD-VALUE"));
+        // Whole-token means `MYPATVALUE` does NOT match: there is no separator to
+        // bound the token, and the residual gap is documented on `looks_secret`
+        // rather than papered over by a substring rule that would eat `PATH`.
+        assert!(!looks_secret("MYPATVALUE"));
+    }
+
+    /// A false positive only costs a `<redacted>` in a log, so the design accepts
+    /// them — but they should be *stated*, not discovered later as a surprise.
+    #[test]
+    fn false_positives_are_the_safe_direction_and_are_expected() {
+        // Neither of these is a secret; both are redacted on purpose.
+        assert!(looks_secret("TOKENIZER_PATH"));
+        assert!(looks_secret("SSH_AUTH_SOCK"));
+    }
+
+    /// End to end for the reviewer's headline case: the planted value must not
+    /// survive into the payload, which is what actually crosses the wire.
+    #[test]
+    fn a_planted_underscored_api_key_never_reaches_the_payload() {
+        std::env::set_var("VRCXK_TEST_OPENAI_API_KEY", "sk-do-not-leak-me");
+        std::env::set_var("VRCXK_TEST_AWS_ACCESS_KEY_ID", "AKIA-do-not-leak-me");
+        let payload = hello_payload();
+        std::env::remove_var("VRCXK_TEST_OPENAI_API_KEY");
+        std::env::remove_var("VRCXK_TEST_AWS_ACCESS_KEY_ID");
+        assert_eq!(
+            payload["env"]["VRCXK_TEST_OPENAI_API_KEY"],
+            json!("<redacted>")
+        );
+        assert_eq!(
+            payload["env"]["VRCXK_TEST_AWS_ACCESS_KEY_ID"],
+            json!("<redacted>")
+        );
+        // ⚠ And the presence of the key is still answerable: the fix must not
+        // have replaced redaction with omission.
+        assert_eq!(
+            payload["env"]["VRCXK_TEST_OPENAI_API_KEY"],
+            json!("<redacted>"),
+            "the variable must be present-but-redacted, not dropped"
         );
     }
 

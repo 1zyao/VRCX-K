@@ -6,9 +6,6 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "notification:default",
-    "os:default",
-    "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text"
+    "notification:default"
   ]
 }
