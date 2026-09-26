@@ -214,8 +214,15 @@ Our shell already carries the machinery but **no scheme string is set**:
   MEANS; the shell only proves it arrived."
 - `src-tauri/src/lib.rs:172-197` handles second-instance redirect and emits `single-instance-redirect`,
   documenting the plugin behaviour that a missing event means the redirect never arrived.
-- Host side: `host/src/stdio.ts:614-619` (`deepLink.opened` → fanout) and `:646-647` (`onOpen`), plus
-  `host/src/capability.ts:270-276` (`deepLink.register` / `isRegistered`).
+- Host side: `host/src/stdio.ts` (`deepLink.opened` → fanout) and `onOpen`, plus
+  `host/src/capability.ts` — which exposes **`deepLink.isRegistered` only**.
+  ⚠ `deepLink.register` is deliberately NOT exposed to plugins as of the review round
+  that found it: it writes `HKCU\Software\Classes\<scheme>` with no unregister route,
+  so a single call is a persistent machine-wide change this app cannot undo — and the
+  feature it would serve is not wired (no `schemes` in `tauri.conf.json`, so
+  `deepLink.opened` never fires). Exposing it would buy the side effect without the
+  feature. The shell-side route remains and is still validated; see
+  `src-tauri/src/shell_sys.rs`.
 - ⚠ **`src-tauri/tauri.conf.json` contains no `plugins`/deep-link scheme section** → no scheme is
   currently declared, so on macOS/Android/iOS the feature cannot work yet.
 

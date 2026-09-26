@@ -117,6 +117,12 @@ function fakeBridge(seen: string[]): ShellStdioBridge {
 }
 
 describe("capability surface (M2-1)", () => {
+  // `Service` adds own `ctx`/`name`; every other own key is a mirror entry.
+  const keys = (node: object) =>
+    Object.getOwnPropertyNames(node)
+      .filter((key) => key !== "ctx" && key !== "name")
+      .sort()
+
   test("both the curated and raw paths reach the shell and are attributed", async () => {
     const seen: string[] = []
     const audit: string[] = []
@@ -169,11 +175,6 @@ describe("capability surface (M2-1)", () => {
   test('the raw shell mirror enumerates every ShellSysAPI["shell"] method', () => {
     const ctx = new Context()
     createShellCapabilities(ctx, new ShellHandle(() => {}))
-    // `Service` adds own `ctx`/`name`; every other own key is a mirror entry.
-    const keys = (node: object) =>
-      Object.getOwnPropertyNames(node)
-        .filter((key) => key !== "ctx" && key !== "name")
-        .sort()
 
     expect(keys(ctx.shell)).toEqual(
       [
@@ -208,5 +209,38 @@ describe("capability surface (M2-1)", () => {
     expect(keys(ctx.shell.app)).toEqual(["exit", "info"])
     expect(keys(ctx.shell.path)).toEqual(["dir", "resolve"])
     expect(keys(ctx.shell.tray)).toEqual(["setSnapshot"])
+  })
+
+  test("deepLink exposes isRegistered but NOT register, on BOTH layers", () => {
+    // ⚠ THE REMOVAL IS PINNED, on both paths.
+    //
+    // `deepLink.register` writes `HKCU\Software\Classes\<scheme>` and there is no
+    // unregister route, so one call is a PERSISTENT, machine-wide change this app
+    // cannot undo. `HKCU` outranks `HKLM`, so claiming a class that already exists
+    // (measured with `exefile`) would redirect every `.exe` on that machine here.
+    // It is also the wrong half to expose first: the event path is not wired (no
+    // `schemes` in `tauri.conf.json`, so `deepLink.opened` never fires), so the
+    // capability would buy the side effect with none of the feature.
+    //
+    // ⚠ Both assertions matter. `ctx.shell` is the RAW one-for-one mirror and the
+    // curated namespace resolves through the same spec, so a future edit restoring
+    // `register` on either layer must fail here. Asserting only the curated path
+    // would be theatre: the raw mirror reaches the same route one property access
+    // away.
+    const ctx = new Context()
+    createShellCapabilities(ctx, new ShellHandle(() => {}))
+    const deepLink = ctx.shell.deepLink as
+      | { register?: unknown; isRegistered?: unknown }
+      | undefined
+    // The namespace exists at all — otherwise the assertions below would pass by
+    // looking at `undefined`.
+    expect(deepLink, "the deepLink namespace must still exist").toBeDefined()
+    expect(keys(deepLink as object)).toEqual(["isRegistered"])
+    // Reading is harmless and stays, so the assertion above is not vacuous.
+    expect(typeof deepLink?.isRegistered).toBe("function")
+    expect(
+      deepLink?.register,
+      "register must stay removed: it makes an un-undoable machine-wide change",
+    ).toBeUndefined()
   })
 })

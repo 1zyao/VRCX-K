@@ -494,8 +494,17 @@ export type ShellSysAPI = {
       isEnabled(): Promise<boolean>
       setEnabled(enabled: boolean): Promise<{ ok: boolean; error?: string }>
     }
+    /**
+     * ⚠ `register` IS GONE FROM THIS TYPE ON PURPOSE. The shell-side route still
+     * exists (and is still validated — see `shell_sys.rs`), but it is no longer
+     * reachable from a plugin: it writes `HKCU\Software\Classes\<scheme>` with no
+     * unregister route, and the shell's own capability layer dropped it from BOTH
+     * the curated and raw surfaces. Removing it here too keeps the wire type
+     * honest about what the host is allowed to ask for — leaving it declared would
+     * let a future caller "restore" the capability by writing one arrow function,
+     * which is exactly how a deliberate removal gets undone by accident.
+     */
     deepLink?: {
-      register(scheme: string): Promise<{ ok: boolean; scheme: string; error?: string }>
       isRegistered(scheme: string): Promise<boolean>
     }
   }

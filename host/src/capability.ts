@@ -301,10 +301,11 @@ const RAW_SHELL: RawShellSpec = {
         : Promise.resolve({ ok: false, error: "unsupported" }),
   },
   deepLink: {
-    register: (s, scheme) =>
-      s?.deepLink
-        ? s.deepLink.register(scheme)
-        : Promise.resolve({ ok: false, scheme, error: "unsupported" }),
+    // ⚠ NO `register`. Removed alongside the curated form (see
+    // `DeepLinkCapability`) because the raw mirror is the OTHER way to reach the
+    // same shell route — leaving it here would make the narrowing theatre: a
+    // plugin would still be one property access away from a persistent registry
+    // write it cannot undo. Both layers move together or neither does.
     isRegistered: (s, scheme) =>
       s?.deepLink ? s.deepLink.isRegistered(scheme) : Promise.resolve(false),
   },
@@ -358,11 +359,25 @@ export type AutostartCapability = {
 /**
  * Custom URL schemes (desktop only — the shell registers no such route on mobile).
  *
- * Registration works at runtime on Windows/Linux only; macOS requires the scheme
- * in `tauri.conf.json`.
+ * ⚠ `register` IS DELIBERATELY ABSENT. It writes
+ * `HKCU\Software\Classes\<scheme>` and there is no unregister route, so a single
+ * call makes a PERSISTENT, machine-wide change that this application cannot undo
+ * — and `HKCU` outranks `HKLM`, so claiming a class that already exists (measured
+ * with `exefile`) would redirect every `.exe` on the machine to this app.
+ *
+ * ⚠ It is also the wrong half to expose FIRST. The event path is not wired: the
+ * shell calls `deepLink.opened` for inbound URLs, but `tauri.conf.json` declares no
+ * `schemes`, so upstream stops before emitting and nothing ever arrives. Exposing
+ * `register` therefore buys the SIDE EFFECT with none of the FEATURE. Wiring the
+ * four missing pieces (unregister route, `schemes` config, uninstall cleanup, and
+ * a consumer for `opened`) is tracked separately; until then `isRegistered` stays
+ * because reading the current state is harmless and useful for diagnosis.
+ *
+ * The shell-side route still exists and is still validated; it is simply not
+ * reachable from a plugin. See `shell_sys.rs` for the validation and the note on
+ * why `HKCU` collisions matter.
  */
 export type DeepLinkCapability = {
-  register(scheme: string): Promise<{ ok: boolean; scheme: string; error?: string }>
   isRegistered(scheme: string): Promise<boolean>
 }
 
