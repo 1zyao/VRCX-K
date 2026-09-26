@@ -21,16 +21,16 @@
 
 | Question | Answer | Confidence |
 |---|---|---|
-| Can `kkrpc/streaming` carry binary over ws? | **Yes**, byte-exact, both directions | **Definite** (240/240 MiB verified, 4 runtime pairs) |
+| Can `kkrpc/streaming` carry binary over ws? | **Yes**, byte-exact, both directions | **Definite** (56 cells × 3 repeats: 49/51 TCP/WS cells byte-exact in every run, the two exceptions being the json cells; 5/5 UDP cells losing, so the detector works) |
 | Does raw binary work, or is base64 required? | **Raw binary works and is ~1.8x faster.** base64 is NOT required | **Definite** (56 cells × 3 repeats) |
 | Does kkrpc's built-in ws transport work for this? | **No.** It JSON-serialises a `Uint8Array` into `{"0":12,…}` — **11.4x expansion**, **29.7x slower**, and at ≥1 MiB it **fails outright** (6–20 of 64 frames, every run timing out) | **Definite** (arithmetic + measurement) |
-| Do we need a thread pool for file I/O? | **No.** Every async file API keeps the event loop free (≤3.2 ms lag at 1 GiB, vs a 2.6 ms idle floor) | **Definite**, two runtimes |
-| …is there any I/O constraint at all? | **Yes: `Buffer.alloc(N)` is synchronous CPU.** Allocating 1 GiB freezes the loop ~0.25 s ⇒ **allocate in chunks, never `Buffer.alloc(fileSize)`** | **Definite**, two runtimes |
-| Can bulk share the RPC tunnel "at low priority"? | **No.** Interactive RPC p50 goes 0.66 ms → **321 ms** (max 488 ms). A **separate connection** keeps it at 14 ms. ⚠ **Ordering is the finding, not the multiple** — that run had `n<30` in-transfer samples and the file warns against quoting it; a smaller-payload re-run compresses 740x → 2.0x | **Definite** (own probe process) |
-| Is the producer bounded when the consumer stalls? | **Yes**, exactly the credit window: **32 chunks** with nothing drained, vs **2048** ungated (64x) | **Definite** |
-| Folder upload: one request per file, or packed? | **Per-file cost is one full RTT.** At 5 ms RTT that is **320x** slower; it grows linearly | **Definite** (RTT sweep) |
-| Does concurrency help? | **Barely (1.26x)** and it costs memory. Prefer sequential / small batches | **Definite**, 240/240 MiB exact |
-| Does cancellation stop a producer? | **Yes**, promptly, in both gated and raw shapes | **Definite** |
+| Do we need a thread pool for file I/O? | **No.** Every async file API keeps the event loop free — **1.37 ms max lag against a 15.78 ms idle floor, node, 256 MiB** (the lower figures sometimes quoted are the **bun** half, which has **no checked-in artifact** — see §5) | **Definite for node**; **bun unverified** |
+| …is there any I/O constraint at all? | **Yes: `Buffer.alloc(N)` is synchronous CPU.** It froze the loop for **64 ms at 256 MiB** (node, artifact) ⇒ **allocate in chunks, never `Buffer.alloc(fileSize)`** | **Definite for node** (the older "~0.25 s at 1 GiB" is a per-byte extrapolation, not a measurement) |
+| Can bulk share the RPC tunnel "at low priority"? | **No.** Interactive RPC p50 goes 0.66 ms → **321 ms** (max 488 ms). A **separate connection** keeps it at 14 ms. ⚠ **Ordering is the finding, not the multiple** — that run had `n<30` in-transfer samples and the file warns against quoting it; a smaller-payload re-run compresses 740x → 2.0x. ⚠ **The checked-in run is the smaller one, and reports different absolutes again** — see §3 | **Definite** (own probe process) |
+| Is the producer bounded when the consumer stalls? | **Yes**, exactly the credit window: **32 chunks (8 MiB)** after the consumer took one chunk and stopped, vs **256 chunks (64 MiB)** ungated — **8x** | **Definite** |
+| Folder upload: one request per file, or packed? | **Per-file cost is one full RTT.** At 5 ms RTT that is **320x** slower; it grows linearly. ⚠ The **checked-in artifact is a different (loopback) configuration** — 200 files, `--rttMs` unset — so it is NOT the evidence for the RTT table | **Definite** (RTT sweep); **the 200-file 78x ratio is loopback-only** |
+| Does concurrency help? | **In throughput yes — the checked-in run measures 2.17x at 4 levels** — but **budget by memory, not by throughput**. An older 4-level run measured only 1.26x on a different machine; the two runs disagree on the multiple and agree only on the shape | **Provisionally definite** — artifact says 2.17x; the 1.26x run is **not in the repo** and is not reproducible here. Neither figure is re-derivable without re-running |
+| Does cancellation stop a producer? | **Yes**, promptly, in both gated and raw shapes (`0 further chunks after close` in both arms) | **Definite** ([`results/backpressure-report.txt`](results/backpressure-report.txt)) |
 
 **The one hard conclusion that holds regardless of anything else**: **kkrpc's
 built-in ws transport cannot carry binary.** Everything else is a design input.
@@ -110,21 +110,39 @@ duplicates frames" reading was an instrument artifact, not a product risk.
 measuring itself on the receiving client is measuring the wrong thing — its event
 loop is saturated by inbound frames).
 
-| Topology | RPC idle p50 | during p50 | during **max** | vs idle |
+| Topology | RPC idle p50 | during p50 | during **max** | vs idle (max) |
 |---|---|---|---|---|
 | **shared tunnel** | 0.66 ms | **321 ms** | **488 ms** | **740x** |
 | **separate connection** | 0.50 ms | 14.3 ms | 75.3 ms | 151x |
 
-Raw evidence for the run behind this table:
-[`results/priority-report.txt`](results/priority-report.txt). ⚠ That run recorded **`n<30`
-in-transfer samples** — the probe says so itself — which is why the smaller-payload
-re-run quoted below compresses the ratio to 2.0x. Cite the ordering, not the multiple.
+⚠ **The table above is NOT what the checked-in artifact says, and the artifact is
+the smaller re-run this document already warns about.** `results/priority-report.txt`
+is a 64 MiB (`--frames=1024`) run and reports its own numbers:
 
-**A shared tunnel blocks an interactive call for ~half a second.**
+| Topology | RPC idle p50 | during p50 | during max | ratio (from its own verdict) |
+|---|---|---|---|---|
+| shared-tunnel | 0.57 ms | 96.76 ms | 130.67 ms | 170x (n<30) |
+| separate-connection | 0.48 ms | 17.66 ms | 66.69 ms | **37x (n<30)** — verdict line: **"SHARING is 2.0x worse"** |
 
-The 75 ms on the separate path is **not** the socket: it is the measuring
-server's single-threaded send loop, which cannot answer a ping while pushing
-128 MiB. **The sender must yield in slices** regardless of topology.
+So the repo contains **two mutually inconsistent absolute sets** for this
+comparison (488/75.3 ms vs 130.67/66.69 ms), both with `n<30` in-transfer
+samples, and **only the second is checkable from the checked-in evidence**. The
+prose below already resolves this the right way — *cite the ordering, not the
+multiple* — but the top table's absolutes must not be quoted as "the" measurement.
+
+Raw evidence for the second set:
+[`results/priority-report.txt`](results/priority-report.txt). ⚠ That run recorded
+**`n<30` in-transfer samples** — the probe says so itself (`only 0/2 topologies
+produced >=30 in-transfer samples`; during `n=4` in both) — which is why the ratio
+here is 2.0x rather than 740x. **Cite the ordering, not the multiple.**
+
+**The conclusion the evidence supports: a shared tunnel blocks an interactive call
+for tens to hundreds of milliseconds, while a separate connection is an order of
+magnitude better but still not at idle.**
+
+The residual ~67 ms on the separate path is **not** the socket: it is the measuring
+server's single-threaded send loop, which cannot answer a ping while pushing bulk.
+**The sender must yield in slices** regardless of topology.
 
 > Re-running `04-shared-vs-separate.mjs` at a smaller payload (64 MiB, `--frames=1024`)
 > reproduces the ordering but compresses everything — shared max 130.7 ms vs
@@ -142,13 +160,22 @@ Consumer opens the stream, takes **one** chunk, then stops pulling.
 
 | Arm | produced while stalled | implied in-flight | bounded |
 |---|---|---|---|
-| **kkrpc/streaming** | **32 chunks** | **32 MiB** | ✅ |
-| no flow control (control) | 2048 chunks | 2048 MiB | ❌ |
+| **kkrpc/streaming** | **32 chunks** | **8 MiB** | ✅ |
+| no flow control (control) | 256 chunks | 64 MiB | ❌ |
 
-**32 is exactly kkrpc's initial credit constant** (`sendStreamPull(e, 32)` in
-`dist/streaming.js`) — so flow control is real and does the work. Memory while
-streaming a large file is `credit × chunk size`, **not the file size**. That is
-what makes "streaming" true rather than nominal.
+**32 is exactly kkrpc's initial credit constant** — verified against the shipped
+source map, not inferred: `STREAM_CREDIT_WINDOW = 32` and
+`STREAM_CREDIT_REPLENISH = 16` in `dist/streaming.js.map`
+(`sendStreamPull(streamId, STREAM_CREDIT_WINDOW)` on first pull, replenished once
+16 values have been consumed). So flow control is real and does the work. Memory
+while streaming a large file is `credit × chunk size`, **not the file size** — here
+32 × 0.25 MiB = 8 MiB. That is what makes "streaming" true rather than nominal.
+
+⚠ **Corrected from an earlier version of this table, which read `2048 chunks /
+2048 MiB` and `64x`.** Those values were the probe's *default* `--total`, not the
+setting the checked-in run used: the artifact ran with `--chunk=262144` (0.25 MiB)
+and an effective total of 256 chunks. The artifact's own conclusion line —
+`=> gating constrains the producer by 8x` — was right and this document was wrong.
 
 Cancellation: **0 further chunks produced after close**, in both arms.
 
@@ -161,26 +188,44 @@ Cancellation: **0 further chunks produced after close**, in both arms.
 
 ## 5. Event loop: is a thread pool needed?
 
-1 GiB payload, chained 1 ms timer, **two runtimes, two independent processes**:
+Event loop, **two runtimes, two independent processes** (the original claim).
+⚠ **Only the node column is re-derivable from the repo.** The checked-in
+`results/evloop-report.txt` is the **node** half and is a **256 MiB** payload
+(`05-event-loop.mjs` invoked without `--sizeMiB`; the script's default is 1024, so
+the artifact either predates that default or was produced with an explicit flag).
+The **bun** column, and the `1 GiB` this section used to state as its payload, are
+**not backed by any checked-in artifact** — see the note under the table.
 
-| Operation | node max lag | bun max lag |
+| Operation | node max lag (256 MiB, artifact) | bun max lag (unverified, no artifact) |
 |---|---|---|
-| IDLE floor | 16.4 ms | 2.6 ms |
-| **CONTROL `readFileSync`** | **0 samples (frozen 527 ms)** | **0 samples (frozen 532 ms)** |
-| `fs/promises readFile` | 1.8 ms | 2.0 ms |
-| `Bun.file().arrayBuffer()` | — | 2.2 ms |
-| `Bun.file().stream()` chunked | — | 3.2 ms |
-| `handle.write` 8 MiB slices | 16.2 ms (= floor) | 2.6 ms (= floor) |
-| `writeFile` one call | 16.1 ms | 2.3 ms |
-| `createWriteStream` 64 KiB | 16.0 ms | 6.5 ms |
-| **`Buffer.alloc(1 GiB)` + fill (pure CPU)** | **241 ms, 0 samples** | **273 ms, 0 samples** |
+| IDLE floor | 15.78 ms | 2.6 ms (unverified) |
+| **CONTROL `readFileSync`** | **0 samples (frozen 95.7 ms)** | **0 samples (frozen 532 ms)** (unverified) |
+| `fs/promises readFile` | 1.37 ms | 2.0 ms (unverified) |
+| `Bun.file().arrayBuffer()` | — (node cannot run it) | 2.2 ms (unverified) |
+| `Bun.file().stream()` chunked | — (node cannot run it) | 3.2 ms (unverified) |
+| `handle.write` slices | **no checked-in row** (see the note below) | **no checked-in row** |
+| `writeFile` one call | **1.35 ms** | 2.3 ms (unverified) |
+| `createWriteStream` 64 KiB | **no checked-in row** | **no checked-in row** |
+| **`Buffer.alloc` + fill (pure CPU)** | **frozen 64 ms, 0 samples** | **frozen 273 ms, 0 samples** (unverified) |
+
+⚠ **What this table used to claim and why it is now marked.** An earlier version
+listed `handle.write` 8 MiB slices (16.2 / 2.6 ms), `createWriteStream` 64 KiB
+(16.0 / 6.5 ms) and a 1 GiB payload for every row. **The currently checked-in
+`evloop-report.txt` has no `handle.write` row and no `createWriteStream` row at
+all**, and it is 256 MiB, not 1 GiB. Those rows are therefore **not reproducible
+from the repository** — they most plausibly came from a bun-side run of the older
+`evloop.mjs` that §7.3 records as discarded. They are left marked rather than
+deleted, because the constraint they support (§5's conclusion) is independently
+carried by the two `CONTROL` rows. **Settling them needs a bun run of the current
+script plus a re-added slice/write-stream row** — do not quote them as measured.
 
 - Disk measured at **2.4–2.8 GB/s**, network at **0.14–0.26 GB/s** — the disk is
   **~10x faster**, so I/O is not even the throughput bottleneck.
 - **⇒ No thread pool.** Concurrency stays a tuning knob, not a structural need.
-- **But `Buffer.alloc(N)` is synchronous CPU work**: allocating 1 GiB freezes the
-  loop for ~0.25 s ⇒ **read/write in bounded chunks; never allocate the whole
-  file up front.**
+- **But `Buffer.alloc(N)` is synchronous CPU work**: the artifact freezes the loop
+  for **64 ms at 256 MiB** (~275 ms at 1 GiB by the same per-byte cost, which is
+  where the old "~0.25 s" figure came from) ⇒ **read/write in bounded chunks;
+  never allocate the whole file up front.**
 
 > A BLOCKING call produces **ZERO** lag samples, not many — the timer never fires
 > while the loop is frozen. The first version read `null` as "no lag" and then as
@@ -208,6 +253,24 @@ Cancellation: **0 further chunks produced after close**, in both arms.
 Loopback hides this because RTT ≈ 0. On a real link the cost is **88–632x** and
 grows linearly with file count.
 
+⚠ **The checked-in artifact is a different configuration and must not be read as
+the evidence for the table above.** `results/folder-report.txt` is a **loopback**
+run — 200 files × 4096 B, `--rttMs` unset — and it reports `packed is 78.26x the
+speed of one-request-per-file` at 66 files/s. Note **both loops are hidden**: the
+`66 files/s` is itself a loopback artifact (the artifact separately extrapolates
+`10,000 files … ~151.5s one-by-one`), and **78.26x does not correspond to any row
+above** — the 1000-file / 0 ms cell measured **4.3x**. The two loopback runs
+disagree, most plausibly because the packed arm's terminator wait dominates at
+200 files (13 frames) in a way it does not at 1000. **Do not quote 78.26x beside
+the RTT ratios**; it is a small-folder, no-injected-RTT measurement.
+**The 1/5/20/50 ms rows above are not independently
+re-derivable from anything in `results/`** — they would need
+`06-folder-upload.mjs --files=1000 --rttMs=<n>` re-run.
+
+Note also that the probe's `--rttMs` is an **injected server-side delay, not a
+network** (§8): it models the cost of a round trip without modelling a real link,
+so treat these ratios as a cost model rather than a measurement of any network.
+
 **Three shapes, and the recommendation is the middle one:**
 
 | Shape | Requests | Strength | Cost |
@@ -219,26 +282,66 @@ grows linearly with file count.
 **Do not give the hands a "packing skill."** §5 shows the shell's I/O is not the
 bottleneck, and packing would bind archive format, progress semantics and resume
 into the shell. Directory walking, batch sizing and retry are **business policy
-and belong in the brain (`host/`)**, which needs only two stateless primitives
-from the hands: read one file, write one file.
+and belong in the brain (`host/`)**, which needs only stateless primitives from
+the hands: read one file, write one file.
+
+⚠ **This paragraph used to say "two stateless primitives", and that count is now
+wrong in a way that matters.** The hands ship **five** — `stat` / `read` / `write` /
+`watch` / **`list`** — because **enumeration had to become a capability too**: "walk
+the directory in the brain" presumes the brain can reach that disk, and this whole
+capability exists for the case where it cannot. `list` lists **one** directory,
+non-recursively, unfiltered; **recursion, patterns, sorting and batching stay
+policy**. See [`../../hands-capability-proposal.md`](../../hands-capability-proposal.md)
+§1.1, which records the correction and the direct measurement behind it
+(`stat(dir)` returns no entries; `read(dir)` raises `EISDIR`). **This does not
+change the §6 conclusion** — packing still belongs in the brain — but the
+reasoning must not rest on a primitive count that is no longer true.
 
 ---
 
 ## 7. Concurrency, and what was thrown away
 
-### 7.1 Concurrency buys little
+### 7.1 Concurrency buys throughput — and costs memory
 
-One connection **per transfer**, 240/240 MiB byte-exact:
+⚠ **This section was inverted relative to its own artifact.** It used to report
+**"1.26x at best ⇒ sequential or small batches"**. The only concurrency artifact in
+the repo, `results/conc2-report.txt`, says the opposite: `scaling vs level 1 :
+2.17x` and its own conclusion line reads **"parallelism DOES raise aggregate
+throughput, so it is worth offering"**. The document also printed a 4-level table
+(1/2/4/8 at 240 MiB) while the artifact ran **two levels** (1 and 4) at 16 MiB per
+transfer. Corrected to the artifact below.
 
-| level | exact | wall | aggregate | heap delta | interference |
-|---|---|---|---|---|---|
-| 1 | 1/1 | 55 ms | 290.8 MB/s | +12.8 MiB | 0 ms |
-| 2 | 2/2 | 95 ms | 337.5 MB/s | +18.2 MiB | 4 ms |
-| 4 | 4/4 | 175 ms | **366.2 MB/s** | +23.3 MiB | 8 ms |
-| 8 | 8/8 | 358 ms | 357.1 MB/s | +18.1 MiB | 19 ms |
+`07-concurrency.mjs`, one connection **per transfer**, verifier = the client
+(`results/conc2-report.txt`, 4 MiB per file = 64 × 64 KiB, node v24.9.0):
 
-**1.26x at best**, memory rising with level ⇒ sequential or small batches, and
-spend the effort on progress/resume instead.
+| level | exact | wall | aggregate | fastest/slowest | heap delta | verified |
+|---|---|---|---|---|---|---|
+| 1 | 1/1 | 56 ms | 72 MB/s | 26 / 26 ms | +3.1 MiB | 4/4 MiB |
+| 4 | 4/4 | 102 ms | **156.4 MB/s** | 41 / 94 ms | +0.8 MiB | 16/16 MiB |
+
+**2.17x at 4 levels.** The recommendation follows from the artifact's own verdict,
+which is a *memory-budget* argument rather than a "don't parallelise" one:
+
+> Budget by MEMORY, not by throughput: each stream costs buffers, and the heap
+> delta above is the price per level on this machine.
+
+⚠ **What is not settled, and must not be quoted.** An older run of this probe
+reported a **1.26x** best case and a 4-level table topping out at **366.2 MB/s**
+with a **+23.3 MiB** heap delta at level 4. **That run is not in the repo** (no
+`conc2-report.txt` matches it; `results/README.md` repeated its conclusion) and its
+numbers are **not reproducible from anything checked in**. Two runs on two
+machines disagree on the multiple (1.26x vs 2.17x) while agreeing on the shape
+(level 1 is the baseline; aggregate rises with level; memory is the real cost).
+**Which is right cannot be decided here** — settling it needs
+`node docs/probes/transport-lab/07-concurrency.mjs --sizeMiB=16` re-run on the
+current machine, with the level set stated. Note also that the two runs differ in
+level depth (1/2/4/8 vs 1/4), so they are **not** a like-for-like comparison even
+before the machine difference.
+
+Also note the artifact's own caveat, which the 4-level table obscures: **heap delta
+was LOWER at level 4 (+0.8 MiB) than at level 1 (+3.1 MiB)** here, so this single
+run does not by itself demonstrate the "memory rises with level" claim either.
+Interference rose as expected (L1 = 0 ms, L4 = 53 ms).
 
 ### 7.2 Two failures that were mine, and the patterns they reveal
 
@@ -342,8 +445,23 @@ And one thing it does **NOT** settle:
 - **Not measured at all**: resume after interruption; progress-reporting
   granularity and its cost; binding a stream's life to `ctx.effect` so a plugin
   unload tears it down; Android `content://` (a real device returns an opaque URI
-  from `pickFile`, not a path, and that has never been verified); the hands have
-  **no file I/O primitive in `src-tauri` yet**.
+  from `pickFile`, not a path, and that has never been verified).
+- ~~the hands have **no file I/O primitive in `src-tauri` yet**~~ — **this is no
+  longer true and the sentence is struck rather than deleted so the change is
+  visible.** The hands now ship **five** file primitives —
+  `hands.stat` / `hands.read` / `hands.write` / `hands.watch` / **`hands.list`** —
+  in `src-tauri/src/hands.rs`, with `register_hands_handlers` wiring them onto a
+  `Peer`. They are driven end-to-end over real OS pipes with the real production
+  modules by [`../hands-e2e/run.mjs`](../hands-e2e/run.mjs) (its own driver is
+  `src-tauri/examples/hands-e2e.rs`), and the capability surface is specified in
+  [`../../hands-capability-proposal.md`](../../hands-capability-proposal.md).
+  ⚠ **The five-primitive count is a correction of this document's older claim of
+  "four"**: enumeration had to become a capability too, because "directory walking
+  belongs in the brain" only holds when the brain can reach that disk at all —
+  which is exactly what this capability exists to avoid. See that proposal's §1.1.
+  ⚠ Everything that *consumes* these primitives over the real bridge is still
+  measured elsewhere, not here: this lab measures **transport**, and the bridge's
+  own end-to-end results live in `../hands-e2e/` and `../hand-io/`.
 - **The earlier in-process anomalies were never explained.** They did not
   reproduce across processes, and the instruments that produced them are gone.
   This is recorded rather than quietly dropped, because "we could not reproduce

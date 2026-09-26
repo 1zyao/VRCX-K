@@ -201,7 +201,7 @@ sources — it cannot drift from what ships.
 
 ```bash
 cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e
-node docs/probes/hands-e2e/run.mjs      # 9/9 checks, ~2 s
+node docs/probes/hands-e2e/run.mjs      # 10/10 checks, ~2 s
 ```
 
 It is driven by the real `kkrpc` 2.1.0 `StreamingRPCChannel`, so a pass means our

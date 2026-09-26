@@ -15,7 +15,8 @@
 //   4. `hands.write` consumes a host-produced stream and reports the byte count.
 //   5. `hands.watch` delivers an event for a file that did NOT exist at start
 //      (the parent-directory fallback), and stops when the stream is returned.
-//   6. Backpressure: the producer stops when the consumer stops pulling.
+//   6. Backpressure/cancellation: after the consumer abandons a stream, nothing
+//      further arrives on it (observed on the wire, not assumed).
 //
 // Usage:
 //   cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e
@@ -46,12 +47,19 @@ const BIN = join(
 )
 
 const results = []
+/**
+ * How long §6 watches for data that must NOT arrive after the consumer stops
+ * pulling. Long enough to dwarf a full transfer on this machine (~24 ms for the
+ * 4 MiB file), short enough not to slow the probe down.
+ */
+const CANCEL_QUIET_MS = 1500
 function check(name, pass, detail) {
   results.push({ name, pass, detail })
   console.log(`   ${pass ? "PASS" : "FAIL"}  ${name}${detail ? `\n         ${detail}` : ""}`)
 }
 
 const sha256 = (buffer) => createHash("sha256").update(buffer).digest("hex")
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**
  * A transport over the child's real pipes.
@@ -92,11 +100,31 @@ function childTransport(child) {
 
 const work = mkdtempSync(join(tmpdir(), "hands-e2e-"))
 const child = spawn(BIN, [], { stdio: ["pipe", "pipe", "inherit"] })
-const channel = new StreamingRPCChannel(childTransport(child), {
+const transport = childTransport(child)
+const channel = new StreamingRPCChannel(transport, {
   timeout: 60_000,
   onClose: (reason) => console.log(`   [channel closed] ${reason ?? "clean"}`),
 })
 const hands = channel.getAPI()
+
+/**
+ * Every frame the Rust peer sent, with its arrival time.
+ *
+ * Section 6 uses this to LOOK for data arriving after the consumer stopped
+ * pulling. Without it the only available evidence is "the loop returned", which
+ * says nothing about the producer — and a check that cannot observe the failure
+ * it names is not a check.
+ */
+const frames = []
+transport.subscribe((message) => {
+  frames.push({ at: performance.now(), message })
+})
+
+/** The stream id from a `__kkrpc_next_stream__` reply, or null for any other frame. */
+const streamRefId = (message) =>
+  message?.v?.["__kkrpc_next_stream__"] === "async-iterable" && typeof message.v.id === "string"
+    ? message.v.id
+    : null
 
 try {
   console.log(`Rust hands peer: ${BIN}\n`)
@@ -213,13 +241,73 @@ try {
   )
 
   // ---- 6. cancellation must stop the producer ----------------------------
+  //
+  // The claim is not "the loop returned" — that happens whether or not the peer
+  // keeps pushing. The claim is that the producer STOPS: no further data for
+  // this stream, even though the file has many chunks left.
+  //
+  // Measured on the wire, and shaped around what the instrument can actually
+  // see (both facts measured on this machine, not assumed):
+  //   · the opening reply names the stream, so the abandoned stream is
+  //     identifiable in the frame stream;
+  //   · the in-flight chunk has already LANDED by the time `break` returns, so
+  //     "frames after the return timestamp" is 0 either way and would be a
+  //     vacuous criterion.
+  //
+  // So the criterion is the one with discriminating power: the total number of
+  // data frames that ever arrive for the abandoned stream must stay far below
+  // the chunk count the SAME file produced in §2, and must not grow at all
+  // during a quiet window that dwarfs a full transfer (~24 ms measured in §2).
+  // A peer that ignored the release would push on towards the credit window.
+  //
+  // `firstChunkAt` keeps the detector honest in the other direction: it proves
+  // the collector DOES register frames arriving after a cutoff, so the flat
+  // reading below is a stopped producer rather than a blind counter.
   console.log("\n6. early termination")
+  frames.length = 0
   let seen = 0
+  let abandonedId = null
+  let firstChunkAt = null
   for await (const _chunk of hands.hands.read(sourcePath)) {
     seen++
+    firstChunkAt ??= performance.now()
+    if (abandonedId === null) {
+      // The opening reply names the stream, and it must arrive before the first
+      // chunk can be delivered.
+      for (const frame of frames) {
+        const id = streamRefId(frame.message)
+        if (id !== null) abandonedId = id
+      }
+    }
     if (seen >= 1) break
   }
-  check("breaking a stream returns control instead of hanging", true, `took ${seen} chunk(s), then returned`)
+  const returnedAfterMs = performance.now() - firstChunkAt
+
+  // Data frames only. A terminal/ack frame for this sid is the peer answering
+  // the release, which is correct behaviour and not a straggler.
+  const dataFramesFor = (sid) =>
+    frames.filter((frame) => frame.message?.sid === sid && frame.message?.d === false)
+  const atRelease = abandonedId === null ? 0 : dataFramesFor(abandonedId).length
+  await sleep(CANCEL_QUIET_MS)
+  const afterQuiet = abandonedId === null ? 0 : dataFramesFor(abandonedId).length
+  const afterFirstChunk =
+    abandonedId === null
+      ? 0
+      : dataFramesFor(abandonedId).filter((frame) => frame.at > firstChunkAt).length
+
+  check(
+    "the abandoned stream is identified on the wire",
+    abandonedId !== null,
+    abandonedId === null ? "no __kkrpc_next_stream__ reply was observed" : `sid=${abandonedId}`,
+  )
+  check(
+    "the producer stops: the abandoned stream never reaches the file's chunk count",
+    abandonedId !== null && seen >= 1 && afterQuiet === atRelease && afterQuiet < chunks,
+    `took ${seen} chunk(s) in ${returnedAfterMs.toFixed(0)} ms; data frames for sid=${abandonedId}: ` +
+      `${atRelease} at release, ${afterQuiet} after a further ${CANCEL_QUIET_MS} ms ` +
+      `(growth ${afterQuiet - atRelease}, want 0) — the same file produced ${chunks} chunks in §2, ` +
+      `and ${afterFirstChunk} frame(s) DID arrive after the first chunk, so the counter is not blind`,
+  )
 } catch (error) {
   check("the run completed without throwing", false, String(error?.stack ?? error))
 } finally {
