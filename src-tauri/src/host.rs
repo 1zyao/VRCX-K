@@ -1010,8 +1010,33 @@ fn watch_until_exit(state: &HostState, rx: &Receiver<HostCommand>) -> WatchOutco
             // deliberate: `HostState` is held as Tauri state, not behind an `Arc`, so
             // it cannot be captured by that callback's `'static` bound, and inventing
             // a channel to work around it would add a second source of truth for
-            // liveness. The decision itself lives in `note_bridge_failure` so it can
-            // be tested without a real dead reader.
+            // liveness.
+            //
+            // ⚠ IT ONLY RECORDS. IT DOES NOT DECIDE THE OUTCOME, and that restraint is
+            // the fix for a real hang rather than a style choice. This block used to
+            // return `WatchOutcome::StdioLost` whenever the reader reported a clean
+            // EOF, on the reasoning that a dead transport means a dying child. That
+            // reasoning was wrong in a way that cost 28 minutes of CI:
+            //
+            //   * `StdioLost` is defined by an EXIT CODE (`HOST_STDIO_LOST_EXIT`), and
+            //     its whole purpose is to be exempt from the restart-storm budget
+            //     ("not the host's fault"). Choosing it from a transport EOF — an
+            //     observation that carries NO exit code — claims that exemption
+            //     without the evidence for it.
+            //   * Every host exit closes stdout, so exit 51 (a deliberate restart
+            //     request) also surfaced here as `Closed`. Returning `StdioLost`
+            //     therefore skipped `note_exit`, the storm cap was never reached, and
+            //     the supervisor relaunched forever. The test that asserts the cap
+            //     (`exit_51_loop_inside_stable_window_...`) blocked in `thread::scope`'s
+            //     join until the job's 30-minute wall killed it.
+            //   * Note the short-circuit bought nothing even in the good case: stdout
+            //     EOF means the child has closed it, so `try_wait` above observes the
+            //     exit on its own. It saved no latency and created a race — one that
+            //     passed on the previous run and hung on this one.
+            //
+            // So the exit code stays the authority: `try_wait` classifies this
+            // generation, exactly as it did before this block existed. Keep it that
+            // way — do not reintroduce a return here.
             let bridge = inner
                 .peer
                 .as_ref()
@@ -1022,10 +1047,7 @@ fn watch_until_exit(state: &HostState, rx: &Receiver<HostCommand>) -> WatchOutco
                     inner.bridge_failure_recorded = true;
                 }
                 drop(inner);
-                let verdict = note_bridge_failure(state, failure, already_recorded);
-                if verdict == BridgeFailureVerdict::TransportClosed {
-                    return WatchOutcome::StdioLost;
-                }
+                note_bridge_failure(state, failure, already_recorded);
                 inner = state.inner.lock().expect("host");
             }
         }
@@ -1033,30 +1055,23 @@ fn watch_until_exit(state: &HostState, rx: &Receiver<HostCommand>) -> WatchOutco
     }
 }
 
-/// What the supervisor should do about a published bridge-reader failure.
+/// Record a bridge-reader failure into the snapshot, and nothing else.
 ///
-/// Extracted from `watch_until_exit` so the judgement is testable without a real
-/// dead reader thread (the peer's publisher is private, and building a `Peer` that
-/// fails on demand would test the scaffolding rather than the decision).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BridgeFailureVerdict {
-    /// The reader stopped but the process may well be alive. The reason is recorded
-    /// so the SNAPSHOT carries it; keep watching the child, because its exit code is
-    /// better evidence than a dead stdout and the normal path will handle it.
-    KeepWatching,
-    /// The reader saw a clean EOF, so the transport is gone and the child is on its
-    /// way out. Hand back to the exit path rather than waiting for `try_wait`.
-    TransportClosed,
-}
-
-/// Record a bridge-reader failure into the snapshot and say what to do next.
+/// ⚠ This function deliberately returns NOTHING. It records the reason so the
+/// SNAPSHOT carries it; it does not decide the generation's outcome, because the
+/// exit code is the authority for that and this observation carries none. A
+/// previous version returned a verdict — `TransportClosed` on a clean EOF — and
+/// the caller turned that into `WatchOutcome::StdioLost`. That skipped the
+/// restart-storm accounting (see `watch_until_exit`), so a deliberate exit 51 was
+/// never billed, the cap was never reached, and a test blocked until CI killed the
+/// job 28 minutes later. Keep this a report.
 ///
-/// ⚠ Records the reason but does NOT declare the host `Failed`. A stopped reader is
-/// not proof the process died — `LinkFailure::Read` explicitly means the child may
-/// be alive with a broken stdout — and forcing `Failed` here would race the
-/// supervisor's own restart logic. `record_spawn_error` is the existing mechanism
-/// for "the cause must reach the snapshot", so the condition becomes visible
-/// without this code claiming more than it can see.
+/// ⚠ It also does NOT declare the host `Failed`: a stopped reader is not proof the
+/// process died — `LinkFailure::Read` explicitly means the child may be alive with a
+/// broken stdout — and forcing `Failed` here would race the supervisor's own restart
+/// logic. `record_spawn_error` is the existing mechanism for "the cause must reach
+/// the snapshot", so the condition becomes visible without this code claiming more
+/// than it can see.
 ///
 /// `already_recorded` is the per-generation latch: `link_failure()` is monotonic
 /// (the first failure wins), so without it a 30 ms poll would rewrite `last_error`
@@ -1065,15 +1080,9 @@ fn note_bridge_failure(
     state: &HostState,
     failure: crate::kkrpc_peer::LinkFailure,
     already_recorded: bool,
-) -> BridgeFailureVerdict {
-    let closed = matches!(failure, crate::kkrpc_peer::LinkFailure::Closed);
+) {
     if !already_recorded {
         state.record_spawn_error(&format!("host bridge reader stopped: {failure:?}"));
-    }
-    if closed {
-        BridgeFailureVerdict::TransportClosed
-    } else {
-        BridgeFailureVerdict::KeepWatching
     }
 }
 
@@ -2212,7 +2221,7 @@ mod tests {
         // death (\`LinkFailure::Read\` means the child may be alive with a broken
         // stdout), and declaring it dead here would race the restart logic.
         let state = storm_state(Duration::from_secs(30), 3);
-        let verdict = note_bridge_failure(
+        note_bridge_failure(
             &state,
             crate::kkrpc_peer::LinkFailure::Read {
                 kind: std::io::ErrorKind::BrokenPipe,
@@ -2221,11 +2230,9 @@ mod tests {
             },
             false,
         );
-        assert_eq!(
-            verdict,
-            BridgeFailureVerdict::KeepWatching,
-            "a read failure is not proof the process died; keep watching its exit code"
-        );
+        // No verdict to assert any more: the function reports and returns nothing, so
+        // that the exit code keeps sole authority over the outcome. What matters here
+        // is that the reason reached the snapshot and that nothing was declared dead.
         let snapshot = state.lifecycle_snapshot();
         let reason = snapshot
             .last_error
@@ -2243,17 +2250,56 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_transport_hands_back_to_the_exit_path() {
-        // The other half: a clean EOF means the transport is gone and the child is on
-        // its way out, so the supervisor should stop waiting on \`try_wait\` and let the
-        // normal exit path decide. That path knows the exit CODE, which is better
-        // evidence than a dead stdout.
+    fn a_closed_transport_is_recorded_and_the_exit_code_still_decides_the_outcome() {
+        // ⚠ THE REGRESSION FOR A 28-MINUTE CI HANG, and it was MY bug.
+        //
+        // A clean EOF used to make the supervisor return `WatchOutcome::StdioLost`
+        // straight away. That is wrong on two counts, and both are pinned here:
+        //
+        //   1. `StdioLost` is defined by an EXIT CODE (`HOST_STDIO_LOST_EXIT`) whose
+        //      entire purpose is exemption from the restart-storm budget. Choosing it
+        //      from a transport EOF — which carries no exit code — claims an exemption
+        //      without the evidence for it.
+        //   2. Every host exit closes stdout, so a deliberate exit 51 was ALSO seen
+        //      here as `Closed`. Returning `StdioLost` skipped `note_exit`, the storm
+        //      cap was never reached, and the supervisor relaunched forever.
+        //
+        // The hang itself was the join in `thread::scope`: the test that asserts the
+        // cap panicked on the phase while the scope still had to join a supervisor
+        // that never stopped, so the job's 30-minute wall killed it. This test is
+        // deterministic ON PURPOSE — the bug was a RACE (it passed on the previous run
+        // and hung on the next), so "I ran it six times and it passed" is not evidence.
         let state = storm_state(Duration::from_secs(30), 3);
-        assert_eq!(
-            note_bridge_failure(&state, crate::kkrpc_peer::LinkFailure::Closed, false),
-            BridgeFailureVerdict::TransportClosed
+
+        // The report is still recorded: that is the whole point of polling.
+        note_bridge_failure(&state, crate::kkrpc_peer::LinkFailure::Closed, false);
+        let recorded = state
+            .lifecycle_snapshot()
+            .last_error
+            .expect("the cause must still reach the snapshot");
+        assert!(
+            recorded.contains("Closed"),
+            "the recorded reason should name the failure kind: {recorded}"
         );
-        assert!(state.lifecycle_snapshot().last_error.is_some());
+
+        // ⚠ And the OUTCOME is still the exit code's to decide. Reaching the storm cap
+        // is what broke, so assert the classification directly: exit 51 must be a
+        // billable restart request, never the exempt path.
+        assert!(
+            matches!(
+                classify_exit_code(Some(HOST_RESTART_EXIT)),
+                WatchOutcome::RestartRequested
+            ),
+            "a deliberate restart request must stay billable, whatever the reader saw"
+        );
+        assert!(
+            !matches!(
+                classify_exit_code(Some(HOST_RESTART_EXIT)),
+                WatchOutcome::StdioLost
+            ),
+            "⚠ exit {HOST_RESTART_EXIT} must never take the exempt path: that is the \
+             exemption a transport EOF has no evidence to award"
+        );
     }
 
     #[test]

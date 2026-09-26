@@ -232,7 +232,8 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
-      # Build the hands end-to-end peer BEFORE the JS tests.
+      # Build the hands end-to-end peer BEFORE the JS tests, and HAND THE PATH
+      # OVER rather than letting the test discover it.
       #
       # `host/tests/hands-e2e-integration.test.ts` spawns this binary to drive
       # the real `HandsService` against the real Rust file primitives over real
@@ -240,18 +241,45 @@ jobs:
       # imports `tauri_app_lib::{hands, kkrpc_peer, hands_hello}`, so it is
       # production code reached through the crate boundary, not a copy.
       #
-      # ⚠ `cargo test` (below) also compiles examples, so a broken example fails
+      # ⚠ `cargo test` (above) also compiles examples, so a broken example fails
       # the Rust test step too. This explicit build is what produces the RELEASE
       # binary the JS tests spawn — `cargo test` builds the debug profile.
+      #
+      # ⚠ WHY THE PATH IS EXPORTED INSTEAD OF PROBED (the reason this step is
+      # ordered here and not "fixed" in the test). A test cannot tell whether the
+      # file it finds is the artifact THIS run built: `existsSync` is equally true
+      # for a stale binary left by an earlier build. That is not hypothetical — a
+      # local "17/17 pass" was a FALSE GREEN because
+      # `target/release/examples/hands-e2e.exe` predated the source change under
+      # test, and the stale binary happened to satisfy the stale expectation too.
+      # CI rebuilds from source every run, so it never saw the mismatch; the
+      # ordering contract below is what makes that explicit rather than lucky.
       #
       # ⚠ Without this step those tests SKIP, and a skip is not a pass: the
       # first CI run of them reported "8 tests skipped" on a green job. That is
       # exactly the "green that hides the gap" failure this suite exists to
-      # prevent, so the tests also require the artifact when
-      # `VRCXK_REQUIRE_HANDS_E2E=1` (set below) — a missing binary is then a
-      # FAILURE rather than a silent skip.
+      # prevent. `VRCXK_HANDS_E2E_BIN` therefore travels WITH the artifact: an
+      # empty path afterwards is reported as a PIPELINE defect, and
+      # `VRCXK_REQUIRE_HANDS_E2E=1` still turns any other absence into a failure
+      # rather than a silent skip.
       - name: Build hands e2e peer (for the integration test)
-        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e
+        id: hands_e2e
+        # ⚠ `shell: bash` IS REQUIRED, not decoration. This block is POSIX
+        # (`VAR=value`, `[ ... ]`, `test -f`, `{...;}`), and GitHub's default shell
+        # on `windows-latest` is **pwsh**, which rejects every one of those — `BIN=x`
+        # fails with "not recognized as a cmdlet". Measured: the three Linux/macOS
+        # jobs passed this step while Windows never reached it, so the breakage was
+        # invisible until the Windows job's turn. GitHub ships Git Bash on Windows
+        # runners, and this is also consistent with the existing
+        # `run: bash scripts/android-*.sh` steps: when a step needs POSIX, say so
+        # instead of writing shell-agnostic contortions.
+        shell: bash
+        run: |
+          cargo build --release --locked --manifest-path src-tauri/Cargo.toml --example hands-e2e
+          BIN="target/release/examples/hands-e2e"
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
+          test -f "$BIN" || { echo "::error::built nothing at $BIN"; exit 1; }
+          echo "VRCXK_HANDS_E2E_BIN=$BIN" >> "$GITHUB_ENV"
 
       - name: Bun tests (frontend + host)
         run: bun run test

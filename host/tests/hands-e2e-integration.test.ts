@@ -45,7 +45,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { type ChildProcess, spawn } from "node:child_process"
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join, resolve } from "node:path"
 import { Context } from "cordis"
 import { stdioJsonTransport } from "kkrpc/stdio"
 import { StreamingRPCChannel } from "kkrpc/streaming"
@@ -62,13 +62,43 @@ const repoRoot = join(import.meta.dir, "..", "..")
 // `cargo build --release --example hands-e2e` from the root puts it in
 // <root>/target/release/examples/. It used to be a standalone probe crate at
 // docs/probes/hands-e2e/rust/ with its own target tree.
-const BIN = join(
+const DEFAULT_BIN = join(
   repoRoot,
   "target",
   "release",
   "examples",
   process.platform === "win32" ? "hands-e2e.exe" : "hands-e2e",
 )
+
+/**
+ * The artifact the BUILD STEP handed over, if it did.
+ *
+ * ⚠ This exists so the test does not have to decide, by looking at the disk,
+ * whether the thing it is about to exercise is the artifact this run built. That
+ * question cannot be answered by a test: `existsSync` says "some binary is there",
+ * which is true for a stale one, a half-written one, or one built from different
+ * sources. Measured the hard way — a local `17/17 pass` was a FALSE GREEN because
+ * `target/release/examples/hands-e2e.exe` predated the source change it was
+ * supposed to validate, and the expectation it satisfied was the stale one too.
+ *
+ * So the pipeline builds first and passes the path (see `build.yml`); when the
+ * variable is set, its presence is a CONTRACT rather than a probe, and a missing
+ * file at that path is a hard failure — never a skip. Unset means a local run, and
+ * the conventional path plus the skip below still applies, because a clean
+ * checkout has no `target/` and an unbuildable prerequisite should not block
+ * unrelated work.
+ */
+const handedOverBin = process.env.VRCXK_HANDS_E2E_BIN
+// ⚠ Resolved against `repoRoot`, NEVER against the process cwd. `bun run test`
+// runs this file with `--cwd host`, so a relative path from the pipeline would
+// otherwise land in `host/target/...` — a directory that does not exist, which
+// would surface as "the pipeline built nothing" and send the next reader to the
+// wrong file entirely. Measured: that is exactly what happened the first time.
+const BIN = handedOverBin
+  ? isAbsolute(handedOverBin)
+    ? handedOverBin
+    : resolve(repoRoot, handedOverBin)
+  : DEFAULT_BIN
 
 let binaryAvailable = true
 try {
@@ -89,6 +119,20 @@ try {
  * `target/` and an unbuildable prerequisite should not block unrelated work.
  */
 const requireBinary = process.env.VRCXK_REQUIRE_HANDS_E2E === "1"
+
+if (!binaryAvailable && handedOverBin) {
+  // ⚠ A HANDED-OVER PATH THAT IS EMPTY IS A PIPELINE FAILURE, and it is reported
+  // as one. `VRCXK_HANDS_E2E_BIN` is set by the build step in `build.yml`, so if
+  // the file is not there afterwards the ordering is wrong or the build step did
+  // not run — a defect in the pipeline, not a missing local prerequisite. Naming
+  // the pipeline keeps this from being read as "run cargo build yourself", which
+  // is the wrong fix and would hide the real one.
+  throw new Error(
+    `[hands-e2e-integration] the build step handed over ${BIN} but it is not ` +
+      `there — the pipeline built nothing, or built it elsewhere. Fix the STEP ` +
+      `ORDER in .github/workflows/build.yml (build before the test), not this file.`,
+  )
+}
 
 if (!binaryAvailable && requireBinary) {
   // Thrown at module scope so the failure names the missing prerequisite
