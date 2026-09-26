@@ -175,9 +175,43 @@ export type HandsServiceOptions = {
  * this keeps working if the transport ever gains a binary carrier — the
  * alternative is a silent mis-read the day that lands.
  */
+/**
+ * Strict base64, matching what the SHELL already does.
+ *
+ * ⚠ `Buffer.from(value, "base64")` NEVER throws — it decodes whatever it can and
+ * silently drops the rest. Measured:
+ *
+ *     "!!!not-base64!!!"  -> 7 bytes (garbage)   "日本語" -> 0 bytes
+ *     "AAE" (len 3)       -> 2 bytes             "a"      -> 0 bytes
+ *     "QUJD!"             -> 3 bytes             "  QUJD  " -> 3 bytes
+ *
+ * So an illegal carrier became garbage written to a FILE, or an empty chunk, with
+ * no error anywhere — while `kkrpc_peer.rs`'s `decode_chunk` rejects the same
+ * input with `bad base64 chunk`. The discipline was half-applied: the shell
+ * refused what the host accepted, so a corrupt frame was caught in one direction
+ * and silently written in the other.
+ *
+ * The regex is the RFC 4648 alphabet with correct padding, and it also rejects
+ * whitespace and stray characters that `Buffer.from` tolerates. Length is checked
+ * because `"AAE"` is not a legal encoding of anything — the standard requires
+ * whole 4-character groups.
+ */
+const BASE64_STRICT = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+
 export function decodeChunk(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) return value
-  if (typeof value === "string") return new Uint8Array(Buffer.from(value, "base64"))
+  if (typeof value === "string") {
+    if (!BASE64_STRICT.test(value)) {
+      // Name the length, not the content: this string IS the payload, and echoing
+      // it into a log or an error message is how a file's bytes end up somewhere
+      // they were never meant to be.
+      throw new HandsError(
+        `EUNSUPPORTED: chunk is not valid base64 (${value.length} characters); ` +
+          "the shell sends standard base64 with padding",
+      )
+    }
+    return new Uint8Array(Buffer.from(value, "base64"))
+  }
   throw new HandsError("EUNSUPPORTED: unrecognised chunk shape from the shell")
 }
 

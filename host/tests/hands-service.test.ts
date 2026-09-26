@@ -163,6 +163,37 @@ describe("chunk decoding", () => {
     expect(() => decodeChunk(42)).toThrow(HandsError)
   })
 
+  test("malformed base64 is REFUSED instead of silently decoded", () => {
+    // ⚠ THE HALF-DISCIPLINE REGRESSION. `Buffer.from(v, "base64")` never throws —
+    // it decodes what it can and drops the rest. Measured before this fix:
+    //   "!!!not-base64!!!" -> 7 bytes of garbage   "日本語" -> 0 bytes
+    //   "AAE" (length 3)   -> 2 bytes              "a"      -> 0 bytes
+    // So an illegal carrier became bytes written to a FILE, or an empty chunk,
+    // with no error anywhere — while the shell's own `decode_chunk` rejects the
+    // same input with `bad base64 chunk`. The shell refused what the host
+    // accepted, so corruption was caught in one direction and written in the
+    // other.
+    for (const bad of [
+      "!!!not-base64!!!", // non-alphabet characters
+      "日本語", // non-ASCII
+      "AAE", // length 3 is not a legal group
+      "a", // length 1
+      "====", // padding with no data
+      "QUJD!", // trailing junk after a valid group
+      "  QUJD  ", // whitespace, which Buffer.from silently trims
+    ]) {
+      expect(() => decodeChunk(bad), `should refuse ${JSON.stringify(bad)}`).toThrow(HandsError)
+    }
+    // The control: every length the shell can actually send still decodes, so the
+    // strictness above cannot break the real wire path. These are the encodings
+    // of 1/2/3/4/5/6 bytes — every padding shape.
+    expect(Array.from(decodeChunk("QQ=="))).toEqual([0x41])
+    expect(Array.from(decodeChunk("QUE="))).toEqual([0x41, 0x41])
+    expect(Array.from(decodeChunk("QUFB"))).toEqual([0x41, 0x41, 0x41])
+    expect(Array.from(decodeChunk("QUFBQQ=="))).toEqual([0x41, 0x41, 0x41, 0x41])
+    expect(Array.from(decodeChunk(""))).toEqual([])
+  })
+
   test("read yields decoded bytes, not the base64 string", async () => {
     const { svc } = serviceWith({ read: () => from(["AAEC"]) })
     const chunks = await collect(svc.read("/tmp/x"))
