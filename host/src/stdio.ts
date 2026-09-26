@@ -278,6 +278,49 @@ export type HandsChange = {
  * ⚠ `ESTALE` is deliberately distinct from `ENOENT`: after a rotation the path is
  * a DIFFERENT file (reopen and reset the offset), whereas a missing file usually
  * means give up. Opposite handling, so they must not collapse.
+ *
+ * ⚠ THIS LIST IS A MIRROR, AND IT IS DRIFT-CHECKED RATHER THAN TRUSTED.
+ * `src-tauri/src/hands.rs`'s `Code` enum is the source of truth: the shell is what
+ * writes the prefix, and `HandsError` only *parses* it. Two consequences that used
+ * to be handled by hand and are now enforced by
+ * `host/tests/hands-error-codes.test.ts`, which reads the Rust file:
+ *
+ *   1. A code ADDED or RENAMED in Rust without a matching edit here makes
+ *      `HandsError.code` silently `undefined` for a message that clearly carries
+ *      a code — so a caller branching on `.code` takes the wrong branch. That is
+ *      not hypothetical: this file's own history records `ENOTDIR` being added to
+ *      the wire contract while this list was a separate hand-written `Set` in
+ *      `hands.ts`, which is exactly why `HandsError` now derives from THIS array.
+ *      Deriving killed the second copy; the test keeps this list honest against
+ *      the third (Rust).
+ *   2. A code that is in this list but that NO path can produce is worse than a
+ *      missing one: it advertises a branch that can never be taken.
+ *
+ * ⚠ `ECANCEL` WAS IN THIS LIST AND IS GONE, because it was unreachable. Verified
+ * rather than assumed: the Rust `Code` enum has no `Cancel` variant and no
+ * producer of `ECANCEL` exists anywhere in this repository, so
+ * `.code === "ECANCEL"` could never be true. The capability proposal
+ * (`docs/hands-capability-proposal.md` §2.2) sketches a "cancellation is not a
+ * malfunction" case for it — but cancellation is expressed on the wire as the
+ * host CALLING the stream's `return()` (kkrpc `op:"return"`), which ends the
+ * iteration normally rather than raising a coded error. If a future shell-side
+ * cancel ever does need to raise, it must be added to the Rust enum FIRST — this
+ * test will then demand it here.
+ *
+ * ⚠ THE FOUR `EINVAL`/`EEXIST`/`EINTR`/`EINTERNAL` ENTRIES ARRIVED AFTER, from
+ * the shell side, and they are the same lesson in the other direction: the shell
+ * carved them out of a catch-all that used to report `EACCES` for everything it
+ * did not recognise (`classify` in `hands.rs`), and a host that did not list them
+ * would have made every one of those calls report `code: undefined`. `EINTERNAL`
+ * in particular must NOT be read as `ESTALE` (its old spelling): `isStale` means
+ * "reopen the file and reset the offset", which cannot help a poisoned lock.
+ *
+ * The alternative that was considered and rejected: generating this list from the
+ * Rust source through the `check:contracts` mirror machinery. `scripts/check-contract-drift.ts`
+ * byte-compares generated TypeScript against a JSON **Schema**, and there is no
+ * schema for these codes — inventing one would mean a new hand-maintained file
+ * plus a generator, i.e. more second copies, not fewer. The drift test gets the
+ * same guarantee (a rename on either side fails a gate) without that.
  */
 export const HANDS_ERROR_CODES = [
   "ENOENT",
@@ -289,7 +332,19 @@ export const HANDS_ERROR_CODES = [
   "ENOTDIR",
   "ESTALE",
   "ENOSPC",
-  "ECANCEL",
+  // The request was malformed for this call — it could never have worked on any
+  // machine. ⚠ NOT `EACCES`: retrying, re-prompting or widening permissions all
+  // waste the caller's time, whereas `EACCES` is exactly the code that says to
+  // do one of those.
+  "EINVAL",
+  // The target is already there and the call refuses to clobber it. Separate from
+  // `EACCES` because the fix differs: pick another name vs change permissions.
+  "EEXIST",
+  // Interrupted before completion. ⚠ RETRYABLE, which is the opposite of what
+  // `EACCES` would have told the caller when this was reported as one.
+  "EINTR",
+  // An internal fault in the hands themselves, never a statement about a path.
+  "EINTERNAL",
   "EUNSUPPORTED",
 ] as const
 export type HandsErrorCode = (typeof HANDS_ERROR_CODES)[number]

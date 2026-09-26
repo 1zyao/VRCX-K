@@ -14,7 +14,7 @@ import { attachDevWatch, DevWatch, type DevWatchEvent } from "./dev-watch"
 import { declaresHeartbeat, FIBER_ACTIVE, FIBER_FAILED } from "./fiber"
 import { HandsService } from "./hands"
 import { stopOnShellLost, stopOnStdinLoss } from "./lifecycle"
-import { log } from "./log"
+import { log, logWithSecret, REDACTED, redactUserPath } from "./log"
 import { loadManifests, manifestRegistryOf } from "./manifests"
 import { makeRestartRequester } from "./restart"
 import { AutostartService } from "./shell-extras"
@@ -274,7 +274,33 @@ async function bootstrap() {
   // separate, deliberate decision made before the entry is created; once a
   // plugin is in the tree, an absent declaration simply means there is nothing
   // to compare its capability usage against (design P2: show, never block).
-  await loadManifests(ctx, includeEntry)
+  //
+  // ⚠ THE RESULT USED TO BE DROPPED, and that made the registry a BLACK BOX: a
+  // plugin whose manifest failed to register — an illegal one rejected by
+  // `maxItems`, an id that disagrees with its entry, a present-but-malformed JSON
+  // — looked exactly like a plugin that never shipped a manifest, and BOTH look
+  // exactly like a plugin that is behaving. `findOverreach` returns `undefined`
+  // for a plugin with no registered manifest (correctly — nothing was promised),
+  // so `#24`'s whole question "which plugins are currently unconstrained?" had no
+  // observable answer. That is the downstream half of the `maxItems` defect: the
+  // rejection itself is reported by the loader, but nothing said how many
+  // declarations the host ended up WITHOUT.
+  //
+  // So the outcome is logged in both directions. The counts are what makes
+  // "unconstrained" countable at all; the names are what makes it actionable.
+  // ⚠ Not a warning per skipped plugin: a plugin legitimately without a manifest
+  // is the normal case today (the base plugins have none), and a log that warns
+  // on every boot is a log nobody reads. `loadManifests` already warns for the
+  // cases that are actually wrong (an unresolvable directory, a present-but-broken
+  // manifest) — this line is the SUMMARY that was missing, not a second opinion
+  // on each one.
+  const manifestResult = await loadManifests(ctx, includeEntry)
+  log(
+    `manifests: ${manifestResult.loaded.length} registered ` +
+      `(${manifestResult.loaded.join(", ") || "none"}), ` +
+      `${manifestResult.skipped.length} without a usable declaration ` +
+      `(${manifestResult.skipped.join(", ") || "none"})`,
+  )
 
   // Enable overreach detection now that manifests exist (#24). Wired AFTER the
   // load, because the lookup reads the registry `loadManifests` just built — and
@@ -357,7 +383,51 @@ async function bootstrap() {
   // contracts/host-ready/v1/host-ready.schema.json), so the version is part of
   // the payload rather than something this log line bolts on. The tests parse
   // this line, so it keeps the bare JSON object shape.
-  log(`ready ${JSON.stringify(ready)}`)
+  //
+  // ⚠ THE LINE IS REDACTED ON THE WAY TO THE FILE, and this is not optional.
+  //
+  // The handshake's REQUIRED fields include `token` — the per-launch kkrpc/ws
+  // bearer token (32 random bytes, lowercase hex) that the face presents as
+  // `?token=` to open the host's ws surface — and `paths`, which holds the host's
+  // `cwd` and `execPath` as absolute paths that on Windows begin with the user's
+  // account name.
+  //
+  // Until the rotating log file landed, this line only reached stderr — which in a
+  // release build is `stderr(Stdio::inherit())` into a handle that leads nowhere
+  // (`src-tauri/src/host.rs`, and this module's `log.ts` header). Now it lands ON
+  // DISK, in a file whose stated purpose is to be "small enough to attach to a
+  // report". So attaching a support bundle would have handed over a LIVE session
+  // token and the user's directory layout.
+  //
+  // ⚠ REDACTED IN THE FILE, UNCHANGED ON STDERR — `logWithSecret`, not `log`.
+  // The two consumers differ in kind: stderr is an ephemeral local pipe to whoever
+  // spawned us, the file is a durable artifact that gets emailed. The token must
+  // still be readable from stderr, because the host's OWN integration tests scrape
+  // it there and then CONNECT with it (`host/tests/helpers.ts#readReady`, used by
+  // `ws-heartbeat` / `stdin-loss` / `compile-smoke` / `sidecar-smoke`), and the
+  // Rust shell never reads the value at all (it logs `token_len` only). See
+  // `logWithSecret`'s comment for why that split is the honest one, not a
+  // loophole.
+  //
+  // ⚠ REDACTED, not deleted, and the distinction is load-bearing. Those four tests
+  // parse the line with `/\[host\] ready ({.*})/` and read `.token`, `.port`,
+  // `.schemaVersion` and `.hostVersion` out of it. Dropping the key would turn
+  // "the host announced itself" into "the host announced a malformed handshake"
+  // for all four — a louder failure than the leak, but the wrong fix.
+  //
+  // ⚠ The redaction applies to the LOG ONLY. The very next statement sends the
+  // REAL `ready` to the shell over stdio, because the shell is the party the token
+  // authenticates; sanitizing the wire copy would break every ws connection while
+  // every log-based test stayed green.
+  const redactedReadyLine = JSON.stringify({
+    ...ready,
+    token: REDACTED,
+    paths: {
+      cwd: redactUserPath(ready.paths.cwd),
+      execPath: redactUserPath(ready.paths.execPath),
+    },
+  })
+  logWithSecret(`ready ${redactedReadyLine}`, `ready ${JSON.stringify(ready)}`)
 
   if (process.env.VRCXK_SHELL === "1") {
     const shell = connectShellStdio(ctx)

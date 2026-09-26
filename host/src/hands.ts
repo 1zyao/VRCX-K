@@ -116,6 +116,50 @@ export class HandsError extends Error {
  */
 const HANDS_ERROR_CODE_SET: ReadonlySet<string> = new Set<string>(HANDS_ERROR_CODES)
 
+/**
+ * Refuse a call whose receiver was lost, with an error that says what to do.
+ *
+ * ⚠ WHY THIS EXISTS AT ALL. A cordis `Service` subclass reaches its per-caller
+ * state through `this`: the method proxy substitutes a per-caller shadow only
+ * when the call goes through the namespace object (`thisArg === outer`). Write
+ * `const { read } = ctx.hands` and the copy is a BARE FUNCTION, so `this` is
+ * `undefined` and the first statement of the method — `this.record(...)` —
+ * throws the opaque `Cannot read properties of undefined (reading 'record')`.
+ * Measured on cordis 4.0.0-rc.9: `read`/`watch`/`list` throw synchronously,
+ * `stat`/`write` return a rejected promise, and because `record` is the first
+ * statement NEITHER the `[cap]` audit line NOR the `#24` overreach warning is
+ * ever emitted for that call.
+ *
+ * `capability.ts` says destructuring "only loses attribution, falls back to
+ * null, and does not throw". That is true for the CLOSURE-style mirrors it
+ * builds (`buildNode`), and FALSE for every `Service` subclass — `hands`,
+ * `tray`, `shortcut`, `autostart`. This guard is the difference between an
+ * actionable message and a TypeError that names an internal field.
+ *
+ * ⚠ A module-level function, NOT a private method, and that is load-bearing: a
+ * method would be reached through the very `this` that is missing, so the guard
+ * would throw the same TypeError it exists to replace.
+ *
+ * ⚠ Do NOT "fix" this by rewriting the methods as arrow-function PROPERTIES.
+ * That does make destructured calls work — by binding the instance directly —
+ * but it SILENTLY destroys caller attribution (`caller: null`, cordis findings
+ * §1.8), so every audit line would say `<unknown>` and every overreach check
+ * would skip (a caller with no entry id is never reported, by design). A loud
+ * refusal to destructure is strictly better than a quiet loss of the audit.
+ */
+function assertReceiver(receiver: unknown, method: string): void {
+  if (receiver === undefined || receiver === null) {
+    throw new HandsError(
+      `EUNSUPPORTED: ctx.hands.${method}(…) was called without its receiver — ` +
+        `do not destructure it. Cordis supplies the per-caller \`this\` only for a ` +
+        `call that goes through \`ctx.hands\`; a destructured or otherwise detached ` +
+        `copy (\`const { ${method} } = ctx.hands\`) is a bare function, so the call ` +
+        `cannot be attributed to its plugin and is REFUSED rather than silently ` +
+        `losing its audit line. Call \`ctx.hands.${method}(…)\` directly.`,
+    )
+  }
+}
+
 export type HandsServiceOptions = {
   /** Shell bridge; omit while the shell is not attached. */
   bridge?: ShellStdioBridge
@@ -237,6 +281,7 @@ export class HandsService extends Service {
 
   /** What is at this path — or `null` when there is nothing. */
   async stat(path: string): Promise<HandsStat | null> {
+    assertReceiver(this, "stat")
     this.record(this, "stat", JSON.stringify(path))
     try {
       return await this.api.stat(path)
@@ -253,6 +298,7 @@ export class HandsService extends Service {
    * stream behind.
    */
   read(path: string, opts?: HandsReadOptions): AsyncIterable<HandsChunk> {
+    assertReceiver(this, "read")
     this.record(this, "read", JSON.stringify(path))
     return this.guarded(async () => {
       const stream = this.api.read(path, opts)
@@ -263,52 +309,94 @@ export class HandsService extends Service {
   /**
    * Write a stream of bytes; resolves with the true byte count.
    *
-   * # Why this primitive is NOT `guarded(...)` — deliberate, not an oversight
+   * # Why this primitive IS guarded — and the reversal that put it here
    *
-   * `read`/`watch`/`list` hand back a stream the CALLER pulls. If the caller
-   * walks away mid-iteration the producer would keep producing for nobody — the
-   * measured leak this file's header cites (16 chunks after the owning plugin was
-   * unloaded) — so the guard's job there is to CANCEL the producer.
+   * `read`/`watch`/`list` hand back a stream the CALLER pulls; `write` is handed
+   * a stream the caller PRODUCES. An earlier revision of this method reasoned
+   * that the difference made a guard unnecessary, on these grounds:
    *
-   * `write` has no such orphan to cancel. The consumer of the caller's bytes is
-   * the SHELL, inside the pending `this.api.write(...)`; that drain lives exactly
-   * as long as the call that started it, because the answer ("how many bytes") is
-   * only knowable after the last chunk — which is why the shell defers the reply.
-   * The only actor that can go away is the CALLER, and a caller that abandons a
-   * promise it is awaiting is not a reason to stop writing bytes it already asked
-   * to write: a half-written file plus a cancelled reply is a worse outcome than
-   * a completed write, and there is no host-side cancel for a deferred-reply call
-   * to invoke anyway (`guarded()`'s abort path ends in `iterator.return()`, which
-   * a write has no equivalent of; releasing the registration alone would just
-   * drop the record of a write that is still running).
+   *   1. "the consumer of the caller's bytes is the SHELL, inside the pending
+   *      `this.api.write(...)`, and that drain lives exactly as long as the call";
+   *   2. "there is no host-side cancel for a deferred-reply call to invoke
+   *      anyway — `guarded()`'s abort path ends in `iterator.return()`, which a
+   *      write has no equivalent of".
    *
-   * ⚠ The consequence, stated plainly and PINNED by
-   * `write keeps draining after its calling plugin is unloaded` in
-   * `host/tests/hands-service.test.ts`: disposing the calling fiber while a write
-   * is in flight does NOT stop it — the caller's generator is drained to the end
-   * and the shell still receives every chunk. That test exists so this behaviour
-   * cannot drift silently in either direction (a future guard, or a future
-   * early-return, changes it and fails).
+   * ⚠ BOTH ARE FALSE, and each one is checkable in this repository:
    *
-   * Audit coverage is unaffected: `record` runs at CALL time, so a write that is
-   * started and then abandoned still leaves its trace (same rule as `read`).
+   *   - The generator is RIGHT HERE: `encodeStream(data)` is created in this
+   *     method, so the "equivalent of `iterator.return()`" is a call on an
+   *     iterator this module owns. (It was always ownable; the old shape simply
+   *     passed the generator straight to kkrpc and dropped the handle.)
+   *   - The wire-level cancel already exists. kkrpc's remote consumer calls
+   *     `iterator.return()` on its local stream when the host stops pulling
+   *     (`node_modules/kkrpc/dist/streaming.js`, `createAsyncIteratorFromPromise`),
+   *     and the Rust peer answers `op:"return"` by cancelling the producer's
+   *     source and acknowledging it (`src-tauri/src/kkrpc_peer.rs`, the
+   *     `"return" | "throw"` arm). So a cancelled write is a NORMAL wire event,
+   *     not an unimplementable one.
+   *
+   * So the drain does NOT necessarily "live exactly as long as the call". kkrpc
+   * pumps the caller's generator ahead of the consumer (it pulls when its credit
+   * budget allows — `pumpRemoteStream`'s `consumedSincePull` rule in the file
+   * above), so after the owning plugin is unloaded we can still be calling
+   * `next()` on a dead plugin's generator, and every chunk it yields is another
+   * write reaching disk on behalf of an owner that no longer exists. That is the
+   * leak this guard closes: the caller's fiber is the write's lifetime, the same
+   * rule the other four primitives follow.
+   *
+   * ⚠ THE TRADE-OFF, stated honestly rather than hidden: stopping a write
+   * mid-stream leaves a PARTIAL file, and the shell's deferred reply then reports
+   * the bytes written so far as a completed write — a caller that had survived
+   * would see success with a short file. Two things bound that risk here: the
+   * only actor that can end the guard early is the caller going away (it has no
+   * expectation left to violate), and kkrpc reads a host-side `return` as a
+   * normal end-of-stream, so the reply is a real number rather than a hang. The
+   * old behaviour is not "safe by comparison" either — it reported `bytes: 12`
+   * for a write whose owner had been unloaded after 3.
+   *
+   * Audit coverage is unchanged: `record` still runs at CALL time, so a write
+   * that is started and then abandoned still leaves its trace (same rule as
+   * `read`).
    */
   async write(
     path: string,
     data: AsyncIterable<HandsChunk>,
     opts?: HandsWriteOptions,
   ): Promise<HandsWriteResult> {
+    assertReceiver(this, "write")
     // The path is audited; the payload is deliberately not even touched here.
     this.record(this, "write", JSON.stringify(path))
+
+    // Registered BEFORE the first `await`, so the guard covers the whole call
+    // including the window before the shell has asked for its first chunk.
+    const lifetime = { cancelled: false }
+    const release = this.registerGuard(() => {
+      lifetime.cancelled = true
+    })
+
     try {
-      return await this.api.write(path, encodeStream(data), opts)
+      return await this.api.write(
+        path,
+        // ⚠ `encodeStream` is INSIDE the wrapper on purpose: the wrapper must
+        // check the guard before every pull, and a pull of `encodeStream` is what
+        // transitively pulls the CALLER's generator. Wrapping the other way round
+        // would check after the caller's chunk had already been produced.
+        transferWhileCallerAlive(encodeStream(data), lifetime),
+        opts,
+      )
     } catch (error) {
       throw asHandsError(error)
+    } finally {
+      // Always: the registration is per-CALL, so leaving it behind would grow the
+      // caller's fiber once per write (measured: 1000 unreleased registrations
+      // survived to unload — `docs/probes/probe-host-effect-economy.ts`).
+      release()
     }
   }
 
   /** Watch a path. The iterable's end cancels the subscription. */
   watch(path: string, opts?: { recursive?: boolean }): AsyncIterable<HandsChange> {
+    assertReceiver(this, "watch")
     this.record(this, "watch", JSON.stringify(path))
     return this.guarded(async () => {
       const stream = this.api.watch(path, opts)
@@ -340,6 +428,7 @@ export class HandsService extends Service {
    * place that knows the encoding (same discipline as `decodeChunk`).
    */
   list(path: string, opts?: HandsListOptions): AsyncIterable<HandsListBatch> {
+    assertReceiver(this, "list")
     this.record(this, "list", JSON.stringify(path))
     return this.guarded(async () => {
       const stream = this.api.list(path, opts)
@@ -415,7 +504,50 @@ export class HandsService extends Service {
               // success path is untouched: `open()` still runs exactly once
               // (guarded by `!iterator`) and its failure now takes the same
               // `stop()` + `asHandsError` path as `iterator.next()`.
-              if (!iterator) iterator = (await open())[Symbol.asyncIterator]()
+              //
+              // ⚠ AND `open()` MUST BE RE-CHECKED AFTER IT RETURNS. That is a
+              // SECOND, orthogonal hole from the one the `try` closes: the entry
+              // check (`if (released) …` at the top of `next()`) only sees a
+              // release that has ALREADY happened, and nothing re-read the flag
+              // between the `await` completing and the freshly opened stream
+              // being pulled.
+              //
+              // The window is not theoretical: in production `open()` is a full
+              // kkrpc round trip, so the WHOLE RTT is a window in which the
+              // caller can go away — its fiber disposed (plugin unload) or its
+              // consumer `return()`ed (an early `break`). What the old shape did
+              // when a release landed there: `next()` still returned the first
+              // chunk produced by the new stream, `return()` was never forwarded
+              // to it, and no later `next()` could reach it (the entry check
+              // short-circuits from then on) — so on the shell side a producer
+              // kept pumping and a file handle stayed open until the process
+              // exited. That is precisely the unguarded-stream leak this module's
+              // header cites (16 chunks after unload), reached by a different
+              // route.
+              //
+              // ⇒ The release is re-read, and the stream we JUST opened is
+              // unwound, with the same `void` + sync-throw tolerance the guard's
+              // own disposer uses: kkrpc's `return()` travels the wire and can
+              // reject, and a transport that is already gone can throw
+              // synchronously.
+              if (!iterator) {
+                const opened = await open()
+                if (released) {
+                  // `released` is only ever set by the guard's disposer or by
+                  // `stop()`, and `stop()` is what calls the disposer — so at
+                  // this point the registration is already released and there is
+                  // nothing left to release. The only thing to unwind is the
+                  // stream that was just opened.
+                  const orphan = opened[Symbol.asyncIterator]()
+                  try {
+                    void Promise.resolve(orphan.return?.(undefined)).catch(() => {})
+                  } catch {
+                    /* the caller is gone; there is nobody to report this to */
+                  }
+                  return { done: true, value: undefined }
+                }
+                iterator = opened[Symbol.asyncIterator]()
+              }
               result = await iterator.next()
             } catch (error) {
               // ⚠ Stream failures must be translated too. `stat`/`write` wrap
@@ -485,6 +617,55 @@ async function* encodeStream(stream: AsyncIterable<Uint8Array>): AsyncIterable<s
   for await (const chunk of stream) {
     const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)
     yield Buffer.from(bytes).toString("base64")
+  }
+}
+
+/**
+ * Forward `source` while the caller is still alive, then stop.
+ *
+ * This is `guarded()`'s mirror image, and the asymmetry is the whole reason it is
+ * a second function rather than a flag on the first:
+ *
+ *   - `guarded()` returns the iterable the CALLER consumes, so its guard has to
+ *     be checked on the caller's own `next()` — the caller is doing the pulling.
+ *   - here the SHELL (through kkrpc) is the puller and the caller only supplied
+ *     the bytes, so the check belongs on every forwarded chunk.
+ *
+ * ⚠ A guard is re-read BEFORE each pull, not after: `for await` pulls the source
+ * and only then lets this generator see the value, so checking afterwards would
+ * let one more chunk of the dead plugin's generator reach disk on every check.
+ * The check is `cancelled` — a plain object rather than a closure boolean because
+ * the guard is registered on the caller's ctx by `write`, which owns the object.
+ *
+ * ⚠ Returning instead of throwing is deliberate. kkrpc reads the end of this
+ * generator as a NORMAL end-of-stream and lets the shell finish the deferred
+ * reply (`StreamSink::finish(Ok(..))`), so the caller gets "N bytes written" —
+ * a truncated file reported as a completed write. That is the price of stopping
+ * at all; a thrown error would instead surface as a write FAILURE, which is a
+ * worse lie for the same file. Both are bounded by the fact that only the
+ * caller's own disappearance can trigger this (see `write`'s comment).
+ */
+async function* transferWhileCallerAlive(
+  source: AsyncIterable<string>,
+  lifetime: { cancelled: boolean },
+): AsyncIterable<string> {
+  const iterator = source[Symbol.asyncIterator]()
+  try {
+    while (!lifetime.cancelled) {
+      const result = await iterator.next()
+      if (result.done) return
+      yield result.value
+    }
+  } finally {
+    // Let the caller's generator unwind exactly once, whichever way we left the
+    // loop — including the `cancelled` exit, where the source has NOT finished.
+    // `return()` can reject (a generator whose body throws in its `finally`) or
+    // throw synchronously, so the call is wrapped like every other teardown here.
+    try {
+      void Promise.resolve(iterator.return?.(undefined)).catch(() => {})
+    } catch {
+      /* teardown continues */
+    }
   }
 }
 

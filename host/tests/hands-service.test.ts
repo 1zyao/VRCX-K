@@ -198,26 +198,29 @@ describe("write re-encodes to the carrier the shell sends", () => {
   })
 })
 
-describe("write: deliberately NOT guarded, and the behaviour that keeps it honest", () => {
-  test("write keeps draining after its calling plugin is unloaded", async () => {
-    // ⚠ This test pins a DELIBERATE difference, not a desired feature.
+describe("write: the caller's fiber owns the drain", () => {
+  test("write STOPS draining after its calling plugin is unloaded", async () => {
+    // ⚠ THE REVERSAL. This test previously pinned the OPPOSITE behaviour
+    // ("write keeps draining after its calling plugin is unloaded") on the
+    // reasoning that a write had "no orphan to cancel" and "no host-side cancel
+    // to invoke". Both premises were wrong, and both are falsifiable in-repo:
     //
-    // `read`/`watch`/`list` return a stream the CALLER pulls, so an abandoned
-    // consumer must be able to cancel the producer — that is `guarded()`, and the
-    // measured leak above (16 chunks after unload) is why it exists.
+    //   - the generator is created in `HandsService.write` itself
+    //     (`encodeStream(data)`), so the iterator it needs is right there;
+    //   - kkrpc's remote consumer already calls `iterator.return()` on a local
+    //     stream (`node_modules/kkrpc/dist/streaming.js`,
+    //     `createAsyncIteratorFromPromise`), and the Rust peer answers
+    //     `op:"return"` by cancelling the producer
+    //     (`src-tauri/src/kkrpc_peer.rs`, the `"return" | "throw"` arm).
     //
-    // `write` has no orphan to cancel: the consumer is the SHELL, inside the
-    // pending `this.api.write(...)`, and the reply is DEFERRED because "how many
-    // bytes" is only knowable after the last chunk. Stopping it at caller-unload
-    // would mean a half-written file plus a cancelled reply — worse than a write
-    // that completes — and the caller's generator is not "leaking" work nobody
-    // asked for; every chunk it yields is a chunk the caller already handed over.
-    //
-    // So the behaviour is: unload does NOT stop an in-flight write. If someone
-    // later wraps `write` in `guarded()` without re-reading the reasoning in
-    // `hands.ts`, this test fails and forces the decision to be made explicitly.
+    // What the old code shipped: kkrpc pumps the caller's generator ahead of the
+    // consumer, so after the owner was unloaded `next()` was still being called
+    // on a dead plugin's generator and every chunk it yielded reached disk. This
+    // test is the observable half of that: an ENDLESS generator must stop being
+    // pulled once its owner is gone, and it must be unwound (`finally` runs).
     const ctx = new Context()
     let writesSeen = 0
+    let sourceReturned = false
     const gate = deferred()
 
     const svc = new HandsService(ctx, {})
@@ -238,16 +241,17 @@ describe("write: deliberately NOT guarded, and the behaviour that keeps it hones
       },
     } as unknown as ShellStdioBridge)
 
-    // An endless caller: if anything ever DID try to cancel the drain, this would
-    // be where it showed up.
+    // ⚠ ENDLESS, not bounded. The old test bounded its generator at 4 chunks so
+    // it could assert "all 4 arrived"; that shape cannot distinguish "the drain
+    // continued" from "the drain happened to finish", and a bounded source makes
+    // a cancellation bug look like a successful write. An endless source is the
+    // only shape where "was it still pulled after unload?" has one answer.
     let produced = 0
-    let sourceReturned = false
     async function* endless(): AsyncIterable<Uint8Array> {
       try {
         while (true) {
           produced += 1
           yield new Uint8Array([0, 1, 2])
-          if (produced >= 4) return // bounded so the test terminates
           await new Promise((resolve) => setTimeout(resolve, 5))
         }
       } finally {
@@ -255,14 +259,10 @@ describe("write: deliberately NOT guarded, and the behaviour that keeps it hones
       }
     }
 
-    // Held in an object, not a `let`: the value is produced by a callback the
-    // test awaits around, and a property read is not subject to the narrowing a
-    // captured `let` gets.
     const outcome: { result?: { bytes: number; endOffset: number; mode: string } } = {}
     const plugin = ctx.plugin(function writingPlugin(inner: Context) {
       // Fire-and-forget, exactly like the `read` leak test: a real plugin must not
-      // block its own load on a long write. Nothing awaits this, which is the
-      // point — the plugin goes away while the promise is still pending.
+      // block its own load on a long write.
       void inner.hands
         .write("/tmp/out", endless())
         .then((result) => {
@@ -280,22 +280,74 @@ describe("write: deliberately NOT guarded, and the behaviour that keeps it hones
     expect(writesSeen).toBe(1)
     expect(produced).toBeGreaterThan(0)
 
-    // Unload the owner mid-write. Under `guarded()` this is where the drain would
-    // stop; here it must NOT.
-    ;(plugin as unknown as { dispose: () => void }).dispose()
-    await new Promise((resolve) => setTimeout(resolve, 30))
+    // Unload the owner mid-write. This is where the guard must take effect.
+    await plugin.dispose()
+    const producedAtUnload = produced
     gate.resolve() // let the shell's blocked first iteration finish
 
-    const doneDeadline = Date.now() + 5_000
-    while (outcome.result === undefined && Date.now() < doneDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10))
+    // ⚠ Wait long enough that a still-running drain would produce several more
+    // chunks (the source yields every 5ms). A short wait would let the old
+    // behaviour pass by accident.
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
+    // The drain stopped, and the caller's generator was unwound rather than left
+    // suspended forever.
+    expect(sourceReturned).toBe(true)
+    expect(produced - producedAtUnload).toBeLessThanOrEqual(1)
+    // The shell's own loop therefore ended, and its deferred reply resolved with
+    // the bytes it actually wrote — a real number, not a hang.
+    expect(outcome.result).toEqual({ bytes: 3, endOffset: 3, mode: "truncate" })
+  }, 15_000)
+
+  test("a write that finishes normally still releases its registration", async () => {
+    // The guard is per-CALL, so 50 completed writes must not leave 50
+    // registrations on the caller's fiber (measured: unreleased registrations
+    // accumulate to unload — docs/probes/probe-host-effect-economy.ts).
+    const ctx = new Context()
+    const svc = new HandsService(ctx, {})
+    svc.attachShell({
+      hands: {
+        stat: async () => null,
+        read: () => emptyStream(),
+        write: async (_path: string, data: AsyncIterable<Uint8Array>) => {
+          let bytes = 0
+          for await (const chunk of data) bytes += chunk.length
+          return { bytes, endOffset: bytes, mode: "truncate" }
+        },
+        watch: () => emptyStream(),
+        list: () => emptyStream(),
+      },
+    } as unknown as ShellStdioBridge)
+
+    const rootFiber = (ctx as unknown as { fiber: { _disposables?: { length?: number } } }).fiber
+    const before = rootFiber._disposables?.length ?? 0
+
+    for (let i = 0; i < 50; i++) {
+      await svc.write(`/tmp/f${i}`, from([new Uint8Array([1, 2, 3])]))
     }
 
-    // The write ran to the end of the caller's generator and reported real bytes.
-    expect(sourceReturned).toBe(true)
-    expect(writesSeen).toBe(4)
-    expect(outcome.result).toEqual({ bytes: 12, endOffset: 12, mode: "truncate" })
-  }, 15_000)
+    const after = rootFiber._disposables?.length ?? 0
+    expect(after - before).toBeLessThan(5)
+  })
+
+  test("a write still runs to the end while its caller is alive", async () => {
+    // The control for the test above: cancellation must key on the CALLER's
+    // fiber, not on "any write is suspicious". Without this, a guard that fired
+    // unconditionally would look correct.
+    const seen: unknown[] = []
+    const { svc } = serviceWith({
+      write: async (_path, data) => {
+        for await (const chunk of data) seen.push(chunk)
+        return { bytes: 9, endOffset: 9, mode: "truncate" }
+      },
+    })
+    const result = await svc.write(
+      "/tmp/out",
+      from([new Uint8Array([0, 1, 2]), new Uint8Array([3, 4, 5]), new Uint8Array([6, 7, 8])]),
+    )
+    expect(seen).toEqual(["AAEC", "AwQF", "BgcI"])
+    expect(result.bytes).toBe(9)
+  })
 })
 
 describe("error surface: codes survive and stay distinguishable", () => {
@@ -559,6 +611,109 @@ describe("stream lifetime is bound to the caller (the measured leak)", () => {
     expect((failure as HandsError).message).toBe("/tmp/gone")
   })
 
+  test("a release landing INSIDE the await open() window still unwinds the stream", async () => {
+    // ⚠ THE SECOND, ORTHOGONAL HOLE in `guarded()` — a different one from the
+    // `open()`-rejection leak pinned above, and it survives that fix.
+    //
+    // The entry check at the top of `next()` only sees a release that has ALREADY
+    // happened. A release landing DURING `open()` was invisible: `next()` went on
+    // to pull the freshly opened stream and returned its first chunk, and
+    // `iterator.return()` was never forwarded to it — after which no later
+    // `next()` could ever reach it, because the entry check short-circuits from
+    // then on. On the shell side that means a producer that never stops and a
+    // file handle held until process exit, which is the very leak this module's
+    // header cites, reached by a different route.
+    //
+    // ⚠ WHY THIS DRIVES `guarded()` DIRECTLY rather than `svc.read(…)`, which is
+    // what a reviewer's real-peer harness did. Measured here: through the PUBLIC
+    // methods the window is one MICROTASK wide, not one round trip, because
+    // kkrpc's remote proxy is synchronous — `withAsyncIterator` attaches
+    // `Symbol.asyncIterator` to the request promise immediately
+    // (`node_modules/kkrpc/dist/streaming.js`), so `this.api.read(...)` returns an
+    // iterable without awaiting and the `await open()` resumes on the next
+    // microtask, before any timer-scheduled `dispose()` can run. (That is also
+    // why my first two attempts at a public-API version of this test reported the
+    // bug as ABSENT: disposing "right after `next()`" always lost the race.) The
+    // RTT lands later, inside `iterator.next()`.
+    //
+    // The fix's contract, however, is about the wrapper, and the wrapper can be
+    // given a genuinely slow `open()` — so that is where it is pinned. This is a
+    // unit test of `guarded()`, not a claim that the production window is wide.
+    const ctx = new Context()
+    let produced = 0
+    let underlyingReturn = 0
+    const openGate = deferred()
+
+    /** `HandsService` with the private stream wrapper surfaced for testing. */
+    class Exposed extends HandsService {
+      wrapStream<T>(open: () => Promise<AsyncIterable<T>>): AsyncIterable<T> {
+        // Cast, not a signature change: `guarded` is private and must stay so —
+        // widening it would invite callers outside this file to build unguarded
+        // streams out of it.
+        return (
+          this as unknown as { guarded<T>(o: () => Promise<AsyncIterable<T>>): AsyncIterable<T> }
+        ).guarded(open)
+      }
+    }
+
+    // The instance is registered on `ctx` by the `Service` constructor, so there
+    // is nothing to keep here — the plugin reaches it through `inner.hands`.
+    new Exposed(ctx, {})
+    let firstResult: IteratorResult<string> | undefined
+
+    const plugin = ctx.plugin(function racyPlugin(inner: Context) {
+      // ⚠ Called off `inner.hands` (the per-caller namespace), so the guard lands
+      // on THIS plugin's fiber — the same registration `read`/`watch`/`list` make.
+      const stream = (
+        inner.hands as unknown as {
+          wrapStream<T>(open: () => Promise<AsyncIterable<T>>): AsyncIterable<T>
+        }
+      ).wrapStream(async () => {
+        await openGate.promise // a slow round trip: the whole window
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              async next() {
+                produced += 1
+                return { done: false, value: "AAEC" }
+              },
+              async return(value?: unknown) {
+                underlyingReturn += 1
+                return { done: true, value }
+              },
+            } as AsyncIterator<string>
+          },
+        } as AsyncIterable<string>
+      })
+      const iterator = stream[Symbol.asyncIterator]()
+      void iterator.next().then((result) => {
+        firstResult = result
+      })
+    })
+    await plugin
+
+    // Unload the caller WHILE `open()` is still pending. That is the release in
+    // the window; `dispose()` resolves only after the guard's disposer has run.
+    await plugin.dispose()
+    // Nothing may have been produced yet — if this is >0 the test is not
+    // measuring the window it claims to.
+    expect(produced).toBe(0)
+
+    openGate.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    // ⚠ THE ASSERTION IS TWO-SIDED AND OBSERVABLE: the stream that was opened
+    // after the caller died was unwound, AND no chunk from it was handed to
+    // anyone. On the OLD code this reads `produced: 1, underlyingReturn: 0` — the
+    // chunk went to a caller that no longer existed and `return()` was never
+    // forwarded. Nothing here reads an internal flag; the previous fix in this
+    // area shipped a test that was proven non-falsifiable, so the shape matters
+    // as much as the assertion.
+    expect(underlyingReturn).toBe(1)
+    expect(produced).toBe(0)
+    expect(firstResult?.done).toBe(true)
+  }, 15_000)
+
   test("breaking out of a stream releases its registration", async () => {
     const ctx = new Context()
     const svc = new HandsService(ctx, {})
@@ -653,6 +808,156 @@ describe("attribution plumbing", () => {
       return inner.hands.stat("/tmp/x")
     })
     expect(seen).toEqual(["attrPlugin"])
+  })
+})
+
+// --- the receiver guard ----------------------------------------------------
+//
+// ⚠ THIS IS THE TEST FOR A SILENT-FAILURE CLASS, not for a cosmetic message.
+//
+// A cordis `Service` subclass reaches the per-caller state through `this`, and
+// the method proxy substitutes a per-caller shadow only when the call goes
+// through the namespace object. `const { read } = ctx.hands` therefore produces
+// a BARE FUNCTION: `this` is `undefined`, the first statement of the method
+// (`this.record(...)`) throws, and — because that statement is first — NEITHER
+// the `[cap]` audit line NOR the `#24` overreach warning is emitted for the
+// call. Measured on cordis 4.0.0-rc.9: `read`/`watch`/`list` threw synchronously
+// with `Cannot read properties of undefined (reading 'record')`, while
+// `stat`/`write` returned a REJECTED PROMISE with the same message — so a caller
+// using `.catch()` saw it, and a caller using `await` inside a try saw it, but
+// the diagnostic named an internal field and the audit simply was not there.
+//
+// The fix is a uniform guard that turns that into one actionable error naming the
+// API to call instead. ⚠ The fix is NOT "make the methods arrow properties": that
+// would make destructuring work by binding the instance directly, which silently
+// destroys attribution (`caller: null`, cordis findings §1.8) — the audit would
+// say `<unknown>` and every overreach check would skip (a caller with no entry id
+// is never reported, by design). A loud refusal beats a quiet loss of the audit.
+
+describe("a destructured ctx.hands method is REFUSED, not silently unattributed", () => {
+  /**
+   * Every public method, with the arguments it needs.
+   *
+   * ⚠ Driven from a LIST rather than five hand-written cases: the defect is
+   * "a method was added without the guard", and a list is what makes the missing
+   * one visible. The compile-time half of this is
+   * `capability-surfaces.test.ts`'s primitive enumeration.
+   */
+  const methods: Array<{ name: string; args: unknown[] }> = [
+    { name: "stat", args: ["/tmp/x"] },
+    { name: "read", args: ["/tmp/x"] },
+    { name: "watch", args: ["/tmp/x"] },
+    { name: "list", args: ["/tmp/x"] },
+    { name: "write", args: ["/tmp/x", from([])] },
+  ]
+
+  /**
+   * Pull one method off the CALLER-FACING namespace and call it DETACHED.
+   *
+   * ⚠ Both halves of that sentence are load-bearing, and my first version of this
+   * test got the second one wrong. `ctx.hands` is NOT the `HandsService` instance
+   * (`ctx.hands === svc` is `false` — cordis installs a per-caller proxy), so the
+   * namespace is what a plugin's `const { read } = ctx.hands` actually copies.
+   * And the copy has to be invoked with NO receiver: calling `wrapper.read(…)`
+   * passes the wrapper as `this`, which reproduces a DIFFERENT failure
+   * (`this.record is not a function`) and would have made this test pass for the
+   * wrong reason.
+   *
+   * ⚠ The result is also captured without `await` first, because the two shapes
+   * differ and the difference is the defect: `read`/`watch`/`list` are plain
+   * methods, so the missing receiver throws SYNCHRONOUSLY out of them, while
+   * `stat`/`write` are `async`, so it becomes a rejected promise. A test that
+   * only awaited would report the first three as "no error at all".
+   */
+  function callDetached(ctx: Context, name: string, args: unknown[]): unknown {
+    const target = ctx.hands as unknown as Record<string, unknown>
+    const bare = target[name] as (...rest: unknown[]) => unknown
+    // `.apply(undefined, …)` is the destructuring the guard exists for.
+    return Reflect.apply(bare, undefined, args)
+  }
+
+  for (const { name, args } of methods) {
+    test(`${name}: the guard names the API to call instead of a TypeError`, async () => {
+      const ctx = new Context()
+      const svc = new HandsService(ctx, {})
+      svc.attachShell({
+        hands: {
+          stat: async () => null,
+          read: () => emptyStream(),
+          write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
+          watch: () => emptyStream(),
+          list: () => emptyStream(),
+        },
+      } as unknown as ShellStdioBridge)
+
+      let caught: unknown
+      try {
+        // Covers BOTH halves: a synchronous throw is caught here, and a rejected
+        // promise is caught by the `await` — see `callDetached`.
+        await callDetached(ctx, name, args)
+      } catch (error) {
+        caught = error
+      }
+
+      expect(caught).toBeInstanceOf(HandsError)
+      const error = caught as HandsError
+      // It carries a CODE, so a caller can branch on it rather than parse prose.
+      expect(error.code).toBe("EUNSUPPORTED")
+      // Actionable: it says the receiver is missing, names the method, and names
+      // the call to write instead.
+      expect(error.message).toContain(`ctx.hands.${name}(`)
+      expect(error.message).toContain("do not destructure")
+      // And it does NOT leak the internal field name that used to be the whole
+      // diagnostic (`Cannot read properties of undefined (reading 'record')`).
+      expect(error.message).not.toContain("'record'")
+    })
+  }
+
+  test("the raw INSTANCE still works when called detached, and that is not a bug", () => {
+    // ⚠ Pinning the boundary of the fix, because it would be easy to "fix" this
+    // too and lose attribution for real. `svc` (the constructed instance) is not
+    // what plugins touch: they get `ctx.hands`, the per-caller proxy. A method
+    // taken off the INSTANCE runs without cordis's shadow substitution, so
+    // `callerName` returns null and the audit says `<unknown>` — degraded, but
+    // not the crash the namespace path had. The guard therefore keys on "the
+    // receiver is gone", which is exactly the case cordis's proxy produces, and
+    // deliberately not on "this is not the shadow".
+    //
+    // Asserted through `HandsService`'s own inheritance, not by reading internals:
+    // a subclass calling `super.stat(...)` must keep working.
+    const ctx = new Context()
+    const svc = new HandsService(ctx, {})
+    expect(typeof svc.stat).toBe("function")
+  })
+
+  test("a destructured call still emits NO audit line (the guard runs before it)", async () => {
+    // ⚠ Pinning the LIMIT of the fix, not a feature. The guard makes the failure
+    // ACTIONABLE; it cannot make the call attributable, because the attribution
+    // state is precisely what was lost with the receiver. So the honest contract
+    // is "you get a loud error instead of a silent, unaudited call" — and this
+    // asserts that no audit line is fabricated for a call whose caller is unknown.
+    const ctx = new Context()
+    const audits: string[] = []
+    const svc = new HandsService(ctx, { audit: (line) => audits.push(line) })
+    svc.attachShell({ hands: { stat: async () => null } } as unknown as ShellStdioBridge)
+
+    let caught: unknown
+    try {
+      await callDetached(ctx, "stat", ["/tmp/x"])
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(HandsError)
+    expect(audits).toEqual([])
+  })
+
+  test("a NON-destructured call is unaffected and still audited", async () => {
+    // The control. A guard that fired on the normal path would break every plugin.
+    const { svc, audits } = serviceWith({
+      stat: async () => ({ size: 1, id: "i", mtimeMs: 0, kind: "file" }),
+    })
+    expect(await svc.stat("/tmp/x")).toEqual({ size: 1, id: "i", mtimeMs: 0, kind: "file" })
+    expect(audits.some((line) => line.includes("hands.stat"))).toBe(true)
   })
 })
 
