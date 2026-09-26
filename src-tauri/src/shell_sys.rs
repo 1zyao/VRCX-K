@@ -100,37 +100,28 @@ fn autostart_flag(args: &[Value]) -> Result<bool, Value> {
     }
 }
 
-// ⚠ KNOWN GAP — the seven items below are dead code ON MOBILE, and the Android
-//   build warns about them ON PURPOSE. Read this before "cleaning them up".
+// ⚠ DESKTOP-ONLY: the helpers below are reached ONLY from the `#[cfg(desktop)]`
+//   handler blocks further down (`shell.deepLink.*`, `shell.autostart.*`). On
+//   mobile those blocks are not compiled at all, so each of these carries its own
+//   `#[cfg(desktop)]` and simply does not exist there.
 //
-//   The only callers are `shell.deepLink.register` and
-//   `shell.autostart.setEnabled`, whose handlers sit inside the `#[cfg(desktop)]`
-//   block further down (they share that block). On Android that block is not
-//   compiled at all, so these compile but nothing calls them, and
-//   `cargo build --target aarch64-linux-android` reports:
+//   ⚠ WHY THEY ARE GATED RATHER THAN LEFT TO WARN. They used to compile on mobile
+//   and be reported by the compiler as dead code:
 //
-//       warning: constant `MAX_SCHEME_LEN` is never used
-//       warning: constant `RESERVED_REGISTRY_CLASSES` is never used
-//       warning: constant `RESERVED_SCHEMES` is never used
-//       warning: function `autostart_flag` is never used
-//       warning: function `is_scheme_char` is never used
-//       warning: function `json_type_name` is never used
-//       warning: function `validate_deep_link_scheme` is never used
+//       warning: constant `MAX_SCHEME_LEN` is never used        (and six more)
 //
-//   ⚠ That message is misleading in one direction and accurate in another: on
-//   DESKTOP these ARE used (so the warning never fires there, and `clippy
-//   -D warnings` stays clean), while on Android they genuinely have no caller.
-//   It is not leftover code — it is the deep-link surface being desktop-only.
+//   That warning was deliberately left in as a reminder that deep-link is not
+//   wired for Android. It was replaced by a TEST — see
+//   `the_desktop_only_helpers_are_gated_and_listed` — because a warning only
+//   helps someone who reads the mobile build log, while a test fails in the
+//   ordinary loop. Same signal, no reliance on someone remembering to look.
 //
-//   ⚠ This list is deliberately kept exact. If you add another desktop-only
-//   item to this cluster, add its warning line here in the same commit: a
-//   stale list is how the "one new warning is fine" habit starts.
+//   ⚠ The list below must stay exact: the test asserts every name here is
+//   `#[cfg(desktop)]`-gated AND that this comment still names them. Adding a
+//   desktop-only helper without updating both is a red test, which is the point.
 //
-//   The warning is deliberately LEFT IN as the reminder, so do NOT silence it
-//   with `#[allow(dead_code)]`: the day someone wires deep-link for Android,
-//   these are exactly what must be reached, and a silenced warning would hide
-//   that they were skipped. If this warning ever disappears without Android
-//   deep-link being implemented, something was papered over — check why.
+//   Do NOT "clean these up" by deleting them: the day deep-link or autostart is
+//   wired for Android, these are exactly what must be reached.
 
 #[cfg(desktop)]
 /// Longest scheme this surface accepts.
@@ -1318,6 +1309,98 @@ mod tests {
             assert!(
                 verdict["error"].as_str().is_some_and(|e| !e.is_empty()),
                 "an empty reason would be as unhelpful as the silent coercion"
+            );
+        }
+    }
+
+    /// The desktop-only helpers must stay `#[cfg(desktop)]`-gated, and the note
+    /// above them must stay accurate.
+    ///
+    /// ⚠ THIS TEST REPLACES A COMPILER WARNING, deliberately. Those helpers used
+    /// to compile on mobile and be reported there as dead code:
+    ///
+    ///     warning: constant `MAX_SCHEME_LEN` is never used      (and six more)
+    ///
+    /// The warning was left in on purpose, as a reminder that deep-link is not
+    /// wired for Android. It was replaced by this test for one reason: a warning
+    /// only reaches someone who reads the MOBILE build log, whereas this fails in
+    /// the ordinary `cargo test` loop on every platform. Same signal, no longer
+    /// dependent on remembering to look.
+    ///
+    /// ⚠ What a test like this cannot do is notice a helper that is MISSING from
+    /// the list, so it asserts the list in the source note is exactly the set of
+    /// `#[cfg(desktop)]` items it discovers. Adding a desktop-only helper
+    /// therefore fails until the gate and the note are updated together — which is
+    /// the habit the warning used to protect.
+    #[test]
+    fn the_desktop_only_helpers_are_gated_and_listed() {
+        // Read our own source as TEXT: the property is about the file, and no
+        // amount of calling these functions can observe whether they were gated.
+        const SOURCE: &str = include_str!("shell_sys.rs");
+
+        // Keep this in lockstep with the note above the helpers.
+        const NAMED: &[&str] = &[
+            "MAX_SCHEME_LEN",
+            "RESERVED_REGISTRY_CLASSES",
+            "RESERVED_SCHEMES",
+            "autostart_flag",
+            "is_scheme_char",
+            "json_type_name",
+            "validate_deep_link_scheme",
+        ];
+
+        let lines: Vec<&str> = SOURCE.lines().collect();
+        // A guard against the whole test passing vacuously if `include_str!` ever
+        // resolves to something unexpected.
+        assert!(
+            lines.len() > 100,
+            "reading our own source produced {} lines, so the checks below would \
+             pass without looking at anything",
+            lines.len()
+        );
+
+        for name in NAMED {
+            // Find the DECLARATION, not a mention inside a comment.
+            let declared = lines.iter().position(|line| {
+                let trimmed = line.trim_start();
+                (trimmed.starts_with("fn ") || trimmed.starts_with("const "))
+                    && trimmed
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .nth(1)
+                        .is_some_and(|word| word == *name)
+            });
+            let Some(index) = declared else {
+                panic!(
+                    "`{name}` is named in the desktop-only note but is no longer \
+                     declared here — update the note and this list together"
+                );
+            };
+
+            // Walk back over the item's doc-comment / attribute block and require
+            // a `#[cfg(desktop)]` in it. Walking back rather than reading only the
+            // previous line, because the attribute sits ABOVE the doc comment.
+            let mut gated = false;
+            let mut cursor = index;
+            while cursor > 0 {
+                cursor -= 1;
+                let previous = lines[cursor].trim_start();
+                if previous.starts_with("#[cfg(desktop)]") {
+                    gated = true;
+                    break;
+                }
+                if previous.starts_with("///") || previous.starts_with("//") {
+                    continue;
+                }
+                if previous.starts_with("#[") {
+                    continue;
+                }
+                break;
+            }
+            assert!(
+                gated,
+                "`{name}` is desktop-only but not `#[cfg(desktop)]`-gated, so on \
+                 mobile it compiles with no caller and `clippy -D warnings` fails \
+                 the mobile build with `never used`"
             );
         }
     }
