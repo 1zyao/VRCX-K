@@ -6,12 +6,14 @@
 > | 部分 | 状态 |
 > |---|---|
 > | `policy`（纯判据：是否服务 / token 比较 / socket 命名） | ✅ 已实现，**全平台可测**（Windows 跑 4 条） |
-> | `imp` 的 socket 半边（绑定 / 握手 / accept loop / token 发布 / **`run` 入口**） | ✅ 已实现，**在真 Linux 上跑过 19 条**（`cfg(any(linux, android))`） |
+> | `imp` 的 socket 半边（绑定 / 握手 / accept loop / token 发布 / `run` 入口 / `serve_hands`） | ✅ 已实现，**在真 Linux 上跑过 19 条单元测试 + 一个端到端探针**（`cfg(any(linux, android))`） |
+> | `serve_hands` —— 在真抽象 socket 上挂**真生产 handler** | ✅ 已实现并由 `docs/probes/debug-probe/` **在真 Linux 上实测**（`hands.stat` 回 `size:11`，与客户端刚写的字节数一致） |
 > | `imp::run` —— **唯一入口**，把「判据 + 绑定 + 发布 token + 服务」收在一处 | ✅ 已实现。⚠ 判据与启动**放在一起**，调用方无法绕过检查单独启动监听 |
-> | `imp::is_debuggable` 的 Android 分支（读 `FLAG_DEBUGGABLE`） | ✅ **已实现且 `cargo check --target aarch64-linux-android` 编译通过**（含一个钉住 wry 回调签名的编译期断言）。⚠ **仍未在设备上运行过** |
-> | `jni = "0.21"` 依赖 | ✅ 已加（`[target.'cfg(target_os = "android")'.dependencies]`）。⚠ 它本就在树里（`tao → jni 0.21.1`），但**传递依赖不可命名**；`Cargo.lock` 的改动是**纯新增一行**，无版本变动 |
-> | 接进 `.setup()` | ❌ **未做**（见 §8） |
-> | 探针侧「连接而非 spawn」的 transport | ❌ **未做** |
+> | `imp::is_debuggable`（读 `FLAG_DEBUGGABLE`） | ✅ 已实现且 `cargo check --target aarch64-linux-android` 通过。⚠ **未在设备上运行过** |
+> | `jni::external_files_dir`（`getExternalFilesDir`） | ✅ 已实现且编译通过。⚠ **未在设备上运行过**。见 §5 的**设计错误更正** |
+> | 接进 `.setup()` | ✅ 已接（`lib.rs`，`#[cfg(target_os = "android")]`，失败只记录不传播） |
+> | 探针侧 `adb forward` 连接驱动 | ✅ 已实现（`docs/probes/debug-probe/run-android.mjs`）。⚠ **解析逻辑已对真实设备实测，端到端未跑**（没有可连的监听器） |
+> | **整条链路在设备上跑通** | ❌ **从未**。见 §8 |
 >
 > **它解决什么**：`docs/hands-capability-proposal.md` §9 缺口 6 —— 手的文件能力
 > （`hands.read/write/stat/watch`）在 Android 上**只经过源码阅读**，`cargo check`
@@ -128,6 +130,27 @@ stdin/stdout 换成 unix socket。**驱动侧**（`docs/probes/hands-e2e/run.mjs
   md5 一致）；
 - 其他应用**读不到**（Android 11+ 的分区存储把 `/Android/data/<pkg>` 对别的应用封闭）。
 
+### ⚠ 5.1 实现时发现的一个**设计错误**：Tauri 根本给不出这个目录
+
+原文只写了「写到应用自己的外部目录」，**没有说明"怎么拿到它"** —— 而实现时发现
+**Tauri 没有这个 API**：
+
+```
+tauri-2.11.5/src/path/android.rs 只提供：
+  app_data_dir / app_config_dir / app_cache_dir / app_log_dir
+—— 全部 resolve 到 /data/data/<pkg>/ 之下
+```
+
+而 `/data/data` 是**应用私有沙箱**，实测：`adb shell ls /data/data/` → **`Permission denied`**。
+
+⇒ **按原设计写，harness 永远读不到 token**，监听器会绑一个没人能认证的 socket。
+**这是设计前提错了（把"应该写在哪"当成了"能写到哪"），不是实现疏漏。**
+
+**修法**：走 JNI 的 `Context.getExternalFilesDir(null)`
+（→ `/sdcard/Android/data/<pkg>/files`），这是**唯一**同时满足三条的位置。
+`token_candidates()` 因此把它排**第一**，Tauri 的私有目录降为**回退**
+（外部存储未挂载时才用），并**记录实际用的是哪一个** —— 否则 harness 失败时无从诊断。
+
 ⚠ 不用 logcat 传 token：那要求接收方读日志，而日志是更宽的通道。
 
 ---
@@ -187,10 +210,11 @@ owner 的要求：**生成一个稍大的随机文件放进去，让应用去读
 | `-d` 产出的 APK 实际文件名 | ⚠ 未实测（需 NDK）；CI 的 `Locate APK` 因此**不猜文件名**，只要求"恰好一个 universal APK" |
 | `AndroidManifest` 是否需要额外权限 | 未查（抽象 socket 的 bind 通常不需要权限；须编译后确认） |
 | iOS | 本设计**只针对 Android**（判据与载体都是 Android 专有） |
-| 接进 `.setup()` | ❌ 未做。⚠ 约束已核实：判据要读 webview 的 JNI handle ⇒ **只能在窗口建好之后**求值，而 `.setup()` 满足该条件 |
-| token 发布到真实 app 外部目录 | ❌ 未做（`run` 接受候选目录列表，但还没人传真实路径） |
-| 探针侧「连接而非 spawn」的 transport | ❌ 未做。`docs/probes/hands-e2e/run.mjs` 现在 `spawn(BIN)`；要加一个 connect 变体 |
-| 服务内容接真 `hands.*` handler | ❌ 未做。`run` 的 `serve` 闭包由调用方提供，**还没人接 `hands::register_hands_handlers` / `hands_hello::send_hello`** |
+| 接进 `.setup()` | ✅ 已做（`lib.rs`，`#[cfg(target_os = "android")]`，失败只记录不传播）。⚠ 约束已核实：判据要读 webview 的 JNI handle ⇒ **只能在窗口建好之后**求值，而 tauri `app.rs:2524` 先建窗口、`:2530` 才调 `.setup()` ⇒ 满足 |
+| token 发布到真实 app 外部目录 | ✅ 已做（`jni::external_files_dir` + `token_candidates()`，见 §5.1） |
+| 探针侧「连接而非 spawn」的 transport | ✅ 已做（`docs/probes/debug-probe/run-android.mjs`） |
+| 服务内容接真 `hands.*` handler | ✅ 已做（`serve_hands`，并由 Linux 探针实测 `size:11`） |
+| **⭐ 整条链路在设备上跑通** | ❌ **从未**。三类东西各差一段：① **监听器的两段 JNI 只在 `cargo check` 层面类型检查过**，从未执行（本机无 NDK，构建不出能在设备上跑的 APK）；② **从未安装过带监听器的 APK**；③ `run-android.mjs` 只验证了**它的解析逻辑**（对真实 socket 与真实 adb 输出实测），端到端未跑（没有可连的监听器） |
 
 ---
 
