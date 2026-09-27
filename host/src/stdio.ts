@@ -203,7 +203,6 @@ export type HandsStatEntriesWire = {
 export type HandsReadOptions = {
   /** Byte offset to start at. Resumption is exactly this — no separate method. */
   offset?: number
-  chunkSize?: number
 }
 
 export type HandsWriteOptions = {

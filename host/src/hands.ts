@@ -46,6 +46,7 @@ import type {
   HandsListWire,
   HandsReadOptions,
   HandsStatWire,
+  HandsSysAPI,
   HandsWriteOptions,
   HandsWriteResult,
   ShellStdioBridge,
@@ -243,8 +244,82 @@ export function normalizeChange(value: unknown): HandsChange | undefined {
 const bridgeSlot = createSecretSlot<ShellStdioBridge>()
 const lookupSlot = createSecretSlot<(entryId: string) => VRCXKPluginManifest | undefined>()
 
+/**
+ * The raw bridge API for `self`.
+ *
+ * ⚠ **A module-level function on purpose, NOT a class member.** `private` is compile-time
+ * only, and both accessors and methods live on the **prototype** — so any `this.api`
+ * (getter or method) is reachable by a plugin through the Cordis per-caller shadow.
+ * Measured before this change, with a real plugin through a real loader entry:
+ *
+ *     ctx.hands.api              -> REACHABLE
+ *     Object.keys(ctx.hands.api) -> ["stat","read"]
+ *
+ * Reaching it skips `record()`, i.e. the `[cap]` audit line and the `#24` overreach
+ * warning — the same class of hole as the `private bridge` field fixed in `76d48743`.
+ * A module-level function is not on the prototype at all, so there is nothing to reach.
+ */
+function rawApi(self: HandsService): HandsSysAPI {
+  const bridge = bridgeSlot.get(self)
+  if (!bridge) {
+    throw new HandsError("EUNSUPPORTED: no shell attached")
+  }
+  return bridge.hands
+}
+
+/**
+ * One audit line per **call**, not per chunk.
+ *
+ * The audit's meaning is "this plugin asked to read this path" — a per-chunk record would
+ * bury the real signal under thousands of lines for one file, and the volume figures belong
+ * to metrics, not to the capability log. Attribution survives either way (measured), so
+ * this is a volume decision.
+ *
+ * `args` are summarised, not dumped: a path is useful, a megabyte of base64 is not.
+ * Recorded at CALL time so a caller that obtains an iterable and never consumes it still
+ * leaves a trace.
+ *
+ * ⚠ **Module-level, NOT a `private` method — this one is a FORGERY vector, not just a
+ * visibility leak.** Prototype members are reachable at runtime, so a plugin could call
+ * `ctx.hands.record(...)` directly and WRITE ARBITRARY LINES into the audit log. Measured
+ * with a real plugin through a real loader entry:
+ *
+ *     [] -> ["[cap] <unknown> -> hands.stat \"/etc/shadow\""]
+ *
+ * `#24`'s entire honest scope is "undeclared access becomes VISIBLE", so a plugin able to
+ * inject `[cap]` lines can bury its own real calls in noise or forge another plugin's
+ * attribution. `guarded` and `registerGuard` are module-level for the same reason (a
+ * plugin could otherwise register its own abort hook against the service).
+ */
+function record(self: HandsService, method: string, detail: string): void {
+  // ⚠ `self` is the per-caller SHADOW, not the constructed instance — and that is exactly
+  // what both uses below need: `callerName` reads the caller symbol off it, and
+  // `lookupSlot.get` resolves the token through it (a property read forwards through the
+  // shadow; a `#private` field would throw, per `hands-host-design.md` §6.2a).
+  const who = callerName(self) ?? "<unknown>"
+  self.auditLine(`[cap] ${who} -> hands.${method} ${detail}`)
+
+  // Overreach: declared vs actual (#24).
+  //
+  // ⚠ `ctx.hands` is the SUPPORTED entry point and it had NO check before this — the raw
+  // escape hatch (`ctx.shell.hands.*`) was checked while this was not, which is the exact
+  // inversion `#24` exists to prevent. It is the same shared helper the mirror uses, so the
+  // rule cannot drift between them.
+  const warning = overreachWarning(self, `hands.${method}`, lookupSlot.get(self))
+  if (warning) self.auditLine(warning)
+}
+
 export class HandsService extends Service {
-  private readonly auditLine: HandsAudit
+  /**
+   * The audit sink.
+   *
+   * ⚠ **Not `private`** — it has to be readable by the module-level `record()`, and a
+   * `private` modifier would be a lie here anyway (compile-time only; a plugin would read
+   * it regardless). It is a benign surface: writing to it can forge a log LINE, which is
+   * why `record()` itself is module-level, but a plugin able to reach this field gains
+   * nothing beyond what `console` already gives it.
+   */
+  readonly auditLine: HandsAudit
 
   constructor(ctx: Context, options: HandsServiceOptions = {}) {
     super(ctx, "hands")
@@ -276,39 +351,21 @@ export class HandsService extends Service {
     return bridgeSlot.has(this)
   }
 
-  private get api() {
-    const bridge = bridgeSlot.get(this)
-    if (!bridge) {
-      throw new HandsError("EUNSUPPORTED: no shell attached")
-    }
-    return bridge.hands
-  }
-
   /**
-   * One audit line per **call**, not per chunk.
+   * ⚠ The raw bridge API is reached through a MODULE-LEVEL function, not a class member.
    *
-   * The audit's meaning is "this plugin asked to read this path" — a per-chunk
-   * record would bury the real signal under thousands of lines for one file, and
-   * the volume figures belong to metrics, not to the capability log. Attribution
-   * survives either way (measured), so this is a volume decision.
+   * A TypeScript `private` is compile-time only, and **both accessors and methods live on
+   * the prototype** — so `private get api()` (and equally a `private api()` method) is
+   * reachable at runtime through the Cordis per-caller shadow. Measured with a real plugin
+   * through a real loader entry before this change:
    *
-   * `args` are summarised, not dumped: a path is useful, a megabyte of base64 is
-   * not. Recorded at CALL time so a caller that obtains an iterable and never
-   * consumes it still leaves a trace.
+   *     ctx.hands.api              -> REACHABLE
+   *     Object.keys(ctx.hands.api) -> ["stat","read"]
+   *
+   * That is the SAME class of hole as the `private bridge` field fixed in `76d48743`:
+   * reaching the raw API skips `record()` (no `[cap]` audit line, no `#24` warning) and the
+   * caller-fiber binding the stream guards rely on. See `rawApi()` below the class.
    */
-  private record(self: unknown, method: string, detail: string): void {
-    const who = callerName(self) ?? "<unknown>"
-    this.auditLine(`[cap] ${who} -> hands.${method} ${detail}`)
-
-    // Overreach: declared vs actual (#24).
-    //
-    // ⚠ `ctx.hands` is the SUPPORTED entry point and it had NO check before
-    // this — the raw escape hatch (`ctx.shell.hands.*`) was checked while this
-    // was not, which is the exact inversion `#24` exists to prevent. It is the
-    // same shared helper the mirror uses, so the rule cannot drift between them.
-    const warning = overreachWarning(self, `hands.${method}`, lookupSlot.get(this))
-    if (warning) this.auditLine(warning)
-  }
 
   // --- the four primitives ------------------------------------------------
   //
@@ -319,9 +376,9 @@ export class HandsService extends Service {
   /** What is at this path — or `null` when there is nothing. */
   async stat(path: string): Promise<HandsStat | null> {
     assertReceiver(this, "stat")
-    this.record(this, "stat", JSON.stringify(path))
+    record(this, "stat", JSON.stringify(path))
     try {
-      return await this.api.stat(path)
+      return await rawApi(this).stat(path)
     } catch (error) {
       throw asHandsError(error)
     }
@@ -336,9 +393,9 @@ export class HandsService extends Service {
    */
   read(path: string, opts?: HandsReadOptions): AsyncIterable<HandsChunk> {
     assertReceiver(this, "read")
-    this.record(this, "read", JSON.stringify(path))
+    record(this, "read", JSON.stringify(path))
     return this.guarded(async () => {
-      const stream = this.api.read(path, opts)
+      const stream = rawApi(this).read(path, opts)
       return decodeStream(stream)
     })
   }
@@ -353,7 +410,7 @@ export class HandsService extends Service {
    * that the difference made a guard unnecessary, on these grounds:
    *
    *   1. "the consumer of the caller's bytes is the SHELL, inside the pending
-   *      `this.api.write(...)`, and that drain lives exactly as long as the call";
+   *      `rawApi\(this\)\.write\(...\)`, and that drain lives exactly as long as the call";
    *   2. "there is no host-side cancel for a deferred-reply call to invoke
    *      anyway — `guarded()`'s abort path ends in `iterator.return()`, which a
    *      write has no equivalent of".
@@ -402,7 +459,7 @@ export class HandsService extends Service {
   ): Promise<HandsWriteResult> {
     assertReceiver(this, "write")
     // The path is audited; the payload is deliberately not even touched here.
-    this.record(this, "write", JSON.stringify(path))
+    record(this, "write", JSON.stringify(path))
 
     // Registered BEFORE the first `await`, so the guard covers the whole call
     // including the window before the shell has asked for its first chunk.
@@ -412,7 +469,7 @@ export class HandsService extends Service {
     })
 
     try {
-      return await this.api.write(
+      return await rawApi(this).write(
         path,
         // ⚠ `encodeStream` is INSIDE the wrapper on purpose: the wrapper must
         // check the guard before every pull, and a pull of `encodeStream` is what
@@ -434,9 +491,9 @@ export class HandsService extends Service {
   /** Watch a path. The iterable's end cancels the subscription. */
   watch(path: string, opts?: { recursive?: boolean }): AsyncIterable<HandsChange> {
     assertReceiver(this, "watch")
-    this.record(this, "watch", JSON.stringify(path))
+    record(this, "watch", JSON.stringify(path))
     return this.guarded(async () => {
-      const stream = this.api.watch(path, opts)
+      const stream = rawApi(this).watch(path, opts)
       return decodeChanges(stream)
     })
   }
@@ -466,9 +523,9 @@ export class HandsService extends Service {
    */
   list(path: string, opts?: HandsListOptions): AsyncIterable<HandsListBatch> {
     assertReceiver(this, "list")
-    this.record(this, "list", JSON.stringify(path))
+    record(this, "list", JSON.stringify(path))
     return this.guarded(async () => {
-      const stream = this.api.list(path, opts)
+      const stream = rawApi(this).list(path, opts)
       return decodeBatches(stream)
     })
   }
@@ -485,7 +542,18 @@ export class HandsService extends Service {
    * registration when the stream ends or is cancelled, so a bulk sync does not
    * accumulate one entry per file (measured: 1000 unreleased ones survive).
    */
-  private guarded<T>(open: () => Promise<AsyncIterable<T>>): AsyncIterable<T> {
+  /**
+   * Wrap a stream so its teardown is bound to the CALLER's lifecycle.
+   *
+   * ⚠ **Deliberately not `private`.** The modifier would be a lie: prototype members are
+   * reachable at runtime through the Cordis per-caller shadow, so a plugin could call it
+   * regardless. It is also not an escalation — a plugin can already do the same thing with
+   * its own `ctx.effect`, and this method only calls `registerGuard` below. Marking it
+   * `private` would imply a boundary that does not exist; naming it plainly is the honest
+   * option. (Contrast `rawApi`/`record`, which ARE module-level because reaching them
+   * genuinely bypasses the audit.)
+   */
+  guarded<T>(open: () => Promise<AsyncIterable<T>>): AsyncIterable<T> {
     const self = this
     return {
       [Symbol.asyncIterator]() {
@@ -614,7 +682,14 @@ export class HandsService extends Service {
   }
 
   /** Register the per-stream guard on the calling ctx and return its disposer. */
-  private registerGuard(onAbort: () => void): () => void {
+  /**
+   * Register an abort hook on the CALLER's ctx.
+   *
+   * ⚠ Deliberately not `private` — see `guarded` above for why the modifier would be
+   * misleading rather than protective. A plugin calling this directly gains nothing it
+   * could not already do with `ctx.effect`.
+   */
+  registerGuard(onAbort: () => void): () => void {
     const disposer = this.ctx.effect(() => () => {
       onAbort()
     })
