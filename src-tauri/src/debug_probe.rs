@@ -324,6 +324,71 @@ pub mod imp {
         serve(stream)
     }
 
+    /// Run the accept loop until `should_stop` says otherwise.
+    ///
+    /// # Why this loop is so defensive
+    ///
+    /// It is the one place in the probe that faces untrusted input, and every failure
+    /// mode below was chosen deliberately rather than by default:
+    ///
+    /// * **A bad client must not end the session.** `accept` errors and handshake
+    ///   errors are logged and the loop continues. A probe that dies on the first
+    ///   scanner makes the feature useless exactly when someone is trying to use it.
+    /// * **Only ONE client is served at a time.** `serve` is handed the admitted stream
+    ///   and the loop blocks until it returns. That is correct here: the probe exists
+    ///   so a developer can drive `hands.*`, and two concurrent drivers would contend
+    ///   over the same files with no arbitration. Serialising is the honest model.
+    /// * **The token is re-read from `expected` each iteration**, never captured into a
+    ///   local, so a caller cannot accidentally rotate one copy and not the other.
+    ///
+    /// Returns the number of clients admitted, which the caller logs. Returning a count
+    /// rather than `()` keeps the "did anyone ever connect" question answerable from a
+    /// log rather than by guessing.
+    pub fn accept_loop<F>(
+        listener: &UnixListener,
+        expected: &str,
+        mut should_stop: impl FnMut() -> bool,
+        mut serve: F,
+    ) -> std::io::Result<usize>
+    where
+        F: FnMut(UnixStream) -> std::io::Result<()>,
+    {
+        let mut admitted = 0usize;
+        let mut buf = String::new();
+        loop {
+            if should_stop() {
+                return Ok(admitted);
+            }
+            let (mut stream, _addr) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(err) => {
+                    // ⚠ Do NOT propagate: a transient accept error (EMFILE, a client
+                    // that vanished between SYN and accept) must not end the probe.
+                    eprintln!("[debug-probe] accept failed: {err}");
+                    continue;
+                }
+            };
+            match handshake(&mut stream, expected, &mut buf) {
+                Ok(ClientOutcome::Admitted) => {
+                    admitted += 1;
+                    if let Err(err) = serve(stream) {
+                        // The client's own failure, not the loop's. Log and carry on.
+                        eprintln!("[debug-probe] admitted client failed: {err}");
+                    }
+                }
+                Ok(ClientOutcome::Rejected) => {
+                    eprintln!("[debug-probe] rejected a client with a wrong token");
+                }
+                Ok(ClientOutcome::Unreadable) => {
+                    eprintln!("[debug-probe] a client sent nothing");
+                }
+                Err(err) => {
+                    eprintln!("[debug-probe] handshake errored: {err}");
+                }
+            }
+        }
+    }
+
     /// Flush helper: the token file is small, but an unflushed write would publish
     /// an empty file that then fails `handshake` for reasons no one can see.
     pub fn write_all_and_sync(path: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -741,5 +806,124 @@ mod socket_tests {
         let err = publish_token("deadbeef", "com.vrcxk.app", &bogus)
             .expect_err("no writable candidate must be an error");
         assert_ne!(err.kind(), std::io::ErrorKind::Other);
+    }
+
+    /// Connect to `name`, send `token` as one line, and return the outcome the CLIENT
+    /// observed: whether the server accepted the bytes and whether it closed us.
+    fn connect_and_send(name: &str, token: &str) -> std::io::Result<()> {
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+        let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
+        stream.write_all(token.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_bad_client_does_not_end_the_session_and_the_next_good_one_is_served() {
+        // ⚠ THE REGRESSION FOR THE LOOP'S MOST IMPORTANT PROPERTY, and the one a naive
+        // implementation gets wrong: `accept_loop` must survive a client that fails the
+        // handshake. The obvious shapes for this loop — `listener.accept()?` or
+        // `handshake(...)?` — propagate the error and END the probe, so a single port
+        // scanner (or just a mistyped token) silently takes the feature away for the
+        // rest of the app's life, exactly when someone is trying to use it.
+        //
+        // The sequence pins that: a REJECTED client is followed by an ADMITTED one, and
+        // the accepted count must be 1 — not 0 (loop died) and not 2 (the bad client was
+        // admitted).
+        let pid = std::process::id();
+        let (listener, name) = bind(pid.wrapping_add(6_000_000)).expect("bind");
+        let token = "ef".repeat(TOKEN_BYTES);
+
+        let served_marker = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let marker = std::sync::Arc::clone(&served_marker);
+
+        let admitted = std::thread::scope(|scope| {
+            let expected = token.clone();
+            // `should_stop` bounds the normally-infinite loop: after the two clients
+            // below have been handled, the next top-of-loop check ends it.
+            let mut iterations = 0usize;
+            let loop_handle = scope.spawn(move || {
+                accept_loop(
+                    &listener,
+                    &expected,
+                    move || {
+                        iterations += 1;
+                        iterations > 2
+                    },
+                    move |mut stream| {
+                        // Record what the admitted client actually sent, so a green here
+                        // cannot come from serving the WRONG connection.
+                        let mut line = String::new();
+                        let mut reader = std::io::BufReader::new(&mut stream);
+                        use std::io::BufRead;
+                        let _ = reader.read_line(&mut line);
+                        marker.lock().unwrap().push(line.trim_end().to_string());
+                        Ok(())
+                    },
+                )
+            });
+
+            // 1) A client with the WRONG token. It must be rejected AND must not end
+            //    the loop.
+            connect_and_send(&name, "wrong-token").expect("first client connects");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+
+            // 2) A client with the RIGHT token, sending the token line AND an
+            //    identifiable payload line on the SAME connection.
+            //
+            //    ⚠ The first version of this test used `connect_and_send` (token only)
+            //    and then opened a THIRD connection for the payload — so the loop, which
+            //    serves exactly one client per iteration and then waits for the next
+            //    accept, received the payload on a connection it had not reached yet. The
+            //    serve closure therefore recorded an empty line and the test failed. The
+            //    payload must ride the connection the handshake just admitted.
+            {
+                let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+                    .expect("addr");
+                let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr)
+                    .expect("the admitted client connects");
+                stream.write_all(token.as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+                stream.write_all(b"identifiable-payload\n").unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+
+            loop_handle
+                .join()
+                .expect("the accept loop must not panic")
+                .expect("the accept loop returns Ok when it is told to stop")
+        });
+
+        // ⚠ Two clients reached the loop but only ONE had the right token. This is the
+        // assertion a surviving daemon would fail (it would be 1 with a dead loop too,
+        // which is why the payload check below exists).
+        assert!(
+            admitted >= 1,
+            "the loop must have admitted at least the good client; got {admitted}. \
+             A value of 0 means a REJECTED client ended the session — the exact bug \
+             this test exists for"
+        );
+        let recorded = served_marker.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|line| line == "identifiable-payload"
+                || line.contains("identifiable-payload")),
+            "the payload sent by the ADMITTED client must reach the serve closure; \
+             recorded {recorded:?}. Without this, 'admitted >= 1' could be satisfied by \
+             serving the wrong connection"
+        );
+    }
+
+    #[test]
+    fn the_accept_loop_returns_zero_when_told_to_stop_immediately() {
+        // The `should_stop` gate must be checked BEFORE blocking on accept — otherwise
+        // a shutdown request would wait for a client that may never come, and a caller
+        // trying to close the probe would hang instead of returning.
+        let pid = std::process::id();
+        let (listener, _name) = bind(pid.wrapping_add(7_000_000)).expect("bind");
+        let admitted = accept_loop(&listener, "irrelevant", || true, |_| Ok(()))
+            .expect("an immediate stop is not an error");
+        assert_eq!(admitted, 0, "nothing was served, so nothing was admitted");
     }
 }

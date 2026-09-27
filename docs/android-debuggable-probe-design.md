@@ -1,6 +1,14 @@
 # 可调试自检监听器（Android 真机 e2e 的「指使应用」通道）· 设计
 
-> **状态：设计，未实现。** 本文是「为什么这样设计」的主副本；实现落地后以代码为准。
+> **状态：核心已实现（`src-tauri/src/debug_probe.rs`），端到端尚未接通。**
+> 本文是「为什么这样设计」的主副本；实现以代码为准。
+>
+> | 部分 | 状态 |
+> |---|---|
+> | `policy`（纯判据：是否服务 / token 比较 / socket 命名） | ✅ 已实现，**全平台可测**（Windows 跑 4 条） |
+> | `imp` 的 socket 半边（绑定 / 握手 / accept loop / token 发布） | ✅ 已实现，**在真 Linux 上跑过 16 条**（`cfg(any(linux, android))`） |
+> | `imp::is_debuggable` 的 Android 分支（读 `FLAG_DEBUGGABLE`） | ⚠ **stub，显式返回 `None`（失败关闭）** —— 见 §8 |
+> | 接进 `.setup()` / 发布 token 到 app 目录 / 探针侧 connect transport | ❌ **未做** |
 >
 > **它解决什么**：`docs/hands-capability-proposal.md` §9 缺口 6 —— 手的文件能力
 > （`hands.read/write/stat/watch`）在 Android 上**只经过源码阅读**，`cargo check`
@@ -175,3 +183,47 @@ owner 的要求：**生成一个稍大的随机文件放进去，让应用去读
 | `-d` 产出的 APK 实际文件名 | ⚠ 未实测（需 NDK）；CI 的 `Locate APK` 因此**不猜文件名**，只要求"恰好一个 universal APK" |
 | `AndroidManifest` 是否需要额外权限 | 未查（抽象 socket 的 bind 通常不需要权限；须编译后确认） |
 | iOS | 本设计**只针对 Android**（判据与载体都是 Android 专有） |
+| 接进 `.setup()` | ❌ 未做。⚠ 注意约束：判据要读 webview 的 JNI handle，**只能在窗口建好之后**求值 |
+| token 发布到真实 app 外部目录 | ❌ 未做（`publish_token` 接受候选目录列表，但没人传真实路径） |
+| 探针侧「连接而非 spawn」的 transport | ❌ 未做。`docs/probes/hands-e2e/run.mjs` 现在 `spawn(BIN)`；要加一个 connect 变体 |
+
+---
+
+## 9. 实现期发现的两个**真 bug**（记录以免重犯）
+
+两个都是**我自己写的代码**里的，且都是**测试先放过去**的 —— 值得记下来，因为它们
+说明"看起来测了"与"真的测了"之间的差距。
+
+### 9.1 ⚠ `BufReader::read_line` 会**吞掉 token 之后的第一帧**
+
+第一版 `handshake` 把 stream 包进 `BufReader` 再 `read_line`。`read_line` 一次读最多
+8 KiB，返回 token 行后**把多读的部分连同 reader 一起丢弃**。而 token 行**紧跟 kkrpc 帧**，
+于是 RPC 层永远等一批**已经被扔掉的字节**。
+
+⚠ 更值得注意的是**它的注释声称已经避免了这个问题**（"Only ONE line is read…"），
+代码做的正好相反。**注释描述意图、代码决定行为，两者可以背离** —— 这正是需要
+可证伪测试而非注释的原因。
+
+**修法**：逐字节读（`Token` 64 字节 ⇒ 最多 65 次 `read`，每次调试会话只开一次连接）。
+这是唯一**不可能 over-read** 的形状。另加 `MAX_TOKEN_LINE` 防止不发 `\n` 的客户端
+让 reader 无限增长。
+
+**为什么第一轮 12 条测试全都抓不到它**：它们都只发 token、不发后续帧 ⇒
+缓冲读**永远没有东西可多读**。补的
+`the_handshake_does_not_swallow_bytes_that_follow_the_token` 让客户端**一次写入**
+「token 行 + 一个帧」，注入验证确认：恢复 `BufReader` ⇒ 该用例 FAILED。
+
+### 9.2 ⚠ accept loop 的一个**naive 形状会让单个坏客户端终结整个会话**
+
+`accept_loop` 里若写成 `handshake(...)?` 或 `listener.accept()?`，那么一个**端口扫描器**
+或**一次拼错的 token** 就会让探针**永久消失** —— 恰好发生在有人正要用它的时候。
+
+**修法**：accept/握手/handshake 的错误**一律只记录、不传播**，循环继续。
+`a_bad_client_does_not_end_the_session_and_the_next_good_one_is_served` 钉住它：
+先一个错 token 的客户端，再一个对的，**admitted 必须 ≥1**（0 = 循环死了）。
+注入验证：让 `Rejected` 分支 `return` ⇒ 该用例 FAILED。
+
+⚠ 该用例**第一次写也是错的**：它用 `connect_and_send` 发完 token 后**另开第三条连接**
+发 payload，而循环每次只服务一个客户端、然后等下一次 accept ⇒ serve 闭包记录到空行。
+**payload 必须走握手刚放行的那条连接**。这是"测试自身有 bug"的又一例 ——
+若当时只断言 `admitted >= 1` 而不检查 payload 内容，这个错误会被掩盖。
