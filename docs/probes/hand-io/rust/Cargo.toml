@@ -1,0 +1,27 @@
+[package]
+name = "handio-probe"
+version = "0.1.0"
+edition = "2021"
+
+# Throwaway probe crate: NOT a workspace member of VRCX-K (it lives in .temp/).
+# It exists to answer one question with a real measurement rather than by reading
+# source: can the hands (Rust) move a large file over kkrpc/stdio as it is
+# actually framed today — one JSON object per line, text only?
+
+# Empty `[workspace]` opts this crate OUT of the VRCX-K root workspace, so
+# building it never touches the real Cargo.lock or the src-tauri build.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+
+# The streaming peer is a SECOND binary in the same throwaway crate, so it shares
+# the dependency block above and the build cache.
+[[bin]]
+name = "handio-stream"
+path = "src/bin/stream.rs"

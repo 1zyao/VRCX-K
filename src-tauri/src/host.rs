@@ -152,6 +152,13 @@ struct HostInner {
     /// exit happened inside the stable window (streak not forgiven) or after
     /// it (streak forgiven). Cleared on adopt, set on promote_ready.
     ready_at: Option<Instant>,
+    /// Whether the bridge-reader failure of THIS generation has already been
+    /// recorded into the snapshot.
+    ///
+    /// The peer's `link_failure()` is monotonic (the first failure wins), so a
+    /// poll without this latch would rewrite `last_error` every 30 ms forever.
+    /// Reset with the rest of the generation in `clear()`.
+    bridge_failure_recorded: bool,
 }
 
 impl HostInner {
@@ -162,6 +169,9 @@ impl HostInner {
         // The child is gone: a snapshot must never advertise a dead pid/port.
         self.lifecycle.pid = None;
         self.lifecycle.port = None;
+        // Per-generation: the next generation's reader thread must be able to
+        // record its OWN failure, so the latch cannot outlive the peer it describes.
+        self.bridge_failure_recorded = false;
     }
 }
 
@@ -178,6 +188,7 @@ impl Default for HostInner {
             fail_streak: 0,
             backoff: INITIAL_BACKOFF,
             ready_at: None,
+            bridge_failure_recorded: false,
         }
     }
 }
@@ -982,8 +993,96 @@ fn watch_until_exit(state: &HostState, rx: &Receiver<HostCommand>) -> WatchOutco
                     return WatchOutcome::Stopped;
                 }
             }
+            // ⚠ THE PROCESS BEING ALIVE IS NOT THE SAME AS THE BRIDGE BEING ALIVE,
+            // and this loop used to conflate them.
+            //
+            // `try_wait` above only sees the child. But the child's stdout is drained
+            // by `kkrpc_peer`'s reader thread, and if THAT thread stops — a
+            // persistent read error, or a flood of unparseable lines — the bridge is
+            // dead while the process is still running and still holding its ws port.
+            // Every check above then reports a healthy host: `try_wait` says running,
+            // the phase stays `Ready`, and the UI shows a host that answers nothing.
+            //
+            // The peer cannot fix this itself (it does not own the lifecycle), so it
+            // publishes the reason and the supervisor — which owns BOTH the state and
+            // the peer — polls for it here, on a loop that already wakes every 30 ms.
+            // Polling rather than the push callback `link_failure_notify` offers is
+            // deliberate: `HostState` is held as Tauri state, not behind an `Arc`, so
+            // it cannot be captured by that callback's `'static` bound, and inventing
+            // a channel to work around it would add a second source of truth for
+            // liveness.
+            //
+            // ⚠ IT ONLY RECORDS. IT DOES NOT DECIDE THE OUTCOME, and that restraint is
+            // the fix for a real hang rather than a style choice. This block used to
+            // return `WatchOutcome::StdioLost` whenever the reader reported a clean
+            // EOF, on the reasoning that a dead transport means a dying child. That
+            // reasoning was wrong in a way that cost 28 minutes of CI:
+            //
+            //   * `StdioLost` is defined by an EXIT CODE (`HOST_STDIO_LOST_EXIT`), and
+            //     its whole purpose is to be exempt from the restart-storm budget
+            //     ("not the host's fault"). Choosing it from a transport EOF — an
+            //     observation that carries NO exit code — claims that exemption
+            //     without the evidence for it.
+            //   * Every host exit closes stdout, so exit 51 (a deliberate restart
+            //     request) also surfaced here as `Closed`. Returning `StdioLost`
+            //     therefore skipped `note_exit`, the storm cap was never reached, and
+            //     the supervisor relaunched forever. The test that asserts the cap
+            //     (`exit_51_loop_inside_stable_window_...`) blocked in `thread::scope`'s
+            //     join until the job's 30-minute wall killed it.
+            //   * Note the short-circuit bought nothing even in the good case: stdout
+            //     EOF means the child has closed it, so `try_wait` above observes the
+            //     exit on its own. It saved no latency and created a race — one that
+            //     passed on the previous run and hung on this one.
+            //
+            // So the exit code stays the authority: `try_wait` classifies this
+            // generation, exactly as it did before this block existed. Keep it that
+            // way — do not reintroduce a return here.
+            let bridge = inner
+                .peer
+                .as_ref()
+                .and_then(|peer| peer.link_failure())
+                .map(|failure| (failure, inner.bridge_failure_recorded));
+            if let Some((failure, already_recorded)) = bridge {
+                if !already_recorded {
+                    inner.bridge_failure_recorded = true;
+                }
+                drop(inner);
+                note_bridge_failure(state, failure, already_recorded);
+                inner = state.inner.lock().expect("host");
+            }
         }
         std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// Record a bridge-reader failure into the snapshot, and nothing else.
+///
+/// ⚠ This function deliberately returns NOTHING. It records the reason so the
+/// SNAPSHOT carries it; it does not decide the generation's outcome, because the
+/// exit code is the authority for that and this observation carries none. A
+/// previous version returned a verdict — `TransportClosed` on a clean EOF — and
+/// the caller turned that into `WatchOutcome::StdioLost`. That skipped the
+/// restart-storm accounting (see `watch_until_exit`), so a deliberate exit 51 was
+/// never billed, the cap was never reached, and a test blocked until CI killed the
+/// job 28 minutes later. Keep this a report.
+///
+/// ⚠ It also does NOT declare the host `Failed`: a stopped reader is not proof the
+/// process died — `LinkFailure::Read` explicitly means the child may be alive with a
+/// broken stdout — and forcing `Failed` here would race the supervisor's own restart
+/// logic. `record_spawn_error` is the existing mechanism for "the cause must reach
+/// the snapshot", so the condition becomes visible without this code claiming more
+/// than it can see.
+///
+/// `already_recorded` is the per-generation latch: `link_failure()` is monotonic
+/// (the first failure wins), so without it a 30 ms poll would rewrite `last_error`
+/// forever.
+fn note_bridge_failure(
+    state: &HostState,
+    failure: crate::kkrpc_peer::LinkFailure,
+    already_recorded: bool,
+) {
+    if !already_recorded {
+        state.record_spawn_error(&format!("host bridge reader stopped: {failure:?}"));
     }
 }
 
@@ -1217,6 +1316,18 @@ fn start_host_process(app: Option<&AppHandle>) -> Result<StartingHost, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    // ⚠ Tell the host WHERE to write its log file, because on a release build it
+    // has nowhere else to put it. The shell is `windows_subsystem = "windows"`
+    // (`main.rs`), so there is no console and the host's stderr — where every
+    // `[cap]` audit line and every `#24` overreach warning goes — is discarded.
+    // Without this the whole declare-and-warn feature was invisible on a user's
+    // machine, which is exactly what `#24` promises it is not.
+    //
+    // The shell owns the location because it is the component that knows the
+    // app's data directory; the host is a sidecar and must not guess it.
+    if let Some(dir) = host_log_dir(app) {
+        cmd.env("VRCXK_LOG_DIR", dir);
+    }
     let mut tree = ProcessTree::spawn(&mut cmd).map_err(|err| {
         format!(
             "spawn {} in {}: {err}",
@@ -1280,7 +1391,20 @@ fn start_host_process(app: Option<&AppHandle>) -> Result<StartingHost, String> {
     if let Some(app) = app {
         register_shell_handlers(&peer, app.clone());
     }
+    // The file capabilities are registered unconditionally: unlike the tray
+    // surface they have no Tauri dependency, and a `hands.*` method that is
+    // simply absent would be indistinguishable from a typo'd name at the host.
+    crate::hands::register_hands_handlers(&peer);
     peer.start_reader(stdout);
+    // Announce who this node is, and from where.
+    //
+    // Sent AFTER the reader starts so the write cannot interleave with the
+    // reader's own setup, and so the brain sees it as an ordinary method call on
+    // an established channel. It is a notification, not a request: nothing waits
+    // for an answer, and a brain that does not know `hands.hello` yet simply logs
+    // an unknown method — which is why this needs no negotiation to be safe to
+    // deploy on one side first.
+    crate::hands_hello::send_hello(&peer);
     Ok(StartingHost {
         tree,
         peer,
@@ -1553,6 +1677,24 @@ fn resolve_host_launch(app: Option<&AppHandle>) -> Result<HostLaunch, String> {
     let cwd_override = std::env::var_os("VRCXK_HOST_DIR").map(PathBuf::from);
     let resource_dir = app.and_then(|app| app.path().resource_dir().ok());
     resolve_host_launch_with(resource_dir, explicit, cwd_override, tauri::is_dev())
+}
+
+/// Where the host should write its log file, if we can determine it.
+///
+/// ⚠ This exists because the host's stderr goes NOWHERE in a release build. The
+/// shell is `windows_subsystem = "windows"` (`main.rs`), so there is no console
+/// attached; on desktop the host is spawned with `stderr(Stdio::inherit())`, which
+/// inherits a handle that leads to no window. Every `[cap]` audit line and every
+/// `#24` overreach warning was therefore written and thrown away, while `#24`
+/// states its whole honest scope as "undeclared access becomes VISIBLE".
+///
+/// The SHELL resolves this because it owns the app's data directory; the host is a
+/// sidecar and cannot know the user's profile layout. `None` means "no log file",
+/// which the host must treat as "stay on stderr" rather than as an error — that is
+/// the correct behaviour in dev and in tests, where stderr IS readable.
+fn host_log_dir(app: Option<&AppHandle>) -> Option<String> {
+    let dir = app?.path().app_log_dir().ok()?;
+    Some(dir.to_string_lossy().into_owned())
 }
 
 /// Pure core of `resolve_host_launch` (inputs passed in for testability).
@@ -2064,6 +2206,147 @@ mod tests {
             max_backoff: Duration::from_millis(40),
             max_failures: cap,
         })
+    }
+
+    #[test]
+    fn a_bridge_failure_is_recorded_in_the_snapshot_without_claiming_the_host_died() {
+        // ⚠ THE REGRESSION for the zombie-\`Ready\` state. The peer's reader thread is
+        // the only thing draining the child's stdout; when it stops, the process can
+        // still be alive and still hold its ws port, so \`try_wait\` says "running",
+        // the phase stays \`Ready\`, and the UI shows a healthy host that answers
+        // nothing. Nothing else in the supervisor could see that, so the reason has
+        // to reach the SNAPSHOT — which is what the UI and tray actually read.
+        //
+        // ⚠ And it must NOT be reported as \`Failed\`: a stopped reader is not proof of
+        // death (\`LinkFailure::Read\` means the child may be alive with a broken
+        // stdout), and declaring it dead here would race the restart logic.
+        let state = storm_state(Duration::from_secs(30), 3);
+        note_bridge_failure(
+            &state,
+            crate::kkrpc_peer::LinkFailure::Read {
+                kind: std::io::ErrorKind::BrokenPipe,
+                message: "the pipe is gone".into(),
+                consecutive: 3,
+            },
+            false,
+        );
+        // No verdict to assert any more: the function reports and returns nothing, so
+        // that the exit code keeps sole authority over the outcome. What matters here
+        // is that the reason reached the snapshot and that nothing was declared dead.
+        let snapshot = state.lifecycle_snapshot();
+        let reason = snapshot
+            .last_error
+            .as_deref()
+            .expect("the cause must reach the snapshot, not just stderr");
+        assert!(
+            reason.contains("bridge") && reason.contains("the pipe is gone"),
+            "the reason must name the bridge and carry the peer's message, got: {reason}"
+        );
+        assert_ne!(
+            snapshot.phase,
+            HostLifecycleState::Failed,
+            "a dead reader must not be reported as a dead host"
+        );
+    }
+
+    #[test]
+    fn a_closed_transport_is_recorded_and_the_exit_code_still_decides_the_outcome() {
+        // ⚠ THE REGRESSION FOR A 28-MINUTE CI HANG, and it was MY bug.
+        //
+        // A clean EOF used to make the supervisor return `WatchOutcome::StdioLost`
+        // straight away. That is wrong on two counts, and both are pinned here:
+        //
+        //   1. `StdioLost` is defined by an EXIT CODE (`HOST_STDIO_LOST_EXIT`) whose
+        //      entire purpose is exemption from the restart-storm budget. Choosing it
+        //      from a transport EOF — which carries no exit code — claims an exemption
+        //      without the evidence for it.
+        //   2. Every host exit closes stdout, so a deliberate exit 51 was ALSO seen
+        //      here as `Closed`. Returning `StdioLost` skipped `note_exit`, the storm
+        //      cap was never reached, and the supervisor relaunched forever.
+        //
+        // The hang itself was the join in `thread::scope`: the test that asserts the
+        // cap panicked on the phase while the scope still had to join a supervisor
+        // that never stopped, so the job's 30-minute wall killed it. This test is
+        // deterministic ON PURPOSE — the bug was a RACE (it passed on the previous run
+        // and hung on the next), so "I ran it six times and it passed" is not evidence.
+        let state = storm_state(Duration::from_secs(30), 3);
+
+        // The report is still recorded: that is the whole point of polling.
+        note_bridge_failure(&state, crate::kkrpc_peer::LinkFailure::Closed, false);
+        let recorded = state
+            .lifecycle_snapshot()
+            .last_error
+            .expect("the cause must still reach the snapshot");
+        assert!(
+            recorded.contains("Closed"),
+            "the recorded reason should name the failure kind: {recorded}"
+        );
+
+        // ⚠ And the OUTCOME is still the exit code's to decide. Reaching the storm cap
+        // is what broke, so assert the classification directly: exit 51 must be a
+        // billable restart request, never the exempt path.
+        assert!(
+            matches!(
+                classify_exit_code(Some(HOST_RESTART_EXIT)),
+                WatchOutcome::RestartRequested
+            ),
+            "a deliberate restart request must stay billable, whatever the reader saw"
+        );
+        assert!(
+            !matches!(
+                classify_exit_code(Some(HOST_RESTART_EXIT)),
+                WatchOutcome::StdioLost
+            ),
+            "⚠ exit {HOST_RESTART_EXIT} must never take the exempt path: that is the \
+             exemption a transport EOF has no evidence to award"
+        );
+    }
+
+    #[test]
+    fn a_bridge_failure_is_recorded_once_even_though_it_is_polled_forever() {
+        // \`link_failure()\` is monotonic (the first failure wins), and the supervisor
+        // polls it every 30 ms. Without the latch the same reason would be rewritten
+        // into \`last_error\` for the life of the process — harmless-looking, but it
+        // would also overwrite a LATER, more specific cause with a stale one.
+        let state = storm_state(Duration::from_secs(30), 3);
+        let first = crate::kkrpc_peer::LinkFailure::Read {
+            kind: std::io::ErrorKind::BrokenPipe,
+            message: "first cause".into(),
+            consecutive: 1,
+        };
+        note_bridge_failure(&state, first, false);
+        let recorded = state.lifecycle_snapshot().last_error;
+        assert!(recorded.as_deref().unwrap_or("").contains("first cause"));
+
+        // A later poll must not rewrite it.
+        state.record_spawn_error("a different, later reason");
+        note_bridge_failure(&state, crate::kkrpc_peer::LinkFailure::Closed, true);
+        let after = state.lifecycle_snapshot().last_error;
+        assert_eq!(
+            after.as_deref(),
+            Some("a different, later reason"),
+            "an already-recorded failure must not overwrite a newer cause"
+        );
+    }
+
+    #[test]
+    fn the_bridge_failure_latch_does_not_outlive_its_generation() {
+        // Per-generation state: the next generation's reader must be able to record
+        // its OWN failure. \`clear()\` runs when the child goes away.
+        let state = storm_state(Duration::from_secs(30), 3);
+        {
+            let mut inner = state.inner.lock().expect("host");
+            inner.bridge_failure_recorded = true;
+        }
+        {
+            let mut inner = state.inner.lock().expect("host");
+            inner.clear();
+        }
+        let inner = state.inner.lock().expect("host");
+        assert!(
+            !inner.bridge_failure_recorded,
+            "the latch must reset with the generation it describes"
+        );
     }
 
     fn force_ready_at(state: &HostState, when: Instant) {

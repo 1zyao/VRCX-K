@@ -18,6 +18,49 @@ import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+/**
+ * Narrow a `Bun.spawn` / `node:child_process` stream field to a real pipe.
+ *
+ * ⚠ WHY THIS LIVES HERE. `Bun.spawn` types `stdin`/`stdout`/`stderr` as
+ * `number | <stream> | undefined` because those fields can legitimately hold a
+ * file descriptor or nothing — the union depends on the OPTIONS passed, and
+ * TypeScript cannot narrow on the literal `"pipe"`. So
+ * `readReady(proc.stderr)` / `drain(proc.stdout)` / `new Response(proc.stdout)`
+ * pass a union where a stream is required.
+ *
+ * ⚠ THE TYPE PARAMETER IS `T extends object`, AND THAT IS THE WHOLE POINT.
+ * A plain `pipe<T>(end: T | undefined | null): T` removes `undefined` but NOT
+ * the `number` arm — `T` simply infers as `number | ReadableStream` and the
+ * error survives with a shorter union. (Measured: the first version of this
+ * helper did exactly that, and the count stayed at 54 while the message changed
+ * from `number | ReadableStream | undefined` to `number | ReadableStream`.)
+ * Constraining `T` to an object forces inference to drop `number`, so the
+ * declared result is genuinely the stream. The runtime check below enforces the
+ * same thing the type now promises.
+ *
+ * Two test files (`stdin-loss`, `stdio-ready`) had each grown their own private
+ * copy of this helper with the same body and the same rationale; the remaining
+ * files simply did not narrow at all, which is where the type errors came from.
+ * Promoting ONE shared definition is the point: three copies of the same
+ * "assert the fixture was spawned correctly" helper is how one of them silently
+ * drifts from the others.
+ *
+ * It THROWS rather than asserting with `as`: a fixture that stops passing
+ * `"pipe"` then fails loudly and by name, instead of producing `undefined` that
+ * later surfaces as "cannot read property getReader of undefined".
+ */
+export function pipe<T extends object>(end: T | number | undefined | null, name: string): T {
+  if (end === undefined || end === null) {
+    throw new Error(`spawned host has no ${name} pipe (was it spawned with "pipe"?)`)
+  }
+  if (typeof end === "number") {
+    throw new Error(
+      `${name} is a file descriptor (${end}), not a pipe — spawn it with \`${name}: "pipe"\``,
+    )
+  }
+  return end
+}
+
 let warmed = false
 
 /** Resolve the real bun executable, mirroring the Rust shell's find_bun. */

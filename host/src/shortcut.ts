@@ -18,6 +18,9 @@
 // never delivered.
 
 import { type Context, Service } from "cordis"
+import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
+import { callerName, overreachWarning } from "./overreach"
+import { createSecretSlot } from "./service-secret"
 import type { ShellShortcutBridge, ShortcutPressEvent, ShortcutRegistration } from "./stdio"
 
 declare module "cordis" {
@@ -66,8 +69,15 @@ export function normalizePress(value: unknown): ShortcutPressEvent | undefined {
   return { accelerator: candidate.accelerator, id: candidate.id }
 }
 
+/**
+ * ⚠ Bridge and manifest lookup live in {@link createSecretSlot} slots, not in fields.
+ * See `service-secret.ts` for the measured alternatives. This service guarded a **global
+ * hotkey**, and the same `private`-field reach exposed the whole bridge.
+ */
+const bridgeSlot = createSecretSlot<ShellShortcutBridge>()
+const lookupSlot = createSecretSlot<(entryId: string) => VRCXKPluginManifest | undefined>()
+
 export class ShortcutService extends Service {
-  private bridge?: ShellShortcutBridge
   private detach?: () => void
   private closed = false
   private readonly logLine: (line: string) => void
@@ -76,8 +86,27 @@ export class ShortcutService extends Service {
 
   constructor(ctx: Context, options: ShortcutServiceOptions = {}) {
     super(ctx, "shortcut")
-    this.bridge = options.bridge
+    if (options.bridge) this.attachShell(options.bridge)
     this.logLine = options.log ?? (() => {})
+  }
+
+  /** Give the service the manifest registry so `#24` can compare declare vs actual. */
+  useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
+    lookupSlot.set(this, lookup)
+  }
+
+  /**
+   * One audit line per caller-visible operation, plus the `#24` check.
+   *
+   * Called from `register`/`unregister` — the two entry points a plugin reaches
+   * through `ctx.shortcut`. Recording only the failures (as the old diagnostics
+   * did) is what made an undeclared call indistinguishable from a declared one.
+   */
+  private record(self: unknown, method: string, detail: string): void {
+    const who = callerName(self) ?? "<unknown>"
+    this.logLine(`[cap] ${who} -> shortcut.${method}${detail ? ` ${detail}` : ""}`)
+    const warning = overreachWarning(self, `shortcut.${method}`, lookupSlot.get(this))
+    if (warning) this.logLine(warning)
   }
 
   /**
@@ -89,19 +118,23 @@ export class ShortcutService extends Service {
   attachShell(bridge: ShellShortcutBridge): void {
     if (this.closed) return
     this.detach?.()
-    this.bridge = bridge
+    bridgeSlot.set(this, bridge)
     this.detach = bridge.onPress((event) => this.dispatchPress(event))
   }
 
   detachShell(): void {
     this.detach?.()
     this.detach = undefined
-    this.bridge = undefined
+    bridgeSlot.clear(this)
   }
 
   /** Register a chord and bind a handler to it. */
   async register(accelerator: string, handler: ShortcutHandler): Promise<ShortcutRegisterResult> {
-    const bridge = this.bridge
+    // Record BEFORE the work, so a call that fails (or has no shell) is still
+    // attributed — an undeclared attempt must not become invisible just because
+    // it did not succeed.
+    this.record(this, "register", accelerator)
+    const bridge = bridgeSlot.get(this)
     if (this.closed || !bridge) return { status: "no-shell" }
     let registration: ShortcutRegistration
     try {
@@ -122,7 +155,8 @@ export class ShortcutService extends Service {
 
   /** Release a chord and drop its handler. */
   async unregister(accelerator: string): Promise<ShortcutRegisterResult> {
-    const bridge = this.bridge
+    this.record(this, "unregister", accelerator)
+    const bridge = bridgeSlot.get(this)
     if (this.closed || !bridge) return { status: "no-shell" }
     let registration: ShortcutRegistration
     try {
@@ -182,7 +216,7 @@ export class ShortcutService extends Service {
     this.closed = true
     this.detach?.()
     this.detach = undefined
-    this.bridge = undefined
+    bridgeSlot.clear(this)
     this.bindings.clear()
   }
 }

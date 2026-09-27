@@ -1,0 +1,18 @@
+=== BACKPRESSURE: producer behaviour when the consumer stops pulling ===
+0.25 MiB chunks, up to 64 MiB available, stall 800 ms
+client = ws package (node-v24.9.0)
+
+  arm     opened  took  produced while stalled   in-flight   bounded?  cancel stops it
+  gated   true       1                     32          8 MiB  true      true
+  raw     true     256                    256         64 MiB  false     true
+
+=== VERDICT ===
+  kkrpc/streaming: the consumer took 1 chunk and stopped; the producer
+  advanced only 32 chunks (8 MiB) in 800 ms
+  => BOUNDED. Memory while streaming a large file is ~credit x chunk size,
+     NOT the file size. This is what makes 'streaming' true rather than nominal.
+  comparison (no flow control at all): 256 chunks = 64 MiB queued in the socket buffer
+  => gating constrains the producer by 8x
+
+  gated: cancellation — 0 further chunks after close (stopped promptly)
+  raw: cancellation — 0 further chunks after close (stopped promptly)

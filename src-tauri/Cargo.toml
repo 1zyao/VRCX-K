@@ -14,22 +14,82 @@ edition = "2021"
 name = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# ⚠ `dead_code` DENIED FOR THIS CRATE ONLY, and the reason is a measured blind spot
+# rather than tidiness.
+#
+# The crate is full of `#[cfg(desktop)]` blocks (the tray / shortcut / autostart /
+# deep-link handlers), and helpers reached ONLY from them. On a configuration
+# where that cfg is FALSE — i.e. Android, since tauri's build script defines
+# `desktop = !(ios || android)` — those helpers compile with no caller and rustc
+# reports `never used`. On Windows/Linux/macOS `desktop` is TRUE, so the same
+# code is live and NOTHING is reported.
+#
+# That asymmetry is what let a real defect hide: `component_eq` was gated on
+# `any(windows, macos)`, so it was dead on **Linux** — where CI's one clippy run
+# happens — and the Linux job caught it. But the `#[cfg(desktop)]` family is dead
+# only on **mobile**, and no local run and no clippy invocation ever compiles that
+# shape. Measured before this line existed: removing one `#[cfg(desktop)]` gate
+# left Windows/Linux clippy at `exit 0` while the Android target errored.
+#
+# The mobile job ALREADY builds the Android shape (`tauri android build --apk`
+# compiles `aarch64-linux-android` and friends), so denying this lint there costs
+# ZERO extra steps and zero extra compile time: it converts a warning that job was
+# already printing — and ignoring, because `tauri android build` does not treat
+# warnings as errors — into a failure.
+#
+# ⚠ Why `[lints]` and not `RUSTFLAGS=-D dead_code` on the mobile step: RUSTFLAGS
+# is part of the cargo/rust-cache fingerprint, so setting it would invalidate the
+# 511 cached dependencies for all four ABIs and recompile everything — the mobile
+# job's own comment records that LTO alone costs ~45 s per target. `[lints]`
+# applies to this crate only, so only `tauri-app` recompiles.
+#
+# ⚠ Scope check before adding this: it applies to EVERY configuration, including
+# macOS. Grepped for a macOS-ONLY `cfg` item that could be dead there — the only
+# `target_os = "macos"` occurrence is an `assert_eq!` inside a test body, not an
+# item, so nothing can be dead on macOS. If a macOS-only helper is ever added, it
+# must be `#[cfg(target_os = "macos")]`-gated like the others.
+[lints.rust]
+dead_code = "deny"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico"] }
 tauri-plugin-opener = "2"
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-dialog = "2"
 # Cross-platform notifications (desktop win/mac/linux + android/ios under one API).
 # Shell exposes simple notify via this plugin; Windows-deep (buttons/hero) rides
 # tauri-winrt-notification below (added at F3; dependency already provisioned).
 tauri-plugin-notification = "2"
+# Cross-platform OS facts (os): platform/arch/version/family/hostname/locale.
+# Read-only, eight commands, supported on all five platforms. Source of truth for
+# "which machine am I on" — relevant to the multi-device direction (#13), and the
+# cheapest way to make platform-conditional UI decisions.
+tauri-plugin-os = "2"
+# Clipboard access (clipboard-manager). A VRCX-shaped app copies user IDs,
+# instance links and avatar URLs constantly, and we had NO clipboard capability.
+# ⚠ Its default permission set enables NOTHING: every command must be listed
+# explicitly in the capability file, or the call fails at runtime.
+tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
+# File bytes on the wire. `kkrpc`'s stock transport is JSON text, so binary must
+# ride a text carrier; base64 costs 1.33x and is far faster than the
+# numeric-keyed JSON that a raw `Uint8Array` degrades into (docs/probes/hand-io/
+# FINDINGS.md §2 — measured 9.4-10.4x smaller and 112-155x faster).
+base64 = "0.22"
+# File watching — the one file capability with no std equivalent. Stable 8.x, not
+# the 9.0.0-rc line: the rc-only fixes could NOT be reproduced here, so they are
+# not evidence (docs/probes/hand-io/rust-crates/FINDINGS.md §4.6-4.7).
+notify = "8"
+# Stable file identity across rename/rotation. On Windows this is the u128
+# high-resolution id (correct on ReFS), unlike `same-file`'s low-res index, which
+# its own source warns is not unique there (rust-crates/FINDINGS.md §4.2).
+file-id = "0.2"
 typify = { version = "0.7.0", features = ["macro"] }
 # Runtime support emitted by typify for schema regex constraints.
 regress = "0.11.1"
@@ -37,8 +97,51 @@ regress = "0.11.1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# ── Desktop-only plugins ──────────────────────────────────────────────────────
+# ⚠ This table MUST come after the general `[dependencies]` table: a
+# `[target.'…'.dependencies]` heading ends the `[dependencies]` table, so
+# anything written below it belongs to the target section instead. Placing this
+# block mid-file silently moved `serde`/`serde_json`/`base64`/`notify`/`file-id`
+# into it — which builds fine on Windows and then fails to compile EVERY module
+# on Android. `cargo check --target aarch64-linux-android` is what caught it.
+#
+# Gated rather than stubbed: these have no mobile implementation at all (the
+# catalog's platform matrix marks every one of them "none" for Android/iOS), so a
+# desktop dependency here would be dead weight — or a build failure — on mobile.
+# See docs/tauri-plugins/tauri-v2-plugin-catalog.md §3e.
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+# Persist window size/position across restarts. Pure Rust, a few lines in
+# `.setup()`; we had no window-state persistence at all before this.
+tauri-plugin-window-state = "2"
+# "Start with the system". Registration lands in the OS's own startup mechanism
+# (Run key / LaunchAgent / XDG autostart); `MacosLauncher::LaunchAgent` is part of
+# `init()`. ⚠ Users dislike silent startup registration, so the UI must expose a
+# toggle — the shell provides the mechanism, not the policy.
+tauri-plugin-autostart = "2"
+# Custom URL scheme handling (`vrchat://`-style). Windows/Linux support runtime
+# registration; **macOS/Android/iOS require the scheme to be declared in config**
+# and cannot register at runtime. Pairing with `single-instance` needs the latter's
+# `deep-link` feature (above) so a second launch is forwarded instead of opening a
+# second window.
+tauri-plugin-deep-link = "2"
+# Tray-relative window positioning. Only meaningful once a POPUP WINDOW exists —
+# today the tray is a native menu with no second window, so this is provisioned for
+# the future tray-panel, not wired to anything yet.
+# The `tray-icon` feature makes `tauri/tray-icon` available; we already enable that
+# on the `tauri` dependency itself, so the feature is a no-op here rather than a
+# second copy of the same capability.
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
+
 # Windows-deep toast (AUMID/icon/hero/buttons) — tauri-apps official fork of
 # winrt-notification. Provisioned now so F3 depth lands without touching the
 # shell's notification layer; actually used from F3 onward.
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8"
+
+# The debug-only self-probe reads our own `ApplicationInfo.flags` over JNI
+# (`src-tauri/src/debug_probe.rs`). ⚠ `jni` is ALREADY in the tree transitively
+# (`tao → jni 0.21.1`), but a transitive dependency cannot be named — `use jni::…`
+# only compiles if it is declared here. Pinning the same major (`0.21`) keeps cargo
+# from pulling a second copy, so this adds no new code to the build.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

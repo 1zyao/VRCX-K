@@ -1,6 +1,6 @@
 // e-write-failure-rejection.ts — the missing cell E.
 //
-// Review finding (1zyao, on head a06bb328): kkrpc has TWO independent
+// Review finding (1zyao, on the `shell.ready` narrowing): kkrpc has TWO independent
 // "peer is gone" paths, and the narrowing in host/src/index.ts only covers the
 // first:
 //

@@ -1,5 +1,12 @@
 import { type Context, Service, symbols } from "cordis"
-import type { AppInfo, PathKind, ShellStdioBridge, ShellSysAPI } from "./stdio"
+import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
+import { callerEntryId, overreachWarning } from "./overreach"
+import type { AppInfo, OsInfo, PathKind, ShellStdioBridge, ShellSysAPI } from "./stdio"
+
+// Re-exported so callers that already import the caller helpers from this module
+// keep working; the implementation lives in `overreach.ts`, which owns the whole
+// declaration-vs-actual rule (importing the other way would be a cycle).
+export { callerEntryId }
 
 type ShellApi = ShellSysAPI["shell"]
 
@@ -81,7 +88,23 @@ export function callerName(self: unknown): string | null {
  */
 export class ShellHandle {
   bridge?: ShellStdioBridge
+  /**
+   * Looks up a plugin's manifest by `entry.id`, for overreach detection (#24).
+   *
+   * Injected rather than imported so `capability.ts` keeps no dependency on the
+   * manifest registry (which is built during bootstrap and lives behind a
+   * WeakMap). Absent means the check is OFF — a host with no loader (tests, the
+   * shell-less dev mode) has no manifests to compare against, and must not start
+   * warning about every call.
+   */
+  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
+
   constructor(private readonly audit: CapabilityAudit) {}
+
+  /** Enable overreach detection by supplying the manifest registry lookup. */
+  useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
+    this.manifestLookup = lookup
+  }
 
   attach(bridge: ShellStdioBridge): void {
     this.bridge = bridge
@@ -104,6 +127,16 @@ export class ShellHandle {
     const who = callerName(self) ?? "<unknown>"
     const detail = args.length > 0 ? ` ${args.map(describe).join(", ")}` : ""
     this.audit(`[cap] ${who} -> ${method}${detail}`)
+
+    // Overreach: declared vs actual (#24). Warn only — never refuse. See
+    // `overreach.ts` for why an enforcement layer cannot exist at this stage.
+    //
+    // ⚠ This is the RAW mirror's call site. The curated services have their own
+    // audit hooks, and each of them must call `overreachWarning` too — the check
+    // does not live "in `record`" for every path just because it lives in this
+    // one. `ctx.hands` was unchecked for exactly that reason.
+    const warning = overreachWarning(self, method, this.manifestLookup)
+    if (warning) this.audit(warning)
   }
 }
 
@@ -201,6 +234,16 @@ const OS_SPEC: CapabilitySpec = {
   appExit: (s, code) => (s ? s.app.exit(code) : Promise.resolve(false)),
   pathDir: (s) => (s ? s.path.dir() : Promise.resolve(null)),
   pathResolve: (s, kind) => (s ? s.path.resolve(kind) : Promise.resolve("")),
+  // Cross-platform OS facts (platform/arch/version/family/locale/hostname).
+  // Added to `ctx.os` rather than a new service because `#17` already designated
+  // `ctx.os` as the low-risk misc bucket, and a second service named for the OS
+  // would be a genuine ambiguity for plugin authors.
+  platformInfo: (s) => (s ? s.os.info() : Promise.resolve(null)),
+}
+
+const CLIPBOARD_SPEC: CapabilitySpec = {
+  writeText: (s, text) => (s ? s.clipboard.writeText(text) : Promise.resolve(false)),
+  readText: (s) => (s ? s.clipboard.readText() : Promise.resolve(null)),
 }
 
 /**
@@ -239,6 +282,33 @@ const RAW_SHELL: RawShellSpec = {
     resolve: (s, kind) => (s ? s.path.resolve(kind) : Promise.resolve("")),
   },
   devWatchEvent: (s, event) => (s ? s.devWatchEvent(event) : Promise.resolve(false)),
+  clipboard: CLIPBOARD_SPEC,
+  // OS facts live at `shell.os.info` but the curated surface is `ctx.os.platformInfo`
+  // (see OS_SPEC). The raw mirror still has to cover the key — the compile-time
+  // guard in `RawShellSpec` exists precisely to catch a key that is on the wire but
+  // unreachable through the mirror.
+  os: {
+    info: (s) => (s ? s.os.info() : Promise.resolve(null)),
+  },
+  // Desktop-only routes. `?? ` guards because the shell does not register them on
+  // mobile at all: a raw mirror that assumed their presence would throw a
+  // TypeError there instead of reporting "unsupported".
+  autostart: {
+    isEnabled: (s) => (s?.autostart ? s.autostart.isEnabled() : Promise.resolve(false)),
+    setEnabled: (s, enabled) =>
+      s?.autostart
+        ? s.autostart.setEnabled(enabled)
+        : Promise.resolve({ ok: false, error: "unsupported" }),
+  },
+  deepLink: {
+    // ⚠ NO `register`. Removed alongside the curated form (see
+    // `DeepLinkCapability`) because the raw mirror is the OTHER way to reach the
+    // same shell route — leaving it here would make the narrowing theatre: a
+    // plugin would still be one property access away from a persistent registry
+    // write it cannot undo. Both layers move together or neither does.
+    isRegistered: (s, scheme) =>
+      s?.deepLink ? s.deepLink.isRegistered(scheme) : Promise.resolve(false),
+  },
   tray: {
     setSnapshot: (s, snapshot) =>
       s
@@ -259,6 +329,56 @@ export type OsCapability = {
   appExit(code?: number): Promise<boolean>
   pathDir(): Promise<Record<PathKind, string> | null>
   pathResolve(kind: PathKind): Promise<string>
+  /**
+   * Cross-platform OS facts (platform/arch/version/family/locale/hostname), or
+   * `null` with no shell. This is "which machine am I on" — the multi-device
+   * direction (#13) needs it, and it is the cheapest source for platform-
+   * conditional behaviour.
+   */
+  platformInfo(): Promise<OsInfo | null>
+}
+
+/** Text-only clipboard access. */
+export type ClipboardCapability = {
+  writeText(text: string): Promise<boolean>
+  /** `null` when there is nothing to read, or no shell. */
+  readText(): Promise<string | null>
+}
+
+/**
+ * "Start with the system" (desktop only).
+ *
+ * ⚠ Mechanism only: nothing here enables autostart by itself, because whether the
+ * app launches with the system is the user's decision.
+ */
+export type AutostartCapability = {
+  isEnabled(): Promise<boolean>
+  setEnabled(enabled: boolean): Promise<{ ok: boolean; error?: string }>
+}
+
+/**
+ * Custom URL schemes (desktop only — the shell registers no such route on mobile).
+ *
+ * ⚠ `register` IS DELIBERATELY ABSENT. It writes
+ * `HKCU\Software\Classes\<scheme>` and there is no unregister route, so a single
+ * call makes a PERSISTENT, machine-wide change that this application cannot undo
+ * — and `HKCU` outranks `HKLM`, so claiming a class that already exists (measured
+ * with `exefile`) would redirect every `.exe` on the machine to this app.
+ *
+ * ⚠ It is also the wrong half to expose FIRST. The event path is not wired: the
+ * shell calls `deepLink.opened` for inbound URLs, but `tauri.conf.json` declares no
+ * `schemes`, so upstream stops before emitting and nothing ever arrives. Exposing
+ * `register` therefore buys the SIDE EFFECT with none of the FEATURE. Wiring the
+ * four missing pieces (unregister route, `schemes` config, uninstall cleanup, and
+ * a consumer for `opened`) is tracked separately; until then `isRegistered` stays
+ * because reading the current state is harmless and useful for diagnosis.
+ *
+ * The shell-side route still exists and is still validated; it is simply not
+ * reachable from a plugin. See `shell_sys.rs` for the validation and the note on
+ * why `HKCU` collisions matter.
+ */
+export type DeepLinkCapability = {
+  isRegistered(scheme: string): Promise<boolean>
 }
 
 /**
@@ -267,6 +387,17 @@ export type OsCapability = {
  * Two layers, both attributable: the raw `ctx.shell` mirror and the curated
  * `ctx.notify`/`ctx.dialog`/`ctx.window`/`ctx.os` domain services. Must run
  * before plugins load (they may inject these).
+ *
+ * `ctx.hands` is NOT built here: it is a `Service` subclass with its own state
+ * (a shell attachment and per-stream lifecycle guards), so `host/src/index.ts`
+ * constructs it the way it constructs `TrayService`/`ShortcutService`.
+ *
+ * ⚠ There is **no** raw `ctx.shell.hands` mirror. An earlier version of this comment said
+ * there was, and `hands.ts` repeated the claim — but `RAW_SHELL` below has **no `hands`
+ * key** (checked: `notify`/`openUrl`/…/`tray` only). `ctx.hands` is therefore the ONLY
+ * route to these primitives, curated by design: it is what binds a stream's life to its
+ * caller, and it is why `#24` needs its own check on this path rather than inheriting the
+ * mirror's.
  */
 export function createShellCapabilities(ctx: Context, handle: ShellHandle): void {
   buildNode(ctx, "shell", handle, RAW_SHELL)
@@ -274,6 +405,7 @@ export function createShellCapabilities(ctx: Context, handle: ShellHandle): void
   buildNode(ctx, "dialog", handle, DIALOG_SPEC)
   buildNode(ctx, "window", handle, WINDOW_SPEC)
   buildNode(ctx, "os", handle, OS_SPEC)
+  buildNode(ctx, "clipboard", handle, CLIPBOARD_SPEC)
 }
 
 declare module "cordis" {
@@ -289,5 +421,6 @@ declare module "cordis" {
     dialog: ShellSysAPI["shell"]["dialog"]
     window: ShellSysAPI["shell"]["window"]
     os: OsCapability
+    clipboard: ClipboardCapability
   }
 }

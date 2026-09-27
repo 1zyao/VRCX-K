@@ -1,0 +1,21 @@
+=== CONCURRENT TRANSFERS, ONE CONNECTION PER TRANSFER ===
+4 MiB per file (64 x 64 KiB), client = global WebSocket (node-v24.9.0)
+
+  level  exact   wall      aggregate   fastest/slowest   heap delta   verified
+      1    1/1      56ms        72MB/s       26/     26ms       +3.1 MiB  4/4 MiB
+      4    4/4     102ms     156.4MB/s       41/     94ms       +0.8 MiB  16/16 MiB
+
+=== VERDICT ===
+  every transfer byte-exact at every level : true
+  bytes verified / expected across all runs : 20 / 20 MiB
+
+  level 1 baseline                          : 72 MB/s, 56 ms
+  best                                     : level 4, 156.4 MB/s
+  worst                                    : level 1, 72 MB/s
+  scaling vs level 1                       : 2.17x
+  heap delta: L1=+3.1MiB  L4=+0.8MiB
+  interference (slowest - fastest, ms): L1=0  L4=53
+
+  => parallelism DOES raise aggregate throughput, so it is worth offering.
+     Budget by MEMORY, not by throughput: each stream costs buffers, and the
+     heap delta above is the price per level on this machine.

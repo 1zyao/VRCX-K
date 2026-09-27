@@ -1,0 +1,26 @@
+=== EVENT-LOOP LAG DURING FILE I/O (v2) ===
+256 MiB payload, chained 1 ms timer, runtime node-v24.9.0
+
+  operation                              work        lag p50 / p95 / MAX (ms)    vs idle floor
+  IDLE baseline (no work)                   799.3ms    15.41 /   15.97 /     16.6
+  CONTROL readFileSync 256 MiB (deliberately blocking)       78ms     null /    null /     null
+  node:fs/promises readFile 256 MiB         100.4ms        1 /    1.14 /     1.25
+  node:fs/promises writeFile 256 MiB (buffer pre-allocated)    173.8ms     1.03 /     1.3 /    10.04
+  CONTROL Buffer.alloc(256 MiB) + fill (pure CPU, no I/O)       59ms     null /    null /     null
+
+=== VERDICT ===
+  instrument validated: idle floor 16.6 ms. The deliberately blocking control
+  read 256 MiB in 78 ms and collected 0 timing samples
+  during it — i.e. the loop was COMPLETELY frozen; a frozen loop produces no ticks at all.
+
+  node:fs/promises readFile 256 MiB                     1.25 ms =    0.1x idle  stays off the loop
+  node:fs/promises writeFile 256 MiB (buffer pre-allocated)               10.04 ms =    0.6x idle  stays off the loop
+  CONTROL Buffer.alloc(256 MiB) + fill (pure CPU, no I/O)  FROZE (0 timer ticks) =    3.6x idle  <-- SYNCHRONOUS CPU (not I/O)
+
+  => every async file API keeps the loop available. A thread pool is therefore NOT
+     required for correctness; the disk is also ~10x faster than the network, so it
+     is not the throughput bottleneck either. Concurrency stays a tuning knob.
+
+  ⚠ THE ONE REAL CONSTRAINT: CONTROL Buffer.alloc(256 MiB) + fill (pure CPU, no I/O)
+     froze the loop for 59 ms. This is pure CPU, not I/O.
+     ⇒ read/write in BOUNDED CHUNKS; never Buffer.alloc(fileSize) up front.

@@ -100,6 +100,56 @@ describe("the capability inventory is single-sourced", () => {
     expect([...(defs.ShellSubdomain.enum ?? [])].sort()).toEqual([...SHELL_SUBDOMAINS].sort())
   })
 
+  test("each narrow-grant `maxItems` equals its enum's length", () => {
+    // ⚠ THE DRIFT BLIND SPOT that let a real bug ship.
+    //
+    // `check:contracts` only compares schema ↔ generated mirror BYTE FOR BYTE,
+    // and json2ts copies `maxItems` into both. So when `list` was added to
+    // `HandsPrimitive` but `hands.maxItems` stayed 4, the gate stayed green
+    // while every manifest granting all five primitives became INVALID.
+    //
+    // The consequence was not a cosmetic error: an invalid manifest makes
+    // `loadManifests` SKIP the plugin (with only a log line), so the plugin has
+    // no manifest, and `findOverreach` returns undefined when there is no
+    // manifest — meaning the `#24` warn silently switched OFF for exactly the
+    // plugin that requested the most. The same drift already existed for
+    // `shell` (maxItems 11 vs 15 sub-domains).
+    //
+    // Pinning enum length to `maxItems` makes that class of mistake impossible:
+    // add a member to either enum and this fails until the cap is raised.
+    const defs = manifestSchema.$defs as Record<string, { enum?: string[] }>
+    const permissions = (
+      manifestSchema.$defs as Record<string, { properties?: Record<string, unknown> }>
+    ).Permissions.properties as Record<string, { oneOf?: Array<{ maxItems?: number }> }>
+
+    for (const [key, defName] of [
+      ["hands", "HandsPrimitive"],
+      ["shell", "ShellSubdomain"],
+    ] as const) {
+      const enumLength = (defs[defName].enum ?? []).length
+      // The array arm is the second `oneOf` branch (the first is `boolean`).
+      const maxItems = permissions[key]?.oneOf?.find((arm) => arm.maxItems !== undefined)?.maxItems
+      expect(maxItems).toBe(enumLength)
+    }
+  })
+
+  test("a manifest granting every primitive and every sub-domain is VALID", () => {
+    // The behavioural half of the pin above: it is not enough for the numbers to
+    // match, the grant has to actually be accepted. Written against the enums so
+    // it stays exhaustive as they grow — `every` over the schema is the same set
+    // a plugin author would read off the docs.
+    const defs = manifestSchema.$defs as Record<string, { enum?: string[] }>
+    const ok = validatePluginManifest({
+      ...base,
+      permissions: {
+        hands: [...(defs.HandsPrimitive.enum ?? [])],
+        shell: [...(defs.ShellSubdomain.enum ?? [])],
+      },
+    })
+    expect(validatePluginManifest.errors ?? []).toEqual([])
+    expect(ok).toBe(true)
+  })
+
   test("signal is a service but NOT a requestable capability", () => {
     // It is a lifecycle mechanism the host provides for cooperative shutdown,
     // not a privileged capability, so asking for it would be meaningless.

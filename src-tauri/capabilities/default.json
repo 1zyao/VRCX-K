@@ -1,11 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Capability for the main window. Contains ONLY what the webview actually calls. The shell reaches opener/notification through the Rust `Ext` traits (`app.opener()`, `app.notification()`), which run inside the Rust process and need no capability entry — granting one here would only widen the webview's reachable surface for no gain. Dropping the unused `os` / `clipboard-manager` permissions follows the same reasoning.",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "opener:default",
-    "notification:default"
-  ]
+  "permissions": ["core:default"]
 }

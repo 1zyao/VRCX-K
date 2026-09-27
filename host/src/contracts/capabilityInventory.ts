@@ -33,6 +33,9 @@ export const HOST_SERVICES = [
   "tray",
   "shortcut",
   "signal",
+  "hands",
+  "clipboard",
+  "autostart",
 ] as const
 export type HostService = (typeof HOST_SERVICES)[number]
 
@@ -51,8 +54,31 @@ export const REQUESTABLE_CAPABILITIES = [
   "os",
   "tray",
   "shortcut",
+  "hands",
+  "clipboard",
+  "autostart",
 ] as const satisfies readonly HostService[]
 export type RequestableCapability = (typeof REQUESTABLE_CAPABILITIES)[number]
+
+/**
+ * The file primitives `hands` can be granted at, one entry per primitive.
+ *
+ * Primitive granularity (not a single boolean, not a path scope). `hands` is a
+ * sharper permission than `ctx.shell` — it reaches the whole disk — so a plugin
+ * should be able to say "read and stat, never write". Path-scoped grants are
+ * deliberately NOT modelled yet: they need a matcher both sides honour, and the
+ * enforcement layer is `#13`/M4, not this stage.
+ *
+ * Must stay in sync with `HandsService`'s methods in `host/src/hands.ts`; the
+ * inventory tests pin that.
+ *
+ * ⚠ `list` is a primitive, not caller policy. An earlier revision omitted it on
+ * the reasoning that enumeration belongs to the brain — which assumes the brain
+ * can reach the filesystem. For a REMOTE shell it cannot, so without `list` a
+ * plugin cannot discover a single filename.
+ */
+export const HANDS_PRIMITIVES = ["stat", "read", "write", "watch", "list"] as const
+export type HandsPrimitive = (typeof HANDS_PRIMITIVES)[number]
 
 /**
  * Sub-domains of the raw `ctx.shell` mirror.
@@ -74,6 +100,10 @@ export const SHELL_SUBDOMAINS = [
   "path",
   "devWatchEvent",
   "tray",
+  "clipboard",
+  "os",
+  "autostart",
+  "deepLink",
 ] as const
 export type ShellSubdomain = (typeof SHELL_SUBDOMAINS)[number]
 

@@ -1,0 +1,38 @@
+[package]
+name = "notify-version-probe"
+version = "0.1.0"
+edition = "2021"
+
+# Empty [workspace] keeps this OUT of the VRCX-K root workspace, so it can never
+# touch the real Cargo.lock or the src-tauri build.
+[workspace]
+
+[dependencies]
+# ⚠ THIS CRATE DELIBERATELY DEPENDS ON BOTH MAJORS AT ONCE.
+#
+# The question is "8.2.0 or 9.0.0-rc.5?", and the only honest way to answer it is
+# to measure both with ONE instrument. Cargo package-renaming makes that possible:
+# `notify` stays the rc, and `notify_v8` is the same crate at version 8.
+#
+# The coexistence is also a free demonstration that the two majors CAN sit in one
+# binary — which matters because `tauri-plugin-fs` pins `notify = "8"` while we
+# would otherwise pick the rc.
+notify = { version = "9.0.0-rc.5", features = ["tokio"] }
+notify_v8 = { package = "notify", version = "8" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[[bin]]
+name = "notify9_probe"
+path = "src/main.rs"
+
+[[bin]]
+name = "unwatch_strict"
+path = "src/bin/unwatch_strict.rs"
+
+[[bin]]
+name = "unwatch_strict_v8"
+path = "src/bin/unwatch_strict_v8.rs"
+
+[profile.release]
+opt-level = 2

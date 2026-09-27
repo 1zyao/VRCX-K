@@ -5,15 +5,25 @@ import {
   validateTrayMenuSnapshot,
 } from "../src/tray_contract"
 
-const action = (id: string, target: "host" | "core" | "app" = "host") => ({
-  kind: "action" as const,
-  id,
-  order: 0,
-  label: id,
-  enabled: true,
-  visible: true,
-  action: { target, command: "do.work", args: [], danger: "safe" as const, confirm: false },
-})
+// ⚠ GENERIC over the target, because the schema DISCRIMINATES on it.
+// `HostAction.target` is `"host"` ONLY; `CoreAction.target` is `"core" | "app"`.
+// A plain `target: "host" | "core" | "app"` parameter widened every result to the
+// union, so a default-constructed action could not be placed in a
+// `source: "host"` group — reported only once `host/tests` joined a tsc program.
+// Inferring `T` from the argument keeps each call's literal, so
+// `action(id)` is a host action and `action(id, "app")` is a core/app one, which
+// is exactly what the privilege-escalation cases below need to express.
+function action<T extends "host" | "core" | "app" = "host">(id: string, target: T = "host" as T) {
+  return {
+    kind: "action" as const,
+    id,
+    order: 0,
+    label: id,
+    enabled: true,
+    visible: true,
+    action: { target, command: "do.work", args: [], danger: "safe" as const, confirm: false },
+  }
+}
 
 const valid: TrayMenuSnapshot = {
   schemaVersion: 1,

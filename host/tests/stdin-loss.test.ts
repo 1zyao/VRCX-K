@@ -20,7 +20,7 @@ import { dispose, RPCChannel, wrap } from "kkrpc"
 import { stdioJsonTransport } from "kkrpc/stdio"
 import { webSocketClientTransport } from "kkrpc/ws"
 import type { HostWsAPI } from "../src/api"
-import { HOST_SPAWN_DETACHED, killTree, readReady, resolveBun, warmBun } from "./helpers"
+import { HOST_SPAWN_DETACHED, killTree, pipe, readReady, resolveBun, warmBun } from "./helpers"
 
 const hostDir = join(import.meta.dir, "..")
 const bun = resolveBun()
@@ -40,21 +40,6 @@ let proc: ReturnType<typeof Bun.spawn> | undefined
 function hostProc(): ReturnType<typeof Bun.spawn> {
   if (!proc) throw new Error("test did not spawn a host process")
   return proc
-}
-
-/**
- * The pipe end of a spawn result, checked.
- *
- * `Bun.spawn` types `stdin`/`stdout`/`stderr` as optional because they depend on
- * the `stdin`/`stdout`/`stderr` options; these tests always pass `"pipe"`, which
- * the type system cannot see. Throwing keeps a mis-spawned fixture from turning
- * into a confusing "cannot read property of undefined".
- */
-function pipe<T>(end: T | undefined, name: string): T {
-  if (end === undefined || end === null) {
-    throw new Error(`spawned host has no ${name} pipe (was it spawned with "pipe"?)`)
-  }
-  return end
 }
 
 afterEach(() => {
@@ -81,7 +66,7 @@ test("shell-less host stops itself when the launcher's stdin pipe closes", async
     detached: HOST_SPAWN_DETACHED,
     env: { ...process.env, VRCXK_SHELL: "0" },
   })
-  await readReady(proc.stderr)
+  await readReady(pipe(proc.stderr, "stderr"))
   // Let the stdin watch take its reader before we pull the pipe.
   await new Promise((r) => setTimeout(r, 300))
 
@@ -101,7 +86,7 @@ test("shell-less host does NOT stop when stdin is the null device", async () => 
     detached: HOST_SPAWN_DETACHED,
     env: { ...process.env, VRCXK_SHELL: "0" },
   })
-  const ready = await readReady(proc.stderr)
+  const ready = await readReady(pipe(proc.stderr, "stderr"))
 
   // A missing fd guard would surface the null device's immediate EOF (~3ms) as
   // a stop signal and kill the host at startup — give it ample time to misfire.
@@ -129,7 +114,7 @@ test("shell-attached host stops when the shell end of stdin goes away", async ()
     detached: HOST_SPAWN_DETACHED,
     env: { ...process.env, VRCXK_SHELL: "1" },
   })
-  await readReady(proc.stderr)
+  await readReady(pipe(proc.stderr, "stderr"))
   // Let connectShellStdio's transport take its reader before we pull the pipe.
   await new Promise((r) => setTimeout(r, 500))
 
@@ -270,13 +255,15 @@ test("stdinIsPeerChannel classifies the real fd 0 (pipe vs ignore)", async () =>
     Bun.spawn([bun, "-e", probe], { cwd: hostDir, stdin, stdout: "pipe", stderr: "pipe" })
 
   const piped = ask("pipe")
-  const pipedFacts = JSON.parse((await new Response(piped.stdout).text()).trim())
+  const pipedFacts = JSON.parse((await new Response(pipe(piped.stdout, "stdout")).text()).trim())
   pipe(piped.stdin, "stdin").end?.()
   expect(pipedFacts.peer, `piped fd 0 facts: ${JSON.stringify(pipedFacts)}`).toBe(true)
   await piped.exited
 
   const ignored = ask("ignore")
-  const ignoredFacts = JSON.parse((await new Response(ignored.stdout).text()).trim())
+  const ignoredFacts = JSON.parse(
+    (await new Response(pipe(ignored.stdout, "stdout")).text()).trim(),
+  )
   expect(ignoredFacts.peer, `ignored fd 0 facts: ${JSON.stringify(ignoredFacts)}`).toBe(false)
   await ignored.exited
 }, 30_000)

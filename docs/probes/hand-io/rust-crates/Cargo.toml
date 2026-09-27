@@ -1,0 +1,47 @@
+[package]
+name = "rust-probe"
+version = "0.1.0"
+edition = "2021"
+
+# Empty [workspace] keeps this OUT of the VRCX-K root workspace, so it can never
+# touch the real Cargo.lock or the src-tauri build.
+[workspace]
+
+[dependencies]
+# The filesystem plugin's Rust-side handle: the ONLY way to turn an Android
+# content:// URI into a real, seekable std::fs::File. Already a transitive dep.
+tauri = { version = "2", features = [] }
+tauri-plugin-fs = { version = "2.5.2", features = ["watch"] }
+
+# File watching (the one thing with no std equivalent).
+notify = "8"
+# Verified-streaming integrity layer: BLAKE3 + bao range proofs.
+blake3 = "1"
+bao-tree = "0.16"
+# Rotation detection: stable file identity across rename/replace. On Windows this
+# uses the u128 high-resolution id (correct for ReFS), unlike `same-file`, whose
+# own source warns its low-res index is not unique there.
+file-id = "0.2"
+
+[[bin]]
+name = "rust-probe"
+path = "src/main.rs"
+
+[[bin]]
+name = "rotation"
+path = "src/bin/rotation.rs"
+
+[[bin]]
+name = "gotchas"
+path = "src/bin/gotchas.rs"
+
+[[bin]]
+name = "unwatch_leak"
+path = "src/bin/unwatch_leak.rs"
+
+[[bin]]
+name = "fs_handle"
+path = "src/bin/fs_handle.rs"
+
+[profile.release]
+opt-level = 2

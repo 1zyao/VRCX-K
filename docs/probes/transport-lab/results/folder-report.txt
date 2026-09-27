@@ -1,0 +1,15 @@
+=== FOLDER UPLOAD: one request per file vs one packed blob ===
+200 files x 4096 B = 0.78 MiB total; client = global WebSocket (node-v24.9.0)
+
+  mode     requests   payload verified        wall      throughput   files/s   exact
+  small         200   200/200 files           3052ms       0.3MB/s       66   true
+  packed          1   13/13 frames              39ms        20MB/s        -   true
+
+=== VERDICT ===
+  per-file overhead measured directly: 66 files/s
+  packed is 78.26x the speed of one-request-per-file
+
+  extrapolated: 10,000 files of this size would take ~151.5s one-by-one
+
+  => per-file overhead DOMINATES. Packing (or at least batching several files per
+     request) is justified for folders with many small files.

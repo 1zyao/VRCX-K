@@ -13,5 +13,19 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["bun"]
   },
-  "include": ["host/src", "host/plugins", "scripts"]
+  /* ⚠ `host/tests` IS DELIBERATELY INCLUDED. It used to be in NO tsconfig program
+     at all, so the tests were never type-checked — only executed. That let four
+     real defects sit in plain sight:
+       - `channel?.close?.()` on a `StreamingRPCChannel`, which has `destroy()`:
+         an optional call on a non-existent method is a SILENT NO-OP, so the
+         stream bookkeeping was never torn down;
+       - a mock bridge typed as `ShellStdioBridge` while missing four of its keys
+         (`hands`, `clipboard`, `os`, `handsHello`);
+       - a fake exposing `ready` with the two channel generics SWAPPED;
+       - `includeSubtree(): Entry` where the value is really the include tree,
+         which alone produced 21 errors.
+     All four passed at runtime and were found only by adding this line. The 54
+     errors it first surfaced are fixed; the file stays included so the next such
+     defect fails the `typecheck` gate instead of shipping. */
+  "include": ["host/src", "host/plugins", "scripts", "host/tests"]
 }

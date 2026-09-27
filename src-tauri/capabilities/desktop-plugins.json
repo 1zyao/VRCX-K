@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-plugins",
+  "description": "Permissions for the desktop-only plugins (window-state, autostart, deep-link, positioner). Kept in a separate capability with an explicit `platforms` list because these plugins have no mobile implementation: referencing them from the default capability would make the Android build fail on an unknown permission identifier rather than simply not applying.",
+  "windows": ["main"],
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": [
+    "window-state:default",
+    "autostart:default",
+    "deep-link:default",
+    "positioner:default"
+  ]
+}

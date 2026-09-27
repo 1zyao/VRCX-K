@@ -30,10 +30,24 @@ function includeId(): string {
   return includeEntry.id
 }
 
-/** The include entry's subtree; see `includeId()` for the failure policy. */
-function includeSubtree(): Entry {
+/**
+ * The include entry's subtree; see `includeId()` for the failure policy.
+ *
+ * ⚠ RETURNS `IncludeTree`, NOT `Entry` — and that single word was the whole bug.
+ * `entry.subtree` is the loader's `EntryTree`, and `@cordisjs/plugin-include`'s
+ * `Include extends EntryTree`, adding `refresh()`. The repo's `IncludeTree` is
+ * exactly `EntryTree & { refresh(): Promise<void> }`, i.e. the shape of the
+ * INCLUDE SERVICE, not of an entry inside it.
+ *
+ * Declaring `Entry` made every use wrong at once: `.entries()` does not exist on
+ * an `Entry` (it is the tree method), and the value could not be passed where
+ * `IncludeTree` was required. 21 of this file's 22 type errors came from here —
+ * all invisible until `host/tests` was added to a tsc program, while the tests
+ * themselves passed, because at RUNTIME it is the Include service.
+ */
+function includeSubtree(): IncludeTree {
   if (!includeEntry?.subtree) throw new Error("include entry has no subtree")
-  return includeEntry.subtree
+  return includeEntry.subtree as IncludeTree
 }
 
 beforeAll(() => {}, 60_000)

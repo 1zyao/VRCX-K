@@ -1,0 +1,92 @@
+=== E2E LAB MATRIX ===
+repeats per cell: 3   generated: 2026-09-23T07:29:38.633Z
+
+  cell                                        exact  throughput    spread   note
+  ws/down 64x16KiB raw/ws                      3/3     100.7MB/s    20.2  
+  ws/down 64x64KiB raw/ws                      3/3     136.8MB/s    19.2  
+  ws/down 64x256KiB raw/ws                     3/3     162.2MB/s    54.9  
+  ws/down 64x1024KiB raw/ws                    3/3     217.2MB/s     8.1  
+  ws/down 64x4096KiB raw/ws                    3/3     206.6MB/s    39.5  
+  ws/down 64x16KiB base64/ws                   3/3      58.3MB/s    12.5  
+  ws/down 64x64KiB base64/ws                   3/3      77.1MB/s     7.5  
+  ws/down 64x256KiB base64/ws                  3/3        73MB/s     8.1  
+  ws/down 64x1024KiB base64/ws                 3/3      86.2MB/s     2.1  
+  ws/down 64x4096KiB base64/ws                 3/3      80.2MB/s     1.7  
+  ws/down 64x16KiB json/ws                     3/3       4.9MB/s     0.9  
+  ws/down 64x64KiB json/ws                     3/3       4.6MB/s     0.3  
+  ws/down 64x256KiB json/ws                    3/3       4.5MB/s     0.3  
+  ws/down 64x1024KiB json/ws                   0/3       0.1MB/s     0.1  LOSS
+  ws/down 64x4096KiB json/ws                   0/3       0.5MB/s     0.3  LOSS
+  ws/down 64x16KiB raw/ws                      3/3     119.7MB/s    51.9  
+  ws/down 64x64KiB raw/ws                      3/3     158.8MB/s    23.8  
+  ws/down 64x256KiB raw/ws                     3/3     181.1MB/s    26.7  
+  ws/down 64x1024KiB raw/ws                    3/3     244.9MB/s     0.9  
+  ws/down 64x4096KiB raw/ws                    3/3     233.7MB/s    16.1  
+  ws/down 64x16KiB raw/global                  3/3     142.9MB/s       0  
+  ws/down 64x64KiB raw/global                  3/3     203.9MB/s    20.1  
+  ws/down 64x256KiB raw/global                 3/3     233.5MB/s    23.2  
+  ws/down 64x1024KiB raw/global                3/3     257.4MB/s     6.2  
+  ws/down 64x4096KiB raw/global                3/3     254.1MB/s     8.4  
+  tcp/down 64x16KiB                            3/3       131MB/s    17.8  
+  tcp/down 64x64KiB                            3/3     150.5MB/s    56.2  
+  tcp/down 64x256KiB                           3/3     112.8MB/s    84.1  
+  tcp/down 64x1024KiB                          3/3       129MB/s    14.7  
+  tcp/down 64x4096KiB                          3/3      68.2MB/s     3.2  
+  tcp/up 64x16KiB                              3/3     186.6MB/s   107.2  
+  tcp/up 64x64KiB                              3/3     161.8MB/s   132.3  
+  tcp/up 64x256KiB                             3/3     207.9MB/s   109.8  
+  tcp/up 64x1024KiB                            3/3     159.3MB/s    12.8  
+  tcp/up 64x4096KiB                            3/3      80.3MB/s     5.3  
+  ws/down 64x16KiB raw/ws                      3/3     120.5MB/s    13.9  
+  ws/down 64x64KiB raw/ws                      3/3     147.2MB/s    26.7  
+  ws/down 64x256KiB raw/ws                     3/3     199.2MB/s     7.4  
+  ws/down 64x1024KiB raw/ws                    3/3     221.8MB/s     6.1  
+  ws/down 64x4096KiB raw/ws                    3/3     212.3MB/s     4.6  
+  ws/up 64x16KiB raw/ws                        3/3       137MB/s    17.8  
+  ws/up 64x64KiB raw/ws                        3/3       185MB/s    56.7  
+  ws/up 64x256KiB raw/ws                       3/3     189.8MB/s    82.9  
+  ws/up 64x1024KiB raw/ws                      3/3     158.3MB/s    15.4  
+  ws/up 64x4096KiB raw/ws                      3/3     162.8MB/s     9.9  
+  udp/down 64x16KiB                            0/3       0.1MB/s       0  LOSS
+  udp/up 64x16KiB                              0/3       0.7MB/s       0  LOSS
+  tcp/down 8x64KiB                             3/3      79.3MB/s    11.9  
+  ws/down 8x64KiB raw/ws                       3/3      75.4MB/s    11.9  
+  tcp/down 64x64KiB                            3/3     144.7MB/s     5.3  
+  ws/down 64x64KiB raw/ws                      3/3     141.7MB/s    20.6  
+  tcp/down 256x64KiB                           3/3     124.6MB/s    19.1  
+  ws/down 256x64KiB raw/ws                     3/3     162.3MB/s    11.5  
+  udp/up 8x16KiB                               0/3       0.1MB/s       0  LOSS
+  udp/up 8x60KiB                               0/3       0.3MB/s       0  LOSS
+  udp/up 8x64KiB                               0/3       0.3MB/s       0  LOSS
+
+=== HEADLINE COMPARISONS ===
+
+  ENCODING (64 KiB frames, 64 frames, ws/ws, down)
+    raw binary WS frame                      136.8 MB/s   exact 3/3
+    base64 text frame                         77.1 MB/s   exact 3/3
+    json numeric-keyed (kkrpc built-in)        4.6 MB/s   exact 3/3
+    => the built-in encoding is 29.7x SLOWER than raw binary
+
+  TRANSPORT (64 KiB frames, 64 frames, down)
+    ws      136.8 MB/s   exact 3/3
+
+  DIRECTION (ws raw, 64 KiB x 64)
+    down    136.8 MB/s   exact 3/3
+    up        185 MB/s   exact 3/3
+
+  CLIENT IMPLEMENTATION (ws raw, down)
+    ws       exact 3/3   136.8 MB/s
+    global   exact 3/3   203.9 MB/s
+
+=== VERDICT ===
+  cells measured                     : 56
+  TCP/WS cells byte-exact every run  : 49/51
+  TCP/WS cells with ANY loss         : 2 (ws/down 64x1024KiB json/ws; ws/down 64x4096KiB json/ws)
+  UDP cells with loss (expected)     : 5/5
+
+  The UDP cells DO show loss, so the detector demonstrably reports loss when it
+  occurs; the exact TCP/WS cells are therefore meaningful rather than vacuous.
+
+  Cells with loss outside UDP:
+      ws/down 64x1024KiB json/ws
+      ws/down 64x4096KiB json/ws

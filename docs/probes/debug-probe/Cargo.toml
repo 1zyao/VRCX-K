@@ -1,0 +1,31 @@
+[package]
+name = "debug-probe-linux"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone harness that runs `debug_probe::imp::serve_hands` against the REAL
+# production modules, on a real Linux kernel, over a real abstract unix socket.
+#
+# WHY THIS EXISTS: `serve_hands` mounts `crate::hands`, `crate::kkrpc_peer` and
+# `crate::hands_hello`. The main crate cannot cross-compile to linux-musl (the
+# `libdbus-sys` build script needs system libraries), so a test inside the crate can
+# only run on Windows — where abstract unix sockets do not exist. This harness pulls
+# the production sources in with `#[path]` and provides the tiny amount of crate
+# plumbing they expect, so the socket path can be exercised on the platform that
+# actually has it.
+#
+# ⚠ It is NOT a substitute for running on Android. It proves the socket transport and
+# the handshake serve the real handlers; it says nothing about Android's permissions,
+# its filesystem layout, or `FLAG_DEBUGGABLE`.
+#
+# Empty `[workspace]` opts this crate OUT of the VRCX-K root workspace, so building it
+# never touches the real `Cargo.lock` or the `src-tauri` build.
+
+[workspace]
+
+[dependencies]
+serde_json = "1"
+base64 = "0.22"
+notify = "8"
+file-id = "0.2"
+libc = "0.2"

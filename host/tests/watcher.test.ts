@@ -81,7 +81,9 @@ describe("HostWatcher", () => {
       debounceMs: 40,
       bindings: [binding("plugin", entry, [pluginRoot])],
       onEvent: (event) => events.push(event),
-      onChange: (path) => changes.push(path),
+      onChange: (path) => {
+        changes.push(path)
+      },
     })
     await watcher.start()
     await waitFor(events, (event) => event.type === "started")
@@ -139,7 +141,9 @@ describe("HostWatcher", () => {
         binding("b", join(root, "b.ts"), [shared]),
       ],
       onEvent: (event) => events.push(event),
-      onChange: (path) => changes.push(path),
+      onChange: (path) => {
+        changes.push(path)
+      },
     })
     await watcher.start()
     await waitFor(events, (event) => event.type === "started")
@@ -166,7 +170,24 @@ describe("HostWatcher", () => {
     const temp = join(pluginRoot, ".index.ts.tmp")
     await writeFile(temp, "export default 3")
     await rename(temp, entry)
-    await waitFor(events, (event) => event.type === "change")
+    // ⚠ WAIT FOR THE EVENT THIS TEST IS ABOUT, not for "any change".
+    //
+    // This used to be `waitFor(events, (e) => e.type === "change")` followed by
+    // `expect(events.some((e) => e.type === "change" && e.path === entry))`.
+    // The wait and the assertion disagreed: **writing the temp file emits its
+    // own `change`** for `.index.ts.tmp` (measured — a lone `writeFile(temp)`
+    // produces `type=change path=<root>/plugin/.index.ts.tmp` before any rename
+    // happens), so the wait could be satisfied by the TEMP path while `entry` had
+    // not arrived yet, and the assertion then failed on a platform that was
+    // behaving correctly. That is the intermittent macos-latest failure: it dies
+    // on the `expect` at the old line 170, never in `waitFor`.
+    //
+    // Waiting on the exact predicate the assertion needs removes the race without
+    // weakening what is asserted — the point of the test (an atomic rename
+    // surfaces as a `change` for the BINDING's path) is unchanged.
+    await waitFor(events, (event) => event.type === "change" && event.path === entry)
+    // Redundant with the wait above, but kept so the CONTRACT is visible in the
+    // test body and a regression reports the path rather than a generic timeout.
     expect(events.some((event) => event.type === "change" && event.path === entry)).toBe(true)
     const added = join(pluginRoot, "new.ts")
     await writeFile(added, "new")
@@ -229,7 +250,9 @@ describe("HostWatcher", () => {
       debounceMs: 20,
       bindings: [binding("plugin", entry, [pluginRoot])],
       onEvent: (event) => events.push(event),
-      onChange: (path) => changes.push(path),
+      onChange: (path) => {
+        changes.push(path)
+      },
     })
     await watcher.start()
     await waitFor(events, (event) => event.type === "started")
@@ -266,20 +289,41 @@ describe("HostWatcher", () => {
     })
     await watcher.start()
     await waitFor(events, (event) => event.type === "started")
-    await writeFile(entry, "trigger")
-    // Wait until onChange is inside the blocked callback.
-    const deadline = Date.now() + 3_000
-    while (!entered && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10))
+
+    // ⚠ WRITE UNTIL THE HANDLER RUNS — do not write once and hope.
+    //
+    // The original version wrote `trigger` once and then waited up to 3s for
+    // `entered`. That is the flaky shape this file already warns about twice
+    // (see `settle` above): FSEvents can drop or batch a single write so the
+    // change never reaches `onChange`, `entered` stays false, and the test fails
+    // on a platform where nothing is actually wrong. Observed as a spurious
+    // macos-latest failure on an unchanged commit (same SHA passed on re-run).
+    //
+    // Re-writing keeps the trigger alive without depending on the platform
+    // delivering any ONE of them, and the `settle`-style quiescence wait is not
+    // needed because this test only cares that the handler is entered at all.
+    // The debounce collapses these into one flush, which is what the assertions
+    // below still require.
+    const deadline = Date.now() + 10_000
+    while (!entered && Date.now() < deadline) {
+      await writeFile(entry, `trigger-${Date.now()}`)
+      await new Promise((r) => setTimeout(r, 25))
+    }
     expect(entered).toBe(true)
     const closing = watcher.close()
     // close waits for the in-flight flush; release it, then close resolves.
     release()
     await closing
     expect(events.filter((event) => event.type === "closed")).toHaveLength(1)
-    // No further events after close.
+    // ⚠ What this test is actually about: NO events after close. Counting the
+    // total would depend on how many batches the platform flushed while the loop
+    // above was writing — the exact-count assertion this file already documents
+    // as the cause of its 37/40 macos-latest failures. So snapshot the count and
+    // assert it does not GROW, which is the contract and is platform-independent.
+    const beforeAfterClose = events.length
     await writeFile(entry, "after-close")
     await new Promise((resolve) => setTimeout(resolve, 100))
-    expect(events.filter((event) => event.type === "change")).toHaveLength(1)
+    expect(events.length).toBe(beforeAfterClose)
     await watcher.close() // idempotent
     expect(events.filter((event) => event.type === "closed")).toHaveLength(1)
   })

@@ -1,0 +1,40 @@
+=== HEAD-OF-LINE BLOCKING on a SHARED ws connection ===
+256 x 64 KiB = 16 MiB per scenario; probes every 5 ms
+client = global WebSocket (node-v24.9.0); samples bucketed by SEND time
+
+  scenario   bulk throughput   RPC idle p50   DURING p50 / p95 / max (n)         verdict
+  A            170.8MB/s        0.63ms    78.68 /   78.68 /    78.68 (  2)  responsive (n<20 UNRELIABLE)
+  B            189.7MB/s         0.5ms    77.74 /   77.74 /    77.74 (  1)  BLOCKED (n<20 UNRELIABLE)
+  A-slow       277.4MB/s        0.42ms       42 /   57.42 /    57.42 (  3)  responsive (n<20 UNRELIABLE)
+  B-slow       317.2MB/s        0.44ms    35.28 /   45.53 /    45.53 (  3)  responsive (n<20 UNRELIABLE)
+
+  detail
+    A: burst, normal reader
+      bulk 16 MiB in 94 ms = 170.8 MB/s (byte-exact)
+      RPC idle   n= 27  p50=0.63 p95=0.91 p99=2.08 max=2.08 ms
+      RPC during n=  2  p50=78.68 p95=78.68 p99=78.68 max=78.68 ms
+      RPC after  n= 20  p50=0.46 p95=0.57 p99=0.57 max=0.57 ms
+      final probe sent during bulk: 66.08 ms
+    B: yielding slices, normal reader
+      bulk 16 MiB in 84 ms = 189.7 MB/s (byte-exact)
+      RPC idle   n= 27  p50=0.5 p95=0.72 p99=0.84 max=0.84 ms
+      RPC during n=  1  p50=77.74 p95=77.74 p99=77.74 max=77.74 ms
+      RPC after  n= 22  p50=0.44 p95=0.6 p99=0.65 max=0.65 ms
+      final probe sent during bulk: 77.74 ms
+    A-slow: burst, SLOW reader (keeps the send queue full)
+      bulk 16 MiB in 58 ms = 277.4 MB/s (byte-exact)
+      RPC idle   n= 26  p50=0.42 p95=0.55 p99=0.61 max=0.61 ms
+      RPC during n=  3  p50=42 p95=57.42 p99=57.42 max=57.42 ms
+      RPC after  n=192  p50=0.42 p95=0.54 p99=0.73 max=0.76 ms
+      final probe sent during bulk: 26.18 ms
+    B-slow: yielding slices, SLOW reader
+      bulk 16 MiB in 50 ms = 317.2 MB/s (byte-exact)
+      RPC idle   n= 27  p50=0.44 p95=0.64 p99=0.65 max=0.65 ms
+      RPC during n=  3  p50=35.28 p95=45.53 p99=45.53 max=45.53 ms
+      RPC after  n=176  p50=0.43 p95=0.58 p99=0.68 max=0.68 ms
+      final probe sent during bulk: 19.74 ms
+
+=== VERDICT ===
+  scenarios with a statistically usable during-sample set (n>=20): 0/4
+  *** NO SCENARIO PRODUCED ENOUGH IN-TRANSFER SAMPLES — this measurement cannot
+  *** support a conclusion either way. Increase --frames or shorten --pingMs. ***

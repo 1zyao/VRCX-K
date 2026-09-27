@@ -48,8 +48,16 @@ export type ShellSubdomain =
   | "app"
   | "path"
   | "devWatchEvent"
-  | "tray";
+  | "tray"
+  | "clipboard"
+  | "os"
+  | "autostart"
+  | "deepLink";
 export type PermissionGrant = boolean | string[];
+/**
+ * The file primitives ctx.hands can be granted at, one entry per primitive. PRIMITIVE granularity, not a single boolean and not a path scope: hands is a sharper permission than ctx.shell because it reaches the whole disk, so 'read and stat, never write' must be expressible. Path-scoped grants are deliberately not modelled yet — they need a matcher both sides honour, and the enforcement layer is #13/M4. Keys mirror HANDS_PRIMITIVES in host/src/contracts/capabilityInventory.ts. `list` enumerates ONE directory (non-recursive, unfiltered); matching, sorting and recursion are caller policy, but enumeration ITSELF is a capability only the shell can perform for a remote node.
+ */
+export type HandsPrimitive = "stat" | "read" | "write" | "watch" | "list";
 
 /**
  * Author-owned plugin declaration, read from <plugin-root>/.vrcxk/manifest.json. AUTHORITATIVE for version, dependencies, services and permissions. The marketplace index carries only a display cache of name/description; everything else is read from this file. See docs/plugin-source-and-index-design.md.
@@ -131,7 +139,7 @@ export interface Services {
  */
 export interface Permissions {
   /**
-   * Raw shell surface. Sub-domain granularity only.
+   * Raw shell surface. Sub-domain granularity only. ⚠ `maxItems` MUST equal the `ShellSubdomain` enum length, or a plugin granting every sub-domain has its whole manifest rejected — which silently disables the `#24` warn for exactly the most-privileged plugins. A contract test pins the two together.
    */
   shell?:
     | boolean
@@ -188,6 +196,68 @@ export interface Permissions {
         ShellSubdomain,
         ShellSubdomain,
         ShellSubdomain
+      ]
+    | [
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain
+      ]
+    | [
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain
+      ]
+    | [
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain
+      ]
+    | [
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain,
+        ShellSubdomain
       ];
   notify?: PermissionGrant;
   dialog?: PermissionGrant;
@@ -195,6 +265,25 @@ export interface Permissions {
   os?: PermissionGrant;
   tray?: PermissionGrant;
   shortcut?: PermissionGrant;
+  /**
+   * Text clipboard access (read/write).
+   */
+  clipboard?: boolean | string[];
+  /**
+   * Register the app to start with the system. Desktop only; the shell registers no such route on mobile.
+   */
+  autostart?: boolean | string[];
+  /**
+   * File primitives (stat/read/write/watch/list). Reaches the whole disk, so prefer a narrow list over `true`. Declaration only at this stage — not enforced (#24 is declare-and-warn, and the real boundary is M4's subprocess isolation). ⚠ `maxItems` MUST equal the `HandsPrimitive` enum length: adding a primitive to the enum without raising this made a 5-primitive grant INVALID, so the manifest was rejected and the `#24` warn silently switched off. A contract test pins the two together.
+   */
+  hands?:
+    | boolean
+    | []
+    | [HandsPrimitive]
+    | [HandsPrimitive, HandsPrimitive]
+    | [HandsPrimitive, HandsPrimitive, HandsPrimitive]
+    | [HandsPrimitive, HandsPrimitive, HandsPrimitive, HandsPrimitive]
+    | [HandsPrimitive, HandsPrimitive, HandsPrimitive, HandsPrimitive, HandsPrimitive];
 }
 /**
  * Frontend extension point (M3). Omit for headless plugins.

@@ -4,7 +4,15 @@ import { dispose, wrap } from "kkrpc"
 import { webSocketClientTransport } from "kkrpc/ws"
 import type { HostWsAPI } from "../src/api"
 import { HOST_VERSION } from "../src/api"
-import { drain, HOST_SPAWN_DETACHED, killTree, readReady, resolveBun, warmBun } from "./helpers"
+import {
+  drain,
+  HOST_SPAWN_DETACHED,
+  killTree,
+  pipe,
+  readReady,
+  resolveBun,
+  warmBun,
+} from "./helpers"
 
 const hostDir = join(import.meta.dir, "..")
 const bun = resolveBun()
@@ -35,7 +43,7 @@ async function spawnHost() {
     // object so an interrupted run reaps it.
     detached: HOST_SPAWN_DETACHED,
   })
-  const ready = await readReady(proc.stderr)
+  const ready = await readReady(pipe(proc.stderr, "stderr"))
   return { proc, ready }
 }
 
@@ -45,7 +53,7 @@ test("host ws ping and getVersion", async () => {
   expect(ready.token).toMatch(/^[0-9a-f]{64}$/)
   expect(ready.hostVersion).toBe(HOST_VERSION)
 
-  const stdout = await drain(child.stdout)
+  const stdout = await drain(pipe(child.stdout, "stdout"))
   expect(stdout).toBe("")
 
   const api = wrap<HostWsAPI>(
@@ -66,7 +74,7 @@ test("wrong cwd cannot assemble cordis.yml and exits non-zero", async () => {
     stderr: "pipe",
   })
   const code = await proc.exited
-  const stderr = await new Response(proc.stderr).text()
+  const stderr = await new Response(pipe(proc.stderr, "stderr")).text()
   expect(code).not.toBe(0)
   expect(stderr).toContain("fatal bootstrap error")
   expect(stderr).toMatch(/config file not found|heartbeat plugin failed/)

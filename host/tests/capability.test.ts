@@ -5,6 +5,11 @@ import type { ShellStdioBridge } from "../src/stdio"
 
 // Acceptance ⑥ for M2-1: a plugin reaches tray/notify/dialog through BOTH the
 // curated domain services and the raw `ctx.shell` mirror, and each call is
+/** An async iterable that yields nothing — what the `hands` streams need. */
+async function* emptyStream(): AsyncIterable<never> {
+  // Intentionally yields nothing.
+}
+
 // attributed to the calling plugin. `seen` proves the call reached the shell;
 // `audit` proves the capability layer knew who called.
 function fakeBridge(seen: string[]): ShellStdioBridge {
@@ -50,6 +55,25 @@ function fakeBridge(seen: string[]): ShellStdioBridge {
       resolve: async () => "",
     },
     devWatchEvent: async () => true,
+    // ⚠ `clipboard` and `os` were added to `ShellStdioBridge` by the hands PR, and
+    // this fake was not updated with them. Nothing failed, because `host/tests`
+    // is in NO tsconfig program — the type error only surfaced when the tests
+    // were added to one. Kept here so the fake matches the interface it claims to
+    // implement.
+    clipboard: {
+      writeText: async () => true,
+      readText: async () => null,
+    },
+    os: {
+      info: async () => ({
+        platform: "win32",
+        version: "10.0.0",
+        family: "windows",
+        arch: "x86_64",
+        locale: null,
+        hostname: "test-host",
+      }),
+    },
     tray: {
       setSnapshot: async () => {
         seen.push("tray")
@@ -60,16 +84,45 @@ function fakeBridge(seen: string[]): ShellStdioBridge {
   return {
     ready: async () => {},
     shell,
+    // `hands` is part of `ShellStdioBridge` since this PR. The curated-call tests
+    // here never reach it, but the bridge type requires it — and leaving it out
+    // was invisible until `host/tests` joined a tsc program.
+    hands: {
+      stat: async () => null,
+      read: () => emptyStream(),
+      write: async () => ({ bytes: 0, endOffset: 0, mode: "truncate" }),
+      watch: () => emptyStream(),
+      list: () => emptyStream(),
+    },
     tray: { setSnapshot: async () => ({ ok: true, revision: 1 }), onAction: () => () => {} },
     shortcut: {
       register: async () => ({ ok: true }),
       unregister: async () => ({ ok: true }),
       onPress: () => () => {},
     },
+    // `handsHello` (the shell→brain identity announcement) and `sawWriteFailure`
+    // (the EPIPE detector) are also part of the bridge. Nothing in this file
+    // exercises them; they are here so the fake satisfies the interface it is
+    // declared to return — which no tsconfig checked until now.
+    handsHello: {
+      onHello: () => () => {},
+      currentHello: () => undefined,
+    },
+    sawWriteFailure: () => false,
+    // `deepLink` predates this PR; it was missing here all along and only became
+    // visible once `host/tests` joined a tsc program. `onOpen` is the local
+    // fan-out registration, not an RPC.
+    deepLink: { onOpen: () => () => {} },
   }
 }
 
 describe("capability surface (M2-1)", () => {
+  // `Service` adds own `ctx`/`name`; every other own key is a mirror entry.
+  const keys = (node: object) =>
+    Object.getOwnPropertyNames(node)
+      .filter((key) => key !== "ctx" && key !== "name")
+      .sort()
+
   test("both the curated and raw paths reach the shell and are attributed", async () => {
     const seen: string[] = []
     const audit: string[] = []
@@ -122,20 +175,19 @@ describe("capability surface (M2-1)", () => {
   test('the raw shell mirror enumerates every ShellSysAPI["shell"] method', () => {
     const ctx = new Context()
     createShellCapabilities(ctx, new ShellHandle(() => {}))
-    // `Service` adds own `ctx`/`name`; every other own key is a mirror entry.
-    const keys = (node: object) =>
-      Object.getOwnPropertyNames(node)
-        .filter((key) => key !== "ctx" && key !== "name")
-        .sort()
 
     expect(keys(ctx.shell)).toEqual(
       [
         "app",
+        "autostart",
+        "clipboard",
+        "deepLink",
         "devWatchEvent",
         "dialog",
         "notify",
         "openPath",
         "openUrl",
+        "os",
         "path",
         "reveal",
         "shortcut",
@@ -157,5 +209,38 @@ describe("capability surface (M2-1)", () => {
     expect(keys(ctx.shell.app)).toEqual(["exit", "info"])
     expect(keys(ctx.shell.path)).toEqual(["dir", "resolve"])
     expect(keys(ctx.shell.tray)).toEqual(["setSnapshot"])
+  })
+
+  test("deepLink exposes isRegistered but NOT register, on BOTH layers", () => {
+    // ⚠ THE REMOVAL IS PINNED, on both paths.
+    //
+    // `deepLink.register` writes `HKCU\Software\Classes\<scheme>` and there is no
+    // unregister route, so one call is a PERSISTENT, machine-wide change this app
+    // cannot undo. `HKCU` outranks `HKLM`, so claiming a class that already exists
+    // (measured with `exefile`) would redirect every `.exe` on that machine here.
+    // It is also the wrong half to expose first: the event path is not wired (no
+    // `schemes` in `tauri.conf.json`, so `deepLink.opened` never fires), so the
+    // capability would buy the side effect with none of the feature.
+    //
+    // ⚠ Both assertions matter. `ctx.shell` is the RAW one-for-one mirror and the
+    // curated namespace resolves through the same spec, so a future edit restoring
+    // `register` on either layer must fail here. Asserting only the curated path
+    // would be theatre: the raw mirror reaches the same route one property access
+    // away.
+    const ctx = new Context()
+    createShellCapabilities(ctx, new ShellHandle(() => {}))
+    const deepLink = ctx.shell.deepLink as
+      | { register?: unknown; isRegistered?: unknown }
+      | undefined
+    // The namespace exists at all — otherwise the assertions below would pass by
+    // looking at `undefined`.
+    expect(deepLink, "the deepLink namespace must still exist").toBeDefined()
+    expect(keys(deepLink as object)).toEqual(["isRegistered"])
+    // Reading is harmless and stays, so the assertion above is not vacuous.
+    expect(typeof deepLink?.isRegistered).toBe("function")
+    expect(
+      deepLink?.register,
+      "register must stay removed: it makes an un-undoable machine-wide change",
+    ).toBeUndefined()
   })
 })

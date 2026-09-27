@@ -1,9 +1,30 @@
 mod app_lifecycle;
+// The debug-only self-probe (design: docs/android-debuggable-probe-design.md).
+//
+// `pub` because a driver must reach it the way production does. The socket half is
+// `cfg(any(linux, android))`, so CI's ubuntu job compiles and runs it for real — that
+// gate is what makes the transport testable without an emulator. Publishing it adds
+// no capability: `policy` is pure, and `imp` refuses to serve unless the platform
+// says this very process is debuggable.
+pub mod debug_probe;
 mod dialog_opts;
+// ⚠ These three are `pub` so the `hands-e2e` EXAMPLE can mount them on a bare
+// stdio loop and exercise the real wire protocol without a webview (see
+// `src-tauri/examples/hands-e2e.rs`). They were `mod` while the driver lived in
+// `docs/probes/hands-e2e/rust/` and pulled the SAME files in with `#[path]` — that
+// compiled the real source, but it built a PRIVATE COPY of the module graph rather
+// than crossing the crate boundary, so nothing verified the modules were reachable
+// the way production reaches them.
+//
+// The exposure is deliberate and narrow: none of the three depends on Tauri, so
+// publishing them adds no capability the shell did not already have — it only
+// lets an example import what production registers.
+pub mod hands;
+pub mod hands_hello;
 mod host;
 mod host_lifecycle;
 mod host_ready;
-mod kkrpc_peer;
+pub mod kkrpc_peer;
 mod notify;
 mod process_tree;
 mod shell_sys;
@@ -130,6 +151,44 @@ fn dispatch_app_command(
     result
 }
 
+/// Forward one deep link to the host, and mirror it to the face.
+///
+/// A received URL that nobody consumes is indistinguishable from a link that
+/// never arrived — the OS delivered it, this process got it, and nothing
+/// happened. So both deliveries are attempted and the outcome is emitted for the
+/// dev panel, the same shape `shortcut.pressed` uses.
+///
+/// The brain owns what a URL MEANS (log in, join an instance); the shell only
+/// proves it arrived.
+///
+/// ⚠ Its only caller is the `on_open_url` hook in `.setup()`. With no scheme
+/// declared in `tauri.conf.json` that hook never fires today, so this function
+/// has never run in a real launch — it is the consumer waiting for a scheme,
+/// not evidence that deep links work. See the note at
+/// `tauri_plugin_deep_link::init()` above.
+#[cfg(desktop)]
+fn forward_deep_link(app: &tauri::AppHandle, urls: Vec<String>) {
+    let delivery = {
+        let state = app.state::<HostState>();
+        match state.peer() {
+            Some(peer) => match peer.notify("deepLink.opened", vec![json!({ "urls": urls })]) {
+                Ok(()) => "delivered",
+                Err(err) => {
+                    eprintln!("[shell] deep link notify failed: {err}");
+                    "write-failed"
+                }
+            },
+            None => "no-host",
+        }
+    };
+    if let Err(err) = app.emit(
+        "deep-link-opened",
+        json!({ "urls": urls, "delivery": delivery }),
+    ) {
+        eprintln!("[shell] emit deep-link-opened: {err}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -168,8 +227,87 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // Cross-platform, no desktop-only API: `os` is read-only facts and
+        // `clipboard-manager` works on mobile too (plain text only there), so
+        // neither is gated.
+        //
+        // ⚠ `clipboard-manager`'s default permission set enables NOTHING. Every
+        // command must be listed in `capabilities/default.json` or the call fails
+        // at runtime with a permission error — see the capability file.
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(HostState::default())
         .manage(AppLifecycle::default());
+
+    // Desktop-only plugins. Declared under a `cfg(any(windows, macos, linux))`
+    // target section in Cargo.toml AND gated here: the catalog's platform matrix
+    // marks every one of them "none" for Android/iOS, so referencing them on
+    // mobile would be a compile error rather than a graceful absence.
+    #[cfg(desktop)]
+    {
+        // Window position/size persistence. Defaults are the documented useful
+        // set (size, position, maximized, fullscreen, decorations, visible) —
+        // deliberately not narrowed, because losing "was maximized" on restart is
+        // exactly the surprise this plugin exists to prevent.
+        builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
+
+        // Autostart: `MacosLauncher::LaunchAgent` is the documented default and
+        // the argv comes from the plugin's own builder. The shell only provides
+        // the MECHANISM — whether a user wants the app to launch with the system
+        // is a UI decision, so nothing enables it at boot. It is off until the
+        // user turns it on.
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
+
+        // Deep links. Registered AFTER single-instance on purpose: a second
+        // launch carrying a URL must be forwarded to the running instance, which
+        // is what single-instance's `deep-link` feature (enabled in Cargo.toml)
+        // arranges. Without that pairing an incoming link would open a second
+        // app instead of reaching the live one.
+        //
+        // ⚠ NO SCHEME IS DECLARED YET, so today nothing actually emits
+        // `deep-link://new-url` and `forward_deep_link` below never runs.
+        // Measured in `tauri-plugin-deep-link` 2.4.10 (`src/lib.rs:196-222` —
+        // this is the same function single-instance calls to forward a second
+        // launch): `handle_cli_arguments` returns immediately when the plugin
+        // config is `None`, and otherwise only accepts a URL whose scheme is in
+        // that config. `tauri.conf.json` has no `plugins.deep-link` section at
+        // all, so the config is `None` and BOTH entry points — cold start
+        // (`init_deep_link` → `handle_cli_arguments`, `src/lib.rs:73-84`) and
+        // single-instance forwarding (`tauri-plugin-single-instance` 2.4.4
+        // `src/lib.rs:55-57`) — stop before emitting. The `on_open_url` hook
+        // further down is therefore wired but unreachable.
+        //
+        // ⚠ The scheme string is a genuine open decision, not a missing line:
+        // `vrcx` is already registered by the separate VRCX app and `vrchat`
+        // belongs to the VRChat client itself, so neither can be claimed
+        // (docs/hands-prior-art.md §2.1/§2.3). No name has been chosen by the
+        // owner, so `tauri.conf.json` legitimately stays without one — the
+        // honest state here is "machinery present, no scheme declared".
+        //
+        // ⚠ Platform split (upstream `register`, 2.4.10 `src/lib.rs:259-281`
+        // vs `:133-135`): Windows/Linux support RUNTIME registration through
+        // `shell.deepLink.register`; macOS/Android/iOS return
+        // `Error::UnsupportedPlatform` and instead require the scheme to be
+        // declared in `tauri.conf.json` (`plugins.deep-link.desktop.schemes` for
+        // desktop, `plugins.deep-link.mobile` for the app-link form). So even
+        // after a runtime registration succeeds on Windows, macOS still has no
+        // path to a delivered URL until the config declares the name.
+        //
+        // ⚠ The `on_open_url` hook is registered in the ONE `.setup()` below,
+        // NOT here. `Builder::setup` is a single slot: a second call REPLACES the
+        // first with no error, so a handler registered in a second `.setup()`
+        // silently discards everything the other one did. That is exactly what
+        // the first attempt at this wiring did.
+        builder = builder.plugin(tauri_plugin_deep_link::init());
+
+        // Tray-relative positioning. Nothing calls `move_window` yet: today the
+        // tray is a native menu and there is no popup window to place. Registered
+        // now so the tray event hook has somewhere to go when the panel lands.
+        builder = builder.plugin(tauri_plugin_positioner::init());
+    }
 
     // Global shortcuts are a desktop-only capability: the plugin's types and the
     // `AppHandle::global_shortcut()` extension do not exist on mobile. The
@@ -221,6 +359,55 @@ pub fn run() {
             // on mobile, so there is nothing to set up there.
             #[cfg(desktop)]
             tray::setup(app.handle())?;
+
+            // Android only: start the debug self-probe IF this process is debuggable.
+            //
+            // ⚠ IT MUST BE HERE, NOT IN `main()`: the debuggability check reads our own
+            // `ApplicationInfo` over a WEBVIEW's JNI handle, and tauri builds the config
+            // windows immediately before running this closure
+            // (`tauri-2.11.5/src/app.rs:2524` then `:2530`). So this is the earliest
+            // point where a handle exists — and calling earlier would just report "no
+            // window" and stay closed.
+            //
+            // ⚠ A failure here is logged, not propagated: this is a debug-only helper,
+            // and making startup depend on it would mean a broken debug aid could stop
+            // the app from launching for a user who never asked for it.
+            #[cfg(target_os = "android")]
+            {
+                if let Err(err) = debug_probe::imp::start_in_background(app.handle()) {
+                    eprintln!("[shell] debug probe not started: {err}");
+                }
+            }
+            // Deep links: consume the URLs the OS hands us. Registered here
+            // rather than in its own `.setup()` because `Builder::setup` is a
+            // single slot — a second call would silently replace this one and
+            // lose the tray + supervisor wiring below.
+            //
+            // Without this hook a deep link is a link that vanishes: the OS
+            // delivers it, this process receives it, nothing happens. The brain
+            // owns what a URL MEANS (log in, join an instance); the shell only
+            // proves it arrived.
+            //
+            // ⚠ This hook is currently UNREACHABLE, so it is the intended
+            // consumer for the day a scheme is chosen — not a working delivery
+            // path today. On Windows/Linux the emission is the config-gated
+            // `handle_cli_arguments` described on `init()` above, and no scheme
+            // is declared in `tauri.conf.json`. Registering one at runtime via
+            // `shell.deepLink.register` does NOT change that: the plugin's own
+            // docs say dynamic schemes "WON'T be processed" there. On macOS the
+            // plugin uses `RunEvent::Opened` instead (which does not read the
+            // config), but the bundle only advertises URL types the config
+            // declares, so the OS still has nothing to deliver.
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt as _;
+                let deeplink_handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    let urls: Vec<String> =
+                        event.urls().iter().map(|url| url.to_string()).collect();
+                    forward_deep_link(&deeplink_handle, urls);
+                });
+            }
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let state = handle.state::<HostState>();

@@ -15,8 +15,27 @@ dist-ssr
 # M0 PoC probe worktree (never committed)
 .temp/
 
-# Cargo workspace build output
+# Cargo workspace build output. `/target/` is root-anchored and covers only the
+# workspace member; a nested probe crate (e.g. the hand-io Rust peers under
+# docs/probes/, which opt out with an empty `[workspace]`) builds to its own
+# target dir and needs the second pattern. That pattern is depth-agnostic so a
+# new nested crate cannot silently start committing a build tree.
 /target/
+docs/probes/**/target/
+
+# Probe MEASUREMENT output — regenerable, so not committed.
+#
+# Three kinds, deliberately treated differently:
+#   - `*-report.txt` IS committed (docs/probes/transport-lab/results/): every
+#     claim in FINDINGS.md points at a figure in one, so they are the evidence.
+#   - `*.json` is NOT: the probe writes it itself, and `matrix.json` alone was
+#     1,273 lines for figures the report already states. Keeping it invited a
+#     committed measurement to look authoritative after the machine changed.
+#   - `Cargo.lock` in a probe crate is NOT: these are one-shot instruments, not
+#     shipped artifacts, so pinning their dependency graph buys nothing. The
+#     versions that matter are recorded in the relevant FINDINGS.md.
+docs/probes/**/results/*.json
+docs/probes/**/Cargo.lock
 
 # Host sidecar artifact (built by scripts/build-host.ts into Tauri's
 # externalBin input dir). The directory itself is tracked via
@@ -29,6 +48,13 @@ host/dist/
 # bun cross-target compile cache (e.g. `bun build --compile --target
 # bun-linux-*`); large and never committed.
 host/.bun-cache/
+
+# TypeScript incremental build info. Written by `tsc` whenever a config enables
+# `incremental` / `composite`, and it records absolute-ish paths plus a graph that
+# is meaningless on another machine. Found the hard way: running a throwaway
+# `tsc -p <temp config>` at the repo root left `tsconfig.node.tsbuildinfo` behind
+# as an untracked file that `git add -A` would have swept into a commit.
+*.tsbuildinfo
 
 # Editor directories and files
 .vscode/*
