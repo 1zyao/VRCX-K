@@ -30,7 +30,7 @@
 // exercise: stderr was never the leak, the file is. A test that asserted on
 // stderr would pass against the unfixed code.
 
-import { afterEach, beforeAll, expect, test } from "bun:test"
+import { afterEach, beforeAll, describe, expect, test } from "bun:test"
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { basename, join } from "node:path"
@@ -207,3 +207,87 @@ test("the manifest outcome is LOGGED, so an unconstrained plugin is countable", 
 
   proc.kill()
 }, 60_000)
+
+// ---------------------------------------------------------------------------
+// The FIRST import in `index.ts` is load-bearing, and nothing tested it.
+//
+// ⚠ THE SILENT FAILURE, named exactly. `src/index.ts` line 1 is `import "./log"`,
+// which REPLACES `console.log` / `console.info` / `console.debug` with writers
+// that go to stderr (and the rotating file). That has to happen before anything
+// else can print, because in production this process is a kkrpc **stdio**
+// sidecar: fd 1 is the protocol channel. Let the patch land late and a stray
+// `console.log` writes a log line INTO the frame stream — a protocol corruption,
+// not a cosmetic problem, and one that shows up as a transport error somewhere
+// else entirely.
+//
+// ⚠ NOT HYPOTHETICAL: `index.ts` loads `@cordisjs/plugin-logger-console`, whose
+// whole job is to render `ctx.logger` **through `console.log`**. The comment at
+// that call site says it is "Safe HERE only because `import "./log"` (line 1)
+// patches console.log → stderr first; stdout carries the kkrpc/stdio protocol.
+// Adopting this without that patch would write protocol frames onto the log
+// channel." So an auto-import sorter (or a hand edit) that moves `import "./log"`
+// down one line — biome's `organizeImports` is enabled in this repo — turns a
+// sanctioned plugin into a live protocol hazard, with no type error, no lint
+// error and no failing test.
+//
+// ⚠ WHY THIS READS THE FILE AS TEXT, mirroring
+// `the_desktop_only_helpers_are_gated_and_listed` in `src-tauri/src/shell_sys.rs`.
+// The property is about the ORDER of a file, and no amount of importing or
+// calling can observe it: `import "./log"` has no binding to assert on, and
+// importing `index.ts` from a test would run `bootstrap()` at module top level
+// and start a real host. The Rust side reached for the same tool for the same
+// reason.
+//
+// ⚠ WHY NOT AN END-TO-END TEST INSTEAD (spawn the host, assert stdout carries no
+// log line). Measured: it would be VACUOUS TODAY. `startup-log.test.ts`'s other
+// two tests already read that process's stdout, and it is empty — nothing in the
+// bootstrap logs through `console.log` until LoggerConsole has a logger event to
+// render, so the moved import produces no observable stdout difference in a
+// smoke run. A test that cannot fail against the broken code is worse than no
+// test, so this pins the ORDER (which is the actual requirement) rather than a
+// downstream symptom that is not reliably produced.
+describe("the console patch is installed FIRST", () => {
+  const source = readFileSync(join(hostDir, "src", "index.ts"), "utf8")
+  const lines = source.split("\n")
+
+  test("index.ts is non-empty and still exists (anti-vacuous guard)", () => {
+    // ⚠ WITHOUT THIS, EVERY ASSERTION BELOW PASSES ON AN EMPTY FILE. A renamed or
+    // emptied `index.ts` has no imports at all, so "the first import is
+    // `./log`" would be checked against `undefined` and — depending on how it is
+    // written — quietly succeed. Same guard, same reason, as the `lines.len() >
+    // 100` check in `shell_sys.rs`.
+    expect(lines.length).toBeGreaterThan(100)
+    expect(source).toContain("bootstrap")
+  })
+
+  test("the first import is exactly `./log`, before any other import", () => {
+    // Find the first import that is a DECLARATION, skipping blanks and comments
+    // so a file header — which this repo writes on nearly every module — does not
+    // change the answer.
+    const first = lines.findIndex(
+      (line) => line.startsWith("import ") || line.startsWith("export "),
+    )
+    expect(first, "index.ts declares no imports at all").toBeGreaterThanOrEqual(0)
+    // The exact line, not "contains ./log": `import { log } from "./log"` (line
+    // 17 of the real file) also matches a loose check, and it is a different
+    // thing entirely — a named import does not run before the others.
+    expect(
+      lines[first].trim(),
+      `the first import must be the side-effect-only \`import "./log"\`, found: ${JSON.stringify(lines[first])}`,
+    ).toBe('import "./log"')
+  })
+
+  test("no OTHER module is imported before it", () => {
+    // The failure this exists for is an ordering one, so the assertion is on the
+    // POSITION of the patch rather than only on which line happens to be first.
+    // Any import declared above `import "./log"` runs first — including the very
+    // one that has no binding (`import "./something-else"`), which a
+    // "check line 1 reads `import \"./log\"`" test alone would miss.
+    const patchAt = lines.findIndex((line) => line.trim() === 'import "./log"')
+    expect(patchAt, 'index.ts no longer has a bare `import "./log"`').toBeGreaterThanOrEqual(0)
+    const earlier = lines
+      .slice(0, patchAt)
+      .filter((line) => line.startsWith("import ") || line.startsWith("export "))
+    expect(earlier, `these run before the console patch: ${earlier.join(" | ")}`).toEqual([])
+  })
+})

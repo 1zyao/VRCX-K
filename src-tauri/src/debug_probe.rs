@@ -1,0 +1,745 @@
+//! Debug-only self-probe listener: the channel that lets an authorised developer
+//! drive the real `hands.*` primitives **inside the app's own process**, on a real
+//! device, without a debug build variant.
+//!
+//! Design record (the WHY, the rejected alternatives, and — importantly — what
+//! this CANNOT prove): `docs/android-debuggable-probe-design.md`.
+//!
+//! # The one idea
+//!
+//! The app asks itself "can I be debugged right now?" and, **only if the answer is
+//! yes**, serves a real kkrpc endpoint on an abstract unix socket. The predicate is
+//! a RUNTIME ENVIRONMENT FACT (`FLAG_DEBUGGABLE`), not a build-product marker, so
+//! the same binary that ships to users simply never opens the door.
+//!
+//! # Why this is not a new attack surface
+//!
+//! On Android, "can something outside reach into this app" already has an
+//! authoritative predicate, and `run-as`, `jdwp` (`adb jdwp` lists exactly the
+//! debuggable processes) and the WebView DevTools socket all consult the SAME flag.
+//! Measured on one device: `run-as io.github.qauxv` → `package not debuggable`,
+//! while `run-as unity.SUPERHOT_…` → `uid=10107(…)`. So this module adds a channel
+//! BEHIND a door the platform already opened — it does not widen one.
+//!
+//! # Two halves, deliberately separated
+//!
+//! * [`policy`] is **pure** and therefore testable on every platform, including the
+//!   Windows developer machine this crate is normally built on.
+//! * [`imp`] is the platform edge (socket, token file, accept loop) and is gated to
+//!   `linux`/`android` — the only platforms where abstract unix sockets exist.
+//!
+//! That split is not tidiness. The interesting failure modes here are policy ones
+//! (a token that can be guessed, a socket that collides across two instances, an
+//! accept loop that dies on the first malformed client), and those are exactly the
+//! ones a device-less test can still catch. See the tests at the bottom.
+
+/// The pure decisions. No I/O, no platform calls — so these run everywhere.
+pub mod policy {
+    /// How long the token is, in BYTES, before hex encoding.
+    ///
+    /// 32 bytes = 256 bits. This is the same width `host_ready`'s handshake token
+    /// uses, and the reason is the same: the token is the only thing standing
+    /// between "any process that can reach the socket" and the file primitives, so
+    /// it must not be brute-forceable. A shorter token would still *look* fine.
+    pub const TOKEN_BYTES: usize = 32;
+
+    /// Prefix for the abstract socket name.
+    ///
+    /// ⚠ Deliberately namespaced rather than a bare word: the abstract namespace is
+    /// flat and machine-global, so a generic name like `probe` would collide with
+    /// anything else on the device that had the same idea (and, worse, two VRCX-K
+    /// instances would collide with each other — hence [`socket_name`] appends the
+    /// pid).
+    pub const SOCKET_PREFIX: &str = "vrcxk-debug-probe";
+
+    /// Upper bound on the token line, in bytes.
+    ///
+    /// ⚠ Not a security boundary on its own — [`TOKEN_BYTES`] bounds the real
+    /// token. This bounds the ALLOCATION a hostile client can force before it is
+    /// rejected: without it, a client that never sends `\n` would make the reader
+    /// grow a `String` until the process dies. Comfortably above
+    /// `TOKEN_BYTES * 2` so a legitimate token plus `\r\n` always fits.
+    pub const MAX_TOKEN_LINE: usize = 512;
+
+    /// The name an instance with this pid should bind.
+    ///
+    /// ⚠ The pid is part of the name ON PURPOSE. The abstract namespace is global
+    /// to the device, so without it a second launch of the app would fail to bind
+    /// — and "the probe silently did not start" is indistinguishable from "the
+    /// probe started and rejected me" when all you can see is a connection error.
+    /// With the pid, `adb shell cat /proc/net/unix` names the exact one to forward.
+    pub fn socket_name(pid: u32) -> String {
+        format!("{SOCKET_PREFIX}:{pid}")
+    }
+
+    /// Should this process serve the probe at all?
+    ///
+    /// This is the whole security argument in one line, which is why it is a
+    /// function rather than an `if` buried in setup code: it makes the claim
+    /// testable and reviewable.
+    ///
+    /// The caller must supply the platform's answer to "am I debuggable" — see
+    /// [`super::imp::is_debuggable`]. Passing a constant `true` here is the one way
+    /// to turn this feature into a backdoor, so the caller's value is read from the
+    /// platform every launch and never cached to a file or a build flag.
+    pub fn should_serve(is_debuggable: bool) -> bool {
+        is_debuggable
+    }
+
+    /// Does the presented token match the expected one?
+    ///
+    /// ⚠ Compares in constant time **for equal-length inputs**, and rejects a
+    /// length mismatch before doing any comparison. The length check leaks only the
+    /// token LENGTH, which is a public constant ([`TOKEN_BYTES`]) — not a secret.
+    ///
+    /// Why constant time at all, when this socket is hard to reach: an early-exit
+    /// compare leaks how many leading bytes were right, which turns a 2^256 search
+    /// into a 256-step one for anyone who CAN reach the socket. The threat model
+    /// does not justify skipping this, because the fix is three lines.
+    pub fn token_matches(expected: &str, presented: &str) -> bool {
+        let (a, b) = (expected.as_bytes(), presented.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
+
+    /// Validate a hex token's SHAPE without knowing its value.
+    ///
+    /// Used on the way OUT (before writing the token file) so a broken generator
+    /// cannot publish a short or non-hex token that then "works" in testing while
+    /// being guessable.
+    pub fn is_well_formed_token(token: &str) -> bool {
+        token.len() == TOKEN_BYTES * 2 && token.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod imp {
+    //! The platform edge: reading the debuggable flag, minting a token, serving.
+    //!
+    //! ⚠ Gated to `linux`/`android` because abstract unix sockets do not exist
+    //! elsewhere. The gate is on the MODULE, not on individual functions, so a
+    //! desktop build cannot even name this API by accident.
+    //!
+    //! ⚠ `cfg(any(linux, android))` rather than `cfg(android)` is deliberate and
+    //! is what makes this testable at all: the socket half is identical on both,
+    //! so CI's `ubuntu-24.04` desktop job exercises it for real. Only
+    //! [`is_debuggable`] genuinely differs (Android reads a JNI flag; Linux reports
+    //! `debug_assertions`, which is the closest honest analogue — see its docs).
+
+    use super::policy::{socket_name, MAX_TOKEN_LINE, TOKEN_BYTES};
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    // ⚠ The abstract-socket constructor lives under a DIFFERENT module path on each
+    // target. This is not a stylistic choice: `std::os::linux::net::SocketAddrExt`
+    // does not exist on Android and `std::os::android::net::SocketAddrExt` does not
+    // exist on Linux. Writing the wrong one fails to COMPILE (measured), so the two
+    // imports below are the only correct spelling.
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt as _;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt as _;
+
+    /// Mint a fresh token: `TOKEN_BYTES` bytes from the OS CSPRNG, lowercase hex.
+    ///
+    /// ⚠ Reads `/dev/urandom` rather than pulling in a `rand`/`getrandom`
+    /// dependency. Both would work; this one keeps the crate's dependency list
+    /// unchanged, and `/dev/urandom` is the same source those crates use on these
+    /// targets. **It is not a `cfg(windows)` fallback** — this module never builds
+    /// on Windows.
+    pub fn mint_token() -> std::io::Result<String> {
+        let mut raw = [0u8; TOKEN_BYTES];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+        let mut out = String::with_capacity(TOKEN_BYTES * 2);
+        for byte in raw {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        Ok(out)
+    }
+
+    /// Is THIS process debuggable, per the platform's own predicate?
+    ///
+    /// * **Android**: `FLAG_DEBUGGABLE` (0x2) off the app's own `ApplicationInfo`.
+    ///   This is the same bit `run-as` / `jdwp` consult, so the app's answer and the
+    ///   platform's answer cannot disagree. ⚠ The JNI call chain is
+    ///   `WebviewWindow::with_webview` → `PlatformWebview::jni_handle()` →
+    ///   `JniHandle::exec`, which means it is only reachable AFTER a window exists;
+    ///   the caller must therefore invoke the probe from `.setup()`-time or later.
+    ///   **The exact JNI sequence is not compiled or run in this change** — see the
+    ///   module docs' "not verified" note in the design doc.
+    /// * **Linux**: `debug_assertions`. ⚠ This is an ANALOGUE, not an equivalent:
+    ///   Linux has no per-process "debuggable" bit, so the honest statement is "a
+    ///   debug build serves, a release build does not". It exists so CI can drive
+    ///   the socket half end-to-end; it must never be read as evidence about
+    ///   Android's policy.
+    #[cfg(target_os = "android")]
+    pub fn is_debuggable() -> bool {
+        android_flag_debuggable()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn is_debuggable() -> bool {
+        cfg!(debug_assertions)
+    }
+
+    /// Android's `FLAG_DEBUGGABLE`, read through Tauri's JNI handle.
+    ///
+    /// ⚠ Split into its own function so the three "unavailable" answers (no Tauri
+    /// window yet, no JNI environment, JNI threw) all collapse to `false`. The
+    /// failure direction matters: a probe that fails to determine debuggability must
+    /// stay CLOSED, because "could not tell" is not "allowed".
+    #[cfg(target_os = "android")]
+    fn android_flag_debuggable() -> bool {
+        // ⚠ Isolated so that the rest of the module compiles and can be unit-tested
+        // without a Tauri runtime. In a real launch this is reached from `.setup()`.
+        crate::debug_probe::jni::read_flag_debuggable().unwrap_or(false)
+    }
+
+    /// Bind the abstract socket for `pid`.
+    ///
+    /// Returns the listener plus the name it bound, so a caller can LOG the exact
+    /// name instead of re-deriving it (a re-derived name that drifted would make
+    /// `adb forward` fail with no clue why).
+    pub fn bind(pid: u32) -> std::io::Result<(UnixListener, String)> {
+        let name = socket_name(pid);
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+        let listener = UnixListener::bind_addr(&addr)?;
+        Ok((listener, name))
+    }
+
+    /// Outcome of one client conversation, for logging and for tests.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ClientOutcome {
+        /// Presented the right token; the caller may now serve RPC on this stream.
+        Admitted,
+        /// Wrong or malformed token. The connection is closed without a reply.
+        Rejected,
+        /// Read failed before a token arrived.
+        Unreadable,
+    }
+
+    /// Read one line and decide whether this client may be served.
+    ///
+    /// ⚠ **The rejection reply is deliberately empty.** Saying "bad token" would
+    /// confirm to a scanner that it found a live probe socket; closing silently
+    /// makes a wrong guess indistinguishable from a port that is not there.
+    ///
+    /// ⚠ **Reads ONE BYTE AT A TIME, and that is not laziness — it is the whole
+    /// correctness argument.** The token line is followed IMMEDIATELY by kkrpc
+    /// frames on the same socket, so any buffered reader here would swallow part of
+    /// the first frame and hand the RPC layer a truncated stream. The first version
+    /// of this function wrapped the stream in a `BufReader` and called `read_line`
+    /// — which reads up to 8 KiB, keeps the token line, and **silently discards the
+    /// excess**. Its own comment claimed the problem was avoided; the code did the
+    /// opposite. A 64-byte token costs at most 65 `read` syscalls on a connection
+    /// that is opened once per debugging session, so the byte loop is the right
+    /// trade: it is the only shape that cannot over-read.
+    pub fn handshake(
+        stream: &mut UnixStream,
+        expected: &str,
+        buf: &mut String,
+    ) -> std::io::Result<ClientOutcome> {
+        buf.clear();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                // EOF with nothing read: the client connected and hung up, or sent
+                // no token at all. Not an admission.
+                Ok(0) => {
+                    return if buf.is_empty() {
+                        Ok(ClientOutcome::Unreadable)
+                    } else {
+                        // A token line that was never terminated. Treat as malformed
+                        // rather than admitting a prefix match.
+                        Ok(ClientOutcome::Rejected)
+                    };
+                }
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    // Bound the line so a client cannot make us allocate forever.
+                    if buf.len() >= MAX_TOKEN_LINE {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return Ok(ClientOutcome::Rejected);
+                    }
+                    buf.push(byte[0] as char);
+                }
+                Err(_) => return Ok(ClientOutcome::Unreadable),
+            }
+        }
+        let presented = buf.trim_end_matches(['\r', '\n']);
+        if super::policy::token_matches(expected, presented) {
+            Ok(ClientOutcome::Admitted)
+        } else {
+            // Close without a reply. See the doc comment.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            Ok(ClientOutcome::Rejected)
+        }
+    }
+
+    /// Write the token where a developer (via adb) can read it, but another app
+    /// cannot.
+    ///
+    /// Tries each candidate directory in order and returns the one that worked, so
+    /// the caller can LOG the real path rather than a guess. The first candidate is
+    /// the app's own external files dir: `adb shell` can read it, the app can write
+    /// it without any runtime permission, and Android 11+ scoped storage keeps other
+    /// apps out. That combination — and nothing else on the device — is what makes it
+    /// the right place.
+    ///
+    /// ⚠ Returns `Err` when NO candidate works. A probe that runs but cannot publish
+    /// its token is useless, and silently continuing would look like "the harness
+    /// could not connect" instead of "the token was never written".
+    pub fn publish_token(token: &str, pkg: &str, candidates: &[String]) -> std::io::Result<String> {
+        let mut last: Option<std::io::Error> = None;
+        for dir in candidates {
+            let path =
+                std::path::Path::new(dir).join(format!("{}.token", super::policy::SOCKET_PREFIX));
+            match std::fs::write(&path, token.as_bytes()) {
+                Ok(()) => return Ok(path.to_string_lossy().into_owned()),
+                Err(err) => last = Some(err),
+            }
+        }
+        let _ = pkg; // kept for a future per-package subdirectory; see the design doc
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no candidate directory")
+        }))
+    }
+
+    /// Serve one admitted client by handing its stream to `serve`.
+    ///
+    /// Kept tiny and separate from the accept loop so the loop's error handling
+    /// (which must NOT die on a single bad client) is readable on its own.
+    pub fn serve_admitted<F>(stream: UnixStream, serve: F) -> std::io::Result<()>
+    where
+        F: FnOnce(UnixStream) -> std::io::Result<()>,
+    {
+        serve(stream)
+    }
+
+    /// Flush helper: the token file is small, but an unflushed write would publish
+    /// an empty file that then fails `handshake` for reasons no one can see.
+    pub fn write_all_and_sync(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+}
+
+/// The Android JNI bridge: reading `FLAG_DEBUGGABLE` off our own `ApplicationInfo`.
+///
+/// ⚠ **This module is the LEAST verified part of the change.** The call chain
+/// (`WebviewWindow::with_webview` → `PlatformWebview::jni_handle()` →
+/// `JniHandle::exec`, which hands over `&mut JNIEnv` plus the activity `JObject`)
+/// was read out of tauri 2.11.5 / wry 0.55.1 sources and matches tauri's own
+/// documented example, but **the flag-read below has never been compiled or run** —
+/// cross-compiling for Android needs an NDK this machine does not have. Treat it as
+/// a sketch to be validated the first time CI builds the debuggable APK.
+#[cfg(target_os = "android")]
+pub mod jni {
+    /// Read `ApplicationInfo.flags & FLAG_DEBUGGABLE` for this process.
+    ///
+    /// Returns `None` when the value could not be determined for ANY reason, so the
+    /// caller can fail closed (see `is_debuggable`).
+    pub fn read_flag_debuggable() -> Option<bool> {
+        // The JNI body is intentionally a stub with an explicit `None`.
+        //
+        // ⚠ Writing the real call here without being able to compile it would put
+        // UNVERIFIED code on the security-critical path, and this module's whole
+        // claim is that the predicate is trustworthy. A stub that fails CLOSED keeps
+        // that claim honest until CI can build it: the probe then simply never
+        // serves, which is the safe direction and is loudly logged by the caller.
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests. These run on every platform (the policy half) — see the module docs for
+// why that split is the point rather than a convenience.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::policy::*;
+
+    #[test]
+    fn only_a_debuggable_process_serves() {
+        // The entire security argument. If this ever returns true for `false`, the
+        // probe becomes a backdoor on every user's device — so it is asserted in
+        // both directions rather than only the interesting one.
+        assert!(should_serve(true), "a debuggable process must serve");
+        assert!(
+            !should_serve(false),
+            "⚠ a NON-debuggable process must never serve — this is the backdoor guard"
+        );
+    }
+
+    #[test]
+    fn the_socket_name_carries_the_pid_so_two_instances_do_not_collide() {
+        let a = socket_name(1234);
+        let b = socket_name(5678);
+        assert_ne!(
+            a, b,
+            "two instances must bind DIFFERENT names: the abstract namespace is global, \
+             so a shared name means the second launch silently fails to bind"
+        );
+        assert!(
+            a.starts_with(SOCKET_PREFIX),
+            "the name must stay namespaced to avoid colliding with unrelated sockets"
+        );
+        assert!(
+            a.contains("1234"),
+            "the pid must be visible in the name so `adb shell cat /proc/net/unix` \
+             tells a developer exactly which socket to forward"
+        );
+    }
+
+    #[test]
+    fn a_token_must_match_exactly() {
+        let good = "a".repeat(TOKEN_BYTES * 2);
+        assert!(token_matches(&good, &good), "identical tokens must match");
+
+        // Every one of these is a DIFFERENT way to be wrong, which is why they are
+        // separate assertions: a compare that forgot the length check would pass the
+        // first case below and fail only the prefix one.
+        assert!(
+            !token_matches(&good, &"a".repeat(TOKEN_BYTES * 2 - 1)),
+            "a truncated token must not match"
+        );
+        assert!(
+            !token_matches(&good, &format!("{}b", "a".repeat(TOKEN_BYTES * 2 - 1))),
+            "a token differing only in the LAST byte must not match"
+        );
+        assert!(
+            !token_matches(&good, &format!("b{}", "a".repeat(TOKEN_BYTES * 2 - 1))),
+            "a token differing only in the FIRST byte must not match"
+        );
+        assert!(!token_matches(&good, ""), "an empty token must not match");
+        assert!(
+            !token_matches("", &good),
+            "an empty EXPECTED token must not match either — that would be the \
+             'no token configured' case silently admitting everyone"
+        );
+        assert!(
+            token_matches("", ""),
+            "…but two empty values DO compare equal; the guard against publishing an \
+             empty expected token lives in is_well_formed_token, not here"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_token_is_full_length_hex() {
+        assert!(is_well_formed_token(&"a".repeat(TOKEN_BYTES * 2)));
+        assert!(is_well_formed_token(&"0123456789abcdef".repeat(4)));
+        assert!(
+            !is_well_formed_token(&"a".repeat(TOKEN_BYTES * 2 - 1)),
+            "a short token is guessable and must be rejected before it is published"
+        );
+        assert!(
+            !is_well_formed_token(&"z".repeat(TOKEN_BYTES * 2)),
+            "a non-hex token means the generator is broken"
+        );
+        assert!(
+            !is_well_formed_token(""),
+            "an empty token is not well formed"
+        );
+    }
+}
+
+/// Socket-layer tests. Gated like [`imp`], and they are the reason the socket half
+/// is `cfg(any(linux, android))` rather than `cfg(android)`: CI's ubuntu job runs
+/// these for real, with no emulator and no device.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod socket_tests {
+    use super::imp::*;
+    use super::policy::*;
+    // ⚠ These three imports are load-bearing and were MISSING in the first version of
+    // this module: `write_all`/`flush`/`read_to_string` are trait methods, and
+    // `from_abstract_name` comes from a target-specific extension trait that `imp`
+    // imports but a sibling module does not inherit. The omission was invisible on
+    // the Windows dev machine (`socket_tests` is cfg'd out there) and also survived
+    // `cargo check --target aarch64-linux-android`, because **`check` does not build
+    // test code**. It took an actual `cargo test --target x86_64-unknown-linux-musl`
+    // to surface it — which is the reason this module is gated `any(linux, android)`
+    // rather than `android` in the first place.
+    use std::io::{Read, Write};
+    #[cfg(target_os = "android")]
+    use std::os::android::net::SocketAddrExt as _;
+    #[cfg(target_os = "linux")]
+    use std::os::linux::net::SocketAddrExt as _;
+
+    #[test]
+    fn a_minted_token_has_the_declared_shape() {
+        let token = mint_token().expect("/dev/urandom must be readable");
+        assert!(
+            is_well_formed_token(&token),
+            "a token that is not {TOKEN_BYTES} bytes of hex is guessable; got {token:?}"
+        );
+    }
+
+    #[test]
+    fn two_minted_tokens_differ() {
+        // Guards against a generator that reads no entropy at all (e.g. a file that
+        // opens but yields zeros). A constant token would pass the shape test above.
+        let a = mint_token().expect("first");
+        let b = mint_token().expect("second");
+        assert_ne!(
+            a, b,
+            "two tokens must not be identical — that means no entropy"
+        );
+    }
+
+    #[test]
+    fn the_abstract_socket_round_trips_a_real_client() {
+        // A REAL socket, a REAL client, on whatever platform is running this. This is
+        // the test that would have caught "abstract sockets do not work on Android"
+        // had the platform not supported them — and it is why the socket half is not
+        // left to be discovered on a device.
+        let pid = std::process::id();
+        let (listener, name) = bind(pid).expect("bind the abstract socket");
+        assert_eq!(name, socket_name(pid));
+
+        let token = "ab".repeat(TOKEN_BYTES);
+        let client_name = name.clone();
+        let client_token = token.clone();
+        let client = std::thread::spawn(move || -> ClientOutcome {
+            let addr =
+                std::os::unix::net::SocketAddr::from_abstract_name(client_name.as_bytes()).unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr).unwrap();
+            stream.write_all(client_token.as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            // ⚠ Do NOT read here. The first version of this test read to EOF, which
+            // deadlocked the whole binary: an ADMITTED client is deliberately left
+            // open (the caller is about to serve RPC on it), so EOF never arrives and
+            // both threads wait forever. A `cargo test` run has no per-test timeout,
+            // so the symptom was a hang, not a failure — the worst kind of test bug.
+            // The outcome is decided by the server side; this thread only proves the
+            // write path works and then returns.
+            ClientOutcome::Admitted
+        });
+
+        let (mut server_stream, _) = listener.accept().expect("accept the client");
+        let mut buf = String::new();
+        let outcome = handshake(&mut server_stream, &token, &mut buf).expect("handshake");
+        assert_eq!(
+            outcome,
+            ClientOutcome::Admitted,
+            "the correct token must be admitted over a real abstract socket"
+        );
+        assert_eq!(client.join().unwrap(), ClientOutcome::Admitted);
+    }
+
+    #[test]
+    fn a_wrong_token_is_rejected_and_closed_without_a_reply() {
+        let pid = std::process::id();
+        // ⚠ A distinct pid offset so this test's socket cannot collide with the
+        // round-trip test's when both run in parallel in one process.
+        let (listener, name) = bind(pid.wrapping_add(1_000_000)).expect("bind");
+        let expected = "aa".repeat(TOKEN_BYTES);
+
+        let client_name = name.clone();
+        let client = std::thread::spawn(move || -> (String, bool) {
+            let addr =
+                std::os::unix::net::SocketAddr::from_abstract_name(client_name.as_bytes()).unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr).unwrap();
+            stream.write_all(b"not-the-token\n").unwrap();
+            stream.flush().unwrap();
+            let mut reply = String::new();
+            let read = stream.read_to_string(&mut reply);
+            (reply, read.is_ok())
+        });
+
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let mut buf = String::new();
+        let outcome = handshake(&mut server_stream, &expected, &mut buf).expect("handshake");
+        assert_eq!(outcome, ClientOutcome::Rejected);
+
+        let (reply, _) = client.join().unwrap();
+        assert!(
+            reply.is_empty(),
+            "⚠ a rejection must send NOTHING back: a reply would confirm to a scanner \
+             that a live probe socket exists here. Got {reply:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_expected_token_never_admits_a_real_client() {
+        // The dangerous misconfiguration: a caller that forgot to mint a token. The
+        // pure test above documents that "" == ""; this one pins that a real client
+        // sending an empty line is still not admitted unless the token is ALSO empty
+        // — and that is the case the caller must prevent via is_well_formed_token.
+        let pid = std::process::id();
+        let (listener, name) = bind(pid.wrapping_add(2_000_000)).expect("bind");
+        let client_name = name.clone();
+        let client = std::thread::spawn(move || {
+            let addr =
+                std::os::unix::net::SocketAddr::from_abstract_name(client_name.as_bytes()).unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr).unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            let mut sink = String::new();
+            let _ = stream.read_to_string(&mut sink);
+        });
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let mut buf = String::new();
+        let outcome = handshake(&mut server_stream, "a-real-token", &mut buf).expect("handshake");
+        assert_eq!(
+            outcome,
+            ClientOutcome::Rejected,
+            "an empty presented token must not satisfy a non-empty expected token"
+        );
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn a_client_that_sends_nothing_is_unreadable_not_admitted() {
+        // Guards the `Ok(0)` (immediate EOF) path: a scanner that connects and hangs
+        // up must not be treated as a successful handshake.
+        let pid = std::process::id();
+        let (listener, name) = bind(pid.wrapping_add(3_000_000)).expect("bind");
+        let client_name = name.clone();
+        let client = std::thread::spawn(move || {
+            let addr =
+                std::os::unix::net::SocketAddr::from_abstract_name(client_name.as_bytes()).unwrap();
+            let stream = std::os::unix::net::UnixStream::connect_addr(&addr).unwrap();
+            drop(stream);
+        });
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let mut buf = String::new();
+        let outcome = handshake(&mut server_stream, "whatever", &mut buf).expect("handshake");
+        assert_eq!(outcome, ClientOutcome::Unreadable);
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn the_handshake_does_not_swallow_bytes_that_follow_the_token() {
+        // ⚠ THE REGRESSION FOR A REAL BUG IN THIS MODULE, and the reason `handshake`
+        // reads one byte at a time instead of using a `BufReader`.
+        //
+        // The first version wrapped the stream in a `BufReader` and called `read_line`.
+        // That reads up to 8 KiB at once, returns the token line, and **silently
+        // discards everything it buffered past the newline** when the reader is dropped.
+        // Since the token line is IMMEDIATELY followed by kkrpc frames on the same
+        // socket, that eats the first frame — or part of it — and the RPC layer then
+        // waits forever for bytes that were already thrown away.
+        //
+        // No other test in this file could catch it: they all send the token and nothing
+        // else, so a buffered read never has anything to over-read. That is exactly how
+        // the bug survived the first round of tests.
+        //
+        // So the client writes the token AND a following frame in ONE write, leaving both
+        // in the socket buffer before the server looks. After the handshake admits it, the
+        // payload must still be readable from that same stream.
+        let pid = std::process::id();
+        let (listener, name) = bind(pid.wrapping_add(4_000_000)).expect("bind");
+        let token = "cd".repeat(TOKEN_BYTES);
+        const PAYLOAD: &[u8] = b"{\"t\":\"q\",\"op\":\"hands.stat\"}\n";
+
+        let client_name = name.clone();
+        let client_token = token.clone();
+        let client = std::thread::spawn(move || {
+            let addr =
+                std::os::unix::net::SocketAddr::from_abstract_name(client_name.as_bytes()).unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr).unwrap();
+            // ONE write: the token line plus the frame that follows it.
+            let mut frame = Vec::new();
+            frame.extend_from_slice(client_token.as_bytes());
+            frame.extend_from_slice(b"\n");
+            frame.extend_from_slice(PAYLOAD);
+            stream.write_all(&frame).unwrap();
+            stream.flush().unwrap();
+            // Hold the connection open so the server's read below can block instead of
+            // seeing EOF — EOF would let the assertion below pass for the wrong reason.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        // Bound the read so a returning bug fails instead of hanging the suite.
+        server_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("set a read timeout");
+        let mut buf = String::new();
+        let outcome = handshake(&mut server_stream, &token, &mut buf).expect("handshake");
+        assert_eq!(outcome, ClientOutcome::Admitted);
+
+        let mut got = vec![0u8; PAYLOAD.len()];
+        let read = server_stream.read_exact(&mut got);
+        assert!(
+            read.is_ok(),
+            "⚠ after the handshake the FOLLOWING frame must still be on the stream. A \
+             buffered read over-reads past the token's newline and discards the frame, so \
+             the RPC layer waits forever for bytes that were already thrown away. Got: \
+             {read:?}"
+        );
+        assert_eq!(
+            got, PAYLOAD,
+            "the bytes after the token must arrive intact and in order"
+        );
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn an_overlong_token_line_is_rejected_without_unbounded_growth() {
+        // The allocation guard: a client that never sends `\n` must not be able to make
+        // the reader grow a `String` until the process dies. MAX_TOKEN_LINE bounds it.
+        let pid = std::process::id();
+        let (listener, name) = bind(pid.wrapping_add(5_000_000)).expect("bind");
+        let client_name = name.clone();
+        let client = std::thread::spawn(move || {
+            let addr =
+                std::os::unix::net::SocketAddr::from_abstract_name(client_name.as_bytes()).unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr).unwrap();
+            // Far more than MAX_TOKEN_LINE, and deliberately never terminated.
+            let flood = vec![b'a'; MAX_TOKEN_LINE * 4];
+            let _ = stream.write_all(&flood);
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let (mut server_stream, _) = listener.accept().expect("accept");
+        let mut buf = String::new();
+        let outcome = handshake(&mut server_stream, "expected", &mut buf).expect("handshake");
+        assert_eq!(
+            outcome,
+            ClientOutcome::Rejected,
+            "an unterminated overlong line must be rejected, not buffered forever"
+        );
+        assert!(
+            buf.len() <= MAX_TOKEN_LINE,
+            "the reader must stop accumulating at MAX_TOKEN_LINE; got {} bytes",
+            buf.len()
+        );
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn the_token_is_published_to_the_first_writable_candidate() {
+        let dir = std::env::temp_dir().join(format!("vrcxk-probe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let candidates = vec![dir.to_string_lossy().into_owned()];
+        let path = publish_token("deadbeef", "com.vrcxk.app", &candidates)
+            .expect("the writable candidate must be used");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            written, "deadbeef",
+            "the published token must be exactly what the handshake will compare against"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publishing_fails_loudly_when_no_candidate_is_writable() {
+        // A probe that runs but cannot publish its token looks EXACTLY like a harness
+        // that cannot connect, so this must be an error rather than a silent skip.
+        let bogus = vec!["/nonexistent-vrcxk-dir-xyz".to_string()];
+        let err = publish_token("deadbeef", "com.vrcxk.app", &bogus)
+            .expect_err("no writable candidate must be an error");
+        assert_ne!(err.kind(), std::io::ErrorKind::Other);
+    }
+}

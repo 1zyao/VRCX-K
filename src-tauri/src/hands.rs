@@ -2761,6 +2761,184 @@ mod tests {
         assert!(error.starts_with("EUNSUPPORTED"), "got: {error}");
     }
 
+    /// Drive the REAL write path once: open → write → `finish` → drop the handle.
+    ///
+    /// ⚠ Why this helper exists: regressions of the "intent computed correctly, disk
+    /// written wrongly" kind are only visible after the bytes actually land. Hand-rolling
+    /// a `DeferredWriter` per test makes it easy to skip either `finish` or `drop` — and
+    /// then the assertion may read a buffer that only another handle in the same process
+    /// can see, which is false coverage: it looks like it tests the disk while it tests
+    /// memory. Funnelling the path through one exit means no case can each miss its own step.
+    fn write_through(path: &Path, opts: &Value, bytes: &[u8]) {
+        let writer = FileWriter::open(path.to_str().unwrap(), opts).expect("open");
+        let mut sink = DeferredWriter {
+            writer,
+            reply: DeferredReply::test_stub(),
+            mode: "test",
+        };
+        sink.write(bytes).expect("write");
+        sink.finish(Ok(()));
+        // In production the sink is dropped as soon as the stream ends, which closes the
+        // handle. It must be closed BEFORE reading back: otherwise this measures "what
+        // another handle can still see" rather than "what the file finally contains".
+        drop(sink);
+    }
+
+    #[test]
+    fn the_default_write_truncates_the_file_on_disk_so_no_tail_survives() {
+        // ⚠ This closes the "pins the struct, not the disk" gap.
+        //
+        // `the_default_intent_rewrites_the_file` only asserts fields of the internal
+        // `WriteIntent`; it never touches a real file. So the whole "intent right, disk
+        // wrong" class of regression stays green: delete the `truncate(true)` line that
+        // `FileWriter::open` passes to `OpenOptions` and those tests all still pass —
+        // while the disk keeps "new content + old tail", which is exactly the
+        // `{"alpha":9}"beta":2}` corruption `e95ba827` fixed: the JSON is already broken,
+        // the caller receives `success`, and **no layer reports anything**.
+        //
+        // So this asserts what the file finally LOOKS LIKE, not what the intent was: seed
+        // a file longer than the new content to create the "short write over a long file"
+        // shape, then read the real bytes back.
+        let dir = temp_dir("write-default-truncates");
+        let path = dir.join("out.txt");
+        std::fs::write(&path, b"0123456789ABCDEFGHIJ").expect("seed");
+
+        write_through(&path, &json!({}), b"short");
+
+        let got = std::fs::read(&path).expect("read back");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            got, b"short",
+            "the default intent must rewrite the file to exactly 5 bytes; any extra byte \
+             is an old tail that was not truncated"
+        );
+    }
+
+    #[test]
+    fn an_offset_write_patches_in_place_on_disk_and_keeps_the_tail() {
+        // ⚠ The other half of the case above, and likewise pinned to the disk rather
+        // than to the struct.
+        //
+        // `an_offset_alone_means_write_in_place_not_rewrite` pins that `{offset: N}`
+        // defaults to in-place patching, but it stops at `WriteIntent`. Add an
+        // `else { options.truncate(true) }` after the `else if intent.truncate` in
+        // `FileWriter::open`, or move the `seek` to the wrong place, and that test is
+        // still fully green — while the disk gets an `O_TRUNC` + `seek(5)`: the first 5
+        // bytes zero-filled and the last 10 chopped off. That is the same corruption the
+        // `truncate_with_an_offset_is_refused_because_it_zero_fills_the_head` refusal
+        // guards against, except here it arrives by bypassing the refusal through the
+        // default-value side.
+        //
+        // The assertion is "all 20 bytes equal, byte for byte" rather than "the file is
+        // long enough": zero-fill, a chopped tail, or only the middle three bytes being
+        // right are all caught by that one comparison.
+        let dir = temp_dir("write-offset-in-place");
+        let path = dir.join("out.txt");
+        std::fs::write(&path, b"0123456789ABCDEFGHIJ").expect("seed");
+
+        write_through(&path, &json!({ "offset": 5 }), b"XYZ");
+
+        let got = std::fs::read(&path).expect("read back");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            got, b"01234XYZ89ABCDEFGHIJ",
+            "`{{offset: 5}}` must patch in place: the first 5 bytes must not be \
+             zero-filled and the last 10 must not be truncated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_of_a_fifo_is_refused_by_the_regular_file_guard() {
+        // ⚠ This is the ONLY regression test for the `Ok(meta) if !meta.is_file()`
+        // guard in `FileWriter::open` (which reports `hands.write: {path} is not a
+        // regular file`). Before it existed, deleting the whole guard left the entire
+        // suite green — removing a deadlock-preventing branch with nothing turning red
+        // is exactly the silent failure this repo keeps hunting.
+        //
+        // Why the guard must exist: `OpenOptions::open(FIFO, write)` **blocks** until
+        // some reader opens the same FIFO, and it runs on the single reader thread — so
+        // cancellation frames are never read again, every in-flight RPC times out
+        // together at 30s, and only `kill_tree` can end it. The read side's copy of the
+        // same guard is pinned by `read_of_a_fifo_is_refused_by_the_regular_file_guard`;
+        // the write side (`hands.write`) had nobody pinning it.
+        //
+        // ⚠ Why `#[cfg(unix)]` is REQUIRED: this branch is **structurally unreachable**
+        // on Windows, not "we were too lazy to build a fixture". std's Windows
+        // `FileType::is_file()` is literally `!self.is_symlink && !self.is_directory`,
+        // so any path whose `metadata` succeeds necessarily lands in `is_file` or
+        // `is_dir`. Measured, and it agrees: device path `\\.\NUL` gives os error 1 and
+        // `\\.\CON` gives 87 (`metadata` fails first, never reaching the guard), a named
+        // pipe reports `is_file() == true`, and file symlinks and junctions also land in
+        // one of the two arms. **So a version without the cfg would "test nothing,
+        // greenly" on Windows**, which is worse than having no test. Local `cargo test`
+        // is Windows, so this does not run locally there; its real execution sites are
+        // CI's ubuntu-24.04 job (`.github/workflows/build.yml`'s desktop matrix runs
+        // `cargo test`).
+        //
+        // `mkfifo` is invoked as a command (no crate dependency), and when the fixture
+        // cannot be created this **skips and says so** rather than asserting against a
+        // file that was never created — the latter is precisely "silently pass when the
+        // fixture is missing".
+        let dir = temp_dir("write-fifo");
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            std::fs::remove_dir_all(&dir).ok();
+            eprintln!("mkfifo unavailable; skipping the write-side FIFO guard check");
+            return;
+        }
+        let path = fifo.to_str().expect("utf-8 temp path").to_string();
+
+        // stat MUST succeed, or this test proves nothing about the guard: the point is
+        // "`metadata` accepted this FIFO and the GUARD refused it", not "the OS errored
+        // out first".
+        let meta = std::fs::metadata(&fifo).expect("metadata on a FIFO succeeds");
+        assert!(!meta.is_dir(), "a FIFO is not a directory");
+        assert!(
+            !meta.is_file(),
+            "⚠ if the platform treated this FIFO as a regular file, the assertion below \
+             would be hitting a different branch and this coverage would be fake"
+        );
+
+        // ⚠ The call goes through a timeout rather than being made directly: once the
+        // guard is deleted this does not "fail", it **blocks forever** (nobody reads this
+        // FIFO) and the whole test process hangs. The timeout turns that back into a
+        // failure with an explanation — and it also pins the property that the refusal
+        // must be **immediate**, which "eventually refused" cannot pin.
+        let (sender, receiver) = mpsc::channel();
+        let target = path.clone();
+        std::thread::spawn(move || {
+            let outcome = FileWriter::open(&target, &json!({})).map(|_| ());
+            let _ = sender.send(outcome);
+        });
+        let error = match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Err(error)) => error,
+            Ok(Ok(())) => panic!("a FIFO must not open for writing"),
+            Err(_) => panic!(
+                "⚠ nothing returned within 10s: the guard is gone and \
+                 `OpenOptions::open` is blocking on the FIFO — exactly the deadlock \
+                 shape it exists to prevent (in production it wedges the one reader \
+                 thread)"
+            ),
+        };
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Asserts the FULL error verbatim rather than just the `EUNSUPPORTED` prefix: a
+        // prefix cannot distinguish "hit the not-a-regular-file guard" from "was caught
+        // incidentally by EISDIR or another EUNSUPPORTED", and pinning that one line is
+        // this test's entire reason to exist.
+        assert_eq!(
+            error,
+            format!("EUNSUPPORTED: hands.write: {path} is not a regular file"),
+            "must hit the write-side not-a-regular-file guard, with the message verbatim"
+        );
+    }
+
     // --- watch --------------------------------------------------------------
 
     #[test]

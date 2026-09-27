@@ -1,4 +1,12 @@
 mod app_lifecycle;
+// The debug-only self-probe (design: docs/android-debuggable-probe-design.md).
+//
+// `pub` because a driver must reach it the way production does. The socket half is
+// `cfg(any(linux, android))`, so CI's ubuntu job compiles and runs it for real — that
+// gate is what makes the transport testable without an emulator. Publishing it adds
+// no capability: `policy` is pure, and `imp` refuses to serve unless the platform
+// says this very process is debuggable.
+pub mod debug_probe;
 mod dialog_opts;
 // ⚠ These three are `pub` so the `hands-e2e` EXAMPLE can mount them on a bare
 // stdio loop and exercise the real wire protocol without a webview (see
