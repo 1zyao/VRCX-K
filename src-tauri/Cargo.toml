@@ -137,3 +137,11 @@ tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 # shell's notification layer; actually used from F3 onward.
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8"
+
+# The debug-only self-probe reads our own `ApplicationInfo.flags` over JNI
+# (`src-tauri/src/debug_probe.rs`). ⚠ `jni` is ALREADY in the tree transitively
+# (`tao → jni 0.21.1`), but a transitive dependency cannot be named — `use jni::…`
+# only compiles if it is declared here. Pinning the same major (`0.21`) keeps cargo
+# from pulling a second copy, so this adds no new code to the build.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

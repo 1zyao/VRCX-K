@@ -165,24 +165,14 @@ pub mod imp {
 
     /// Is THIS process debuggable, per the platform's own predicate?
     ///
-    /// * **Android**: `FLAG_DEBUGGABLE` (0x2) off the app's own `ApplicationInfo`.
-    ///   This is the same bit `run-as` / `jdwp` consult, so the app's answer and the
-    ///   platform's answer cannot disagree. ⚠ The JNI call chain is
-    ///   `WebviewWindow::with_webview` → `PlatformWebview::jni_handle()` →
-    ///   `JniHandle::exec`, which means it is only reachable AFTER a window exists;
-    ///   the caller must therefore invoke the probe from `.setup()`-time or later.
-    ///   **The exact JNI sequence is not compiled or run in this change** — see the
-    ///   module docs' "not verified" note in the design doc.
+    /// * **Android**: `FLAG_DEBUGGABLE` (0x2) off the app's own `ApplicationInfo` —
+    ///   see the `#[cfg(target_os = "android")]` overload below, which needs an
+    ///   `AppHandle` to reach the JNI bridge.
     /// * **Linux**: `debug_assertions`. ⚠ This is an ANALOGUE, not an equivalent:
     ///   Linux has no per-process "debuggable" bit, so the honest statement is "a
     ///   debug build serves, a release build does not". It exists so CI can drive
     ///   the socket half end-to-end; it must never be read as evidence about
     ///   Android's policy.
-    #[cfg(target_os = "android")]
-    pub fn is_debuggable() -> bool {
-        android_flag_debuggable()
-    }
-
     #[cfg(target_os = "linux")]
     pub fn is_debuggable() -> bool {
         cfg!(debug_assertions)
@@ -190,15 +180,37 @@ pub mod imp {
 
     /// Android's `FLAG_DEBUGGABLE`, read through Tauri's JNI handle.
     ///
-    /// ⚠ Split into its own function so the three "unavailable" answers (no Tauri
-    /// window yet, no JNI environment, JNI threw) all collapse to `false`. The
-    /// failure direction matters: a probe that fails to determine debuggability must
-    /// stay CLOSED, because "could not tell" is not "allowed".
+    /// ⚠ All three "unavailable" answers — no window, no JNI environment, JNI threw —
+    /// collapse to `false`. The direction matters: a probe that cannot determine
+    /// debuggability must stay CLOSED, because "could not tell" is not "allowed".
+    ///
+    /// ⚠ This must be called AFTER a window exists. Tauri builds the windows from
+    /// config before running the user's `.setup()`
+    /// (`tauri-2.11.5/src/app.rs:2524` then `:2530`), so `.setup()` is early enough —
+    /// but a call from `main()` before the builder runs would find no window and
+    /// return `false`. That is the safe direction, and it is logged.
+    ///
+    /// ⚠ `tauri::Manager` must be in scope for `get_webview_window` — it is a trait
+    /// method, not an inherent one on `AppHandle`. Without the import the call fails
+    /// to compile with "no method named `get_webview_window`", which is how this was
+    /// found.
     #[cfg(target_os = "android")]
-    fn android_flag_debuggable() -> bool {
-        // ⚠ Isolated so that the rest of the module compiles and can be unit-tested
-        // without a Tauri runtime. In a real launch this is reached from `.setup()`.
-        crate::debug_probe::jni::read_flag_debuggable().unwrap_or(false)
+    pub fn is_debuggable(app: &tauri::AppHandle) -> bool {
+        use tauri::Manager as _;
+        let Some(window) = app.get_webview_window("main") else {
+            eprintln!("[debug-probe] no main window yet; cannot read FLAG_DEBUGGABLE");
+            return false;
+        };
+        // ⚠ `super::jni`, NOT `jni`: the bare path resolves to the `jni` CRATE (which
+        // this file depends on for `JNIEnv`), and the resulting "cannot find function
+        // `probe_via_webview` in crate `jni`" is a confusing way to learn that.
+        match super::jni::probe_via_webview(&window) {
+            Some(debuggable) => debuggable,
+            None => {
+                eprintln!("[debug-probe] could not read FLAG_DEBUGGABLE; staying closed");
+                false
+            }
+        }
     }
 
     /// Bind the abstract socket for `pid`.
@@ -389,6 +401,62 @@ pub mod imp {
         }
     }
 
+    /// The whole probe, decided and started in ONE place.
+    ///
+    /// This is the function a caller should use, and its shape is the design: the
+    /// debuggability check and the decision to serve live together so no caller can
+    /// accidentally start the listener without the check. Returns the socket name on
+    /// success so the caller can LOG it — a name the harness has to guess is a name
+    /// that will be guessed wrong.
+    ///
+    /// `serve` is invoked once per admitted client, on the calling thread. ⚠ The
+    /// check happens ONCE, before binding, and never again: re-reading it per client
+    /// would suggest debuggability can change mid-session, and it cannot.
+    ///
+    /// Returns:
+    /// * `Ok(None)` — correctly declined (not debuggable). **Not an error**: this is
+    ///   the normal outcome on every user's device, and treating it as one would train
+    ///   people to ignore the message.
+    /// * `Ok(Some((name, admitted)))` — served, and how many clients it admitted.
+    /// * `Err(_)` — debuggable, but the probe could not start (bind or token publish
+    ///   failed). ⚠ This IS an error: it means the harness will not be able to connect,
+    ///   and silently returning success would look like "the test found nothing".
+    pub fn run<F>(
+        debuggable: bool,
+        pid: u32,
+        token: &str,
+        token_candidates: &[String],
+        pkg: &str,
+        should_stop: impl FnMut() -> bool,
+        serve: F,
+    ) -> std::io::Result<Option<(String, usize)>>
+    where
+        F: FnMut(UnixStream) -> std::io::Result<()>,
+    {
+        if !super::policy::should_serve(debuggable) {
+            eprintln!("[debug-probe] not debuggable; the probe stays closed (this is normal)");
+            return Ok(None);
+        }
+
+        // ⚠ Refuse to serve a token that is not well formed. This is the one place the
+        // "no token configured" misconfiguration can be caught: an empty or short
+        // expected token would make `token_matches` accept things it must not, and the
+        // failure would be invisible (the harness would simply work).
+        if !super::policy::is_well_formed_token(token) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to serve with a malformed token",
+            ));
+        }
+
+        let (listener, name) = bind(pid)?;
+        let token_path = publish_token(token, pkg, token_candidates)?;
+        eprintln!("[debug-probe] serving on @{name}; token at {token_path}");
+
+        let admitted = accept_loop(&listener, token, should_stop, serve)?;
+        Ok(Some((name, admitted)))
+    }
+
     /// Flush helper: the token file is small, but an unflushed write would publish
     /// an empty file that then fails `handshake` for reasons no one can see.
     pub fn write_all_and_sync(path: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -400,28 +468,117 @@ pub mod imp {
 
 /// The Android JNI bridge: reading `FLAG_DEBUGGABLE` off our own `ApplicationInfo`.
 ///
-/// ⚠ **This module is the LEAST verified part of the change.** The call chain
-/// (`WebviewWindow::with_webview` → `PlatformWebview::jni_handle()` →
-/// `JniHandle::exec`, which hands over `&mut JNIEnv` plus the activity `JObject`)
-/// was read out of tauri 2.11.5 / wry 0.55.1 sources and matches tauri's own
-/// documented example, but **the flag-read below has never been compiled or run** —
-/// cross-compiling for Android needs an NDK this machine does not have. Treat it as
-/// a sketch to be validated the first time CI builds the debuggable APK.
+/// # The call chain, and where each link was verified
+///
+/// ```text
+/// WebviewWindow::with_webview(|w| …)                  tauri 2.11.5 src/webview/webview_window.rs:2371
+///   → PlatformWebview::jni_handle()                   tauri 2.11.5 src/webview/mod.rs:233 (cfg android)
+///     → JniHandle::exec(|env, activity, webview| …)    wry 0.55.1 src/android/mod.rs:479
+///       → env.call_method(activity, "getApplicationInfo", …)   ← `activity` is given to us
+///         → env.get_field(&info, "flags", "I") & 0x2
+/// ```
+///
+/// ⚠ **Reachability in time**: `JniHandle` lives on a webview, and tauri builds the
+/// windows from config BEFORE invoking the user's `.setup()`
+/// (`tauri-2.11.5/src/app.rs:2524` builds, `:2530` calls the setup closure). So a
+/// window — and therefore a JNI handle — exists by the time `.setup()` runs. That
+/// ordering was read out of the source rather than assumed, because getting it wrong
+/// would mean the probe silently never starts.
+///
+/// ⚠ **Still not RUN**: the code below is compiled for `aarch64-linux-android` by CI
+/// (`cargo check --target aarch64-linux-android`, which type-checks without linking),
+/// but it has never executed on a device. `cargo check` catching a type error is real
+/// evidence; it is NOT evidence that the flags bit means what we think.
 #[cfg(target_os = "android")]
 pub mod jni {
+    use jni::objects::{JObject, JValue};
+
+    /// `ApplicationInfo.FLAG_DEBUGGABLE`, from the Android SDK.
+    ///
+    /// ⚠ Spelled out rather than imported: the value is part of the platform's stable
+    /// ABI, and a literal with its name beside it is easier to audit than a constant
+    /// arriving through three layers of re-export.
+    const FLAG_DEBUGGABLE: i32 = 0x2;
+
     /// Read `ApplicationInfo.flags & FLAG_DEBUGGABLE` for this process.
     ///
     /// Returns `None` when the value could not be determined for ANY reason, so the
-    /// caller can fail closed (see `is_debuggable`).
-    pub fn read_flag_debuggable() -> Option<bool> {
-        // The JNI body is intentionally a stub with an explicit `None`.
-        //
-        // ⚠ Writing the real call here without being able to compile it would put
-        // UNVERIFIED code on the security-critical path, and this module's whole
-        // claim is that the predicate is trustworthy. A stub that fails CLOSED keeps
-        // that claim honest until CI can build it: the probe then simply never
-        // serves, which is the safe direction and is loudly logged by the caller.
-        None
+    /// caller fails closed (see `imp::is_debuggable`). Every early return below is a
+    /// deliberate "could not tell", never a "probably fine".
+    pub fn read_flag_debuggable(env: &mut jni::JNIEnv, activity: &JObject) -> Option<bool> {
+        // `Activity.getApplicationInfo()` — an instance method, no args.
+        let info = env
+            .call_method(
+                activity,
+                "getApplicationInfo",
+                "()Landroid/content/pm/ApplicationInfo;",
+                &[],
+            )
+            .ok()?
+            .l() // the returned Object -> JObject
+            .ok()?;
+
+        // `ApplicationInfo.flags` — a public `int` FIELD, not a getter. Reading a field
+        // is the only way; there is no `getFlags()` on this class.
+        let flags = env.get_field(&info, "flags", "I").ok()?.i().ok()?;
+
+        Some(flags & FLAG_DEBUGGABLE != 0)
+    }
+
+    /// Run [`read_flag_debuggable`] through tauri's webview JNI bridge.
+    ///
+    /// ⚠ Returns `None` when there is no window, no JNI environment, or the call did
+    /// not complete in time. The `exec` API is **fire-and-forget** (it posts a message
+    /// to the webview thread), so the value must come back through a channel — and a
+    /// channel that is never filled must not block the caller forever. That is what the
+    /// timeout is for: "could not tell" has to be a bounded answer, not a hang on the
+    /// startup path.
+    pub fn probe_via_webview(window: &tauri::WebviewWindow) -> Option<bool> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (sender, receiver) = mpsc::channel();
+        // ⚠ TWO `move` closures are needed, and the inner one is easy to miss: the
+        // outer closure already captures `sender`, but `exec` requires a `'static`
+        // closure of its own, so the inner one must take ownership of it rather than
+        // borrow it from the outer frame. The compiler's "closure may outlive the
+        // current function, but it borrows `sender`" is the exact symptom.
+        let dispatched = window
+            .with_webview(move |platform| {
+                platform.jni_handle().exec(move |env, activity, _webview| {
+                    // Send whatever we learned. A send error means the receiver is
+                    // already gone (the timeout elapsed), which is not a reason to
+                    // panic on the webview thread.
+                    let _ = sender.send(read_flag_debuggable(env, activity));
+                });
+            })
+            .is_ok();
+
+        if !dispatched {
+            return None;
+        }
+        // Bounded, because this runs during startup: see the doc comment.
+        receiver.recv_timeout(Duration::from_secs(5)).ok().flatten()
+    }
+
+    /// Compile-time proof that the JNI argument shapes above match wry's callback.
+    ///
+    /// ⚠ This exists because the call `exec(|env, activity, _| …)` is checked only when
+    /// the Android target is compiled. Pinning the signature here means a wry upgrade
+    /// that changes it fails the build instead of failing on a device.
+    ///
+    /// ⚠ `tauri::wry` rather than `tauri_runtime_wry` directly: tauri re-exports wry
+    /// (`tauri-2.11.5/src/lib.rs:184`, `pub use tauri_runtime_wry::{tao, wry};`), so
+    /// naming it through tauri avoids adding a dependency on an internal crate whose
+    /// version is not ours to choose.
+    #[allow(dead_code)]
+    fn _exec_signature_matches(handle: tauri::wry::JniHandle) {
+        handle.exec(
+            |env: &mut jni::JNIEnv, activity: &JObject, _webview: &JObject| {
+                let _ = read_flag_debuggable(env, activity);
+                let _ = JValue::Int(0);
+            },
+        );
     }
 }
 
@@ -925,5 +1082,105 @@ mod socket_tests {
         let admitted = accept_loop(&listener, "irrelevant", || true, |_| Ok(()))
             .expect("an immediate stop is not an error");
         assert_eq!(admitted, 0, "nothing was served, so nothing was admitted");
+    }
+
+    /// A well-formed token for entry-point tests.
+    fn good_token() -> String {
+        "ab".repeat(TOKEN_BYTES)
+    }
+
+    #[test]
+    fn the_entry_point_declines_when_not_debuggable() {
+        // ⚠ THE MOST IMPORTANT ASSERTION IN THIS FILE, at the entry point rather than
+        // in the pure helper: a non-debuggable process must not even BIND. Asserting
+        // only `should_serve(false) == false` would leave open the possibility that
+        // `run` ignores it — and `run` is what a caller actually uses.
+        let pid = std::process::id();
+        let outcome = run(
+            false, // not debuggable
+            pid.wrapping_add(8_000_000),
+            &good_token(),
+            &[],
+            "com.vrcxk.app",
+            || true,
+            |_| Ok(()),
+        )
+        .expect("declining is not an error");
+
+        assert!(
+            outcome.is_none(),
+            "⚠ a non-debuggable process must return Ok(None) WITHOUT binding a socket; \
+             got {outcome:?}. If this ever returns Some, the probe is a backdoor on \
+             every user device"
+        );
+        // And prove nothing was bound: connecting to the name must fail.
+        let name = socket_name(pid.wrapping_add(8_000_000));
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        assert!(
+            std::os::unix::net::UnixStream::connect_addr(&addr).is_err(),
+            "⚠ nothing must be listening on @{name} after a decline"
+        );
+    }
+
+    #[test]
+    fn the_entry_point_refuses_a_malformed_token_instead_of_serving_it() {
+        // The "no token configured" misconfiguration. An empty or short expected token
+        // would make `token_matches` accept things it must not, and the failure mode is
+        // INVISIBLE — the harness would simply work, for anyone. So `run` must refuse.
+        let pid = std::process::id();
+        for bad in ["", "short", &"z".repeat(TOKEN_BYTES * 2)] {
+            let err = run(
+                true, // debuggable: so the ONLY thing that can stop it is the token check
+                pid.wrapping_add(9_000_000),
+                bad,
+                &[],
+                "com.vrcxk.app",
+                || true,
+                |_| Ok(()),
+            )
+            .expect_err("a malformed token must be refused, not served");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "the refusal must be distinguishable from a bind/publish failure"
+            );
+        }
+    }
+
+    #[test]
+    fn the_entry_point_serves_when_debuggable_and_reports_the_socket_name() {
+        // The positive path, end to end through `run`: it must bind, publish the token,
+        // and hand back the name the harness needs. Returns immediately because
+        // `should_stop` is true, so nothing needs to connect.
+        let dir = std::env::temp_dir().join(format!("vrcxk-probe-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let candidates = vec![dir.to_string_lossy().into_owned()];
+        let pid = std::process::id();
+        let token = good_token();
+
+        let outcome = run(
+            true,
+            pid.wrapping_add(10_000_000),
+            &token,
+            &candidates,
+            "com.vrcxk.app",
+            || true,
+            |_| Ok(()),
+        )
+        .expect("a debuggable process with a good token must serve");
+
+        let (name, admitted) = outcome.expect("must not decline when debuggable");
+        assert_eq!(name, socket_name(pid.wrapping_add(10_000_000)));
+        assert_eq!(admitted, 0, "no client connected, so nothing was admitted");
+
+        // The token must be on disk and readable — a probe that binds but cannot publish
+        // its token looks exactly like a harness that cannot connect.
+        let path = std::path::Path::new(&candidates[0]).join(format!("{}.token", SOCKET_PREFIX));
+        let published = std::fs::read_to_string(&path).expect("the token must be published");
+        assert_eq!(
+            published, token,
+            "the published token must be exactly the one the handshake compares against"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

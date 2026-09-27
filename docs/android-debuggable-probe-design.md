@@ -6,9 +6,12 @@
 > | 部分 | 状态 |
 > |---|---|
 > | `policy`（纯判据：是否服务 / token 比较 / socket 命名） | ✅ 已实现，**全平台可测**（Windows 跑 4 条） |
-> | `imp` 的 socket 半边（绑定 / 握手 / accept loop / token 发布） | ✅ 已实现，**在真 Linux 上跑过 16 条**（`cfg(any(linux, android))`） |
-> | `imp::is_debuggable` 的 Android 分支（读 `FLAG_DEBUGGABLE`） | ⚠ **stub，显式返回 `None`（失败关闭）** —— 见 §8 |
-> | 接进 `.setup()` / 发布 token 到 app 目录 / 探针侧 connect transport | ❌ **未做** |
+> | `imp` 的 socket 半边（绑定 / 握手 / accept loop / token 发布 / **`run` 入口**） | ✅ 已实现，**在真 Linux 上跑过 19 条**（`cfg(any(linux, android))`） |
+> | `imp::run` —— **唯一入口**，把「判据 + 绑定 + 发布 token + 服务」收在一处 | ✅ 已实现。⚠ 判据与启动**放在一起**，调用方无法绕过检查单独启动监听 |
+> | `imp::is_debuggable` 的 Android 分支（读 `FLAG_DEBUGGABLE`） | ✅ **已实现且 `cargo check --target aarch64-linux-android` 编译通过**（含一个钉住 wry 回调签名的编译期断言）。⚠ **仍未在设备上运行过** |
+> | `jni = "0.21"` 依赖 | ✅ 已加（`[target.'cfg(target_os = "android")'.dependencies]`）。⚠ 它本就在树里（`tao → jni 0.21.1`），但**传递依赖不可命名**；`Cargo.lock` 的改动是**纯新增一行**，无版本变动 |
+> | 接进 `.setup()` | ❌ **未做**（见 §8） |
+> | 探针侧「连接而非 spawn」的 transport | ❌ **未做** |
 >
 > **它解决什么**：`docs/hands-capability-proposal.md` §9 缺口 6 —— 手的文件能力
 > （`hands.read/write/stat/watch`）在 Android 上**只经过源码阅读**，`cargo check`
@@ -177,15 +180,17 @@ owner 的要求：**生成一个稍大的随机文件放进去，让应用去读
 
 | 项 | 状态 |
 |---|---|
-| `getApplicationInfo().flags & 0x2` 的实际 JNI 调用串 | ⚠ **未编译验证**（本文只核实到 `JniHandle::exec` 提供 `&mut JNIEnv` + activity `JObject`；tauri 自己的 doctest 用的正是这个 API，但**读 flag 那段是我写的，未跑**） |
-| 抽象 socket 名 | 未定（建议带包名与 pid 以避免多实例冲突） |
+| `getApplicationInfo().flags & 0x2` 的实际 JNI 调用串 | ⚠ **已编译**（`cargo check --target aarch64-linux-android` 通过，且有一个钉住 wry 回调签名的编译期断言），**但从未在设备上运行过**。「类型正确」是真实证据；「这个 bit 的含义符合预期」**不是** —— 后者只能靠真机 |
+| `with_webview` 的 `PlatformWebview` 在 `.setup()` 时是否已可拿到 | ✅ **已从源码核实**：tauri `app.rs:2524` 先按 config 建窗口，`:2530` 才调用户的 `.setup()` ⇒ `.setup()` 里窗口已存在 |
+| 抽象 socket 名 | ✅ 已定：`vrcxk-debug-probe:<pid>`（pid 在名字里，见 §3.1） |
 | 其他应用能否连上抽象 socket | ⚠ **未实测**（生产设备无法装第二个测试应用；故第 5 节的 token 是**不依赖该答案**的防御） |
 | `-d` 产出的 APK 实际文件名 | ⚠ 未实测（需 NDK）；CI 的 `Locate APK` 因此**不猜文件名**，只要求"恰好一个 universal APK" |
 | `AndroidManifest` 是否需要额外权限 | 未查（抽象 socket 的 bind 通常不需要权限；须编译后确认） |
 | iOS | 本设计**只针对 Android**（判据与载体都是 Android 专有） |
-| 接进 `.setup()` | ❌ 未做。⚠ 注意约束：判据要读 webview 的 JNI handle，**只能在窗口建好之后**求值 |
-| token 发布到真实 app 外部目录 | ❌ 未做（`publish_token` 接受候选目录列表，但没人传真实路径） |
+| 接进 `.setup()` | ❌ 未做。⚠ 约束已核实：判据要读 webview 的 JNI handle ⇒ **只能在窗口建好之后**求值，而 `.setup()` 满足该条件 |
+| token 发布到真实 app 外部目录 | ❌ 未做（`run` 接受候选目录列表，但还没人传真实路径） |
 | 探针侧「连接而非 spawn」的 transport | ❌ 未做。`docs/probes/hands-e2e/run.mjs` 现在 `spawn(BIN)`；要加一个 connect 变体 |
+| 服务内容接真 `hands.*` handler | ❌ 未做。`run` 的 `serve` 闭包由调用方提供，**还没人接 `hands::register_hands_handlers` / `hands_hello::send_hello`** |
 
 ---
 
