@@ -191,6 +191,32 @@ carries an empty `[workspace]` table so `cargo build` cannot touch the root
 ⚠ `02-…` and `03-…` import `kkrpc/streaming`, which resolves from the **root**
 `package.json` (see the bare-specifier rule above).
 
+## `debug-probe/` (subdirectory, includes a Rust crate)
+
+Runs the debug-only self-probe's `serve_hands` over a **real abstract unix socket**, on
+**real Linux**, against the real production modules. Design record:
+[`../android-debuggable-probe-design.md`](../android-debuggable-probe-design.md).
+
+⚠ **Why it needs its own crate**: `serve_hands` mounts `crate::hands`,
+`crate::kkrpc_peer` and `crate::hands_hello`, and the main crate **cannot cross-compile
+to linux-musl** (the `libdbus-sys` build script needs system libraries). So a test
+inside the crate can only run on Windows — which has **no abstract sockets**. This
+crate pulls the production sources in verbatim with `#[path]` so the socket path can be
+executed on the platform that actually has it.
+
+```bash
+cd docs/probes/debug-probe
+cargo build --target x86_64-unknown-linux-musl
+# static musl binary; run it under any Linux (WSL is fine)
+./target/x86_64-unknown-linux-musl/debug/debug-probe-linux
+```
+
+The assertion that matters: a real `hands.stat` answers `"size":11` for a file the
+client just created — proving the production handler ran against the real filesystem.
+
+⚠ **It says NOTHING about Android** — not permissions, not layout, not
+`FLAG_DEBUGGABLE`. Do not read a green here as "Android works".
+
 ## `hands-e2e/` (subdirectory, includes a Rust crate)
 
 The **end-to-end** counterpart to `hand-io/`: the same real-child-on-real-pipes

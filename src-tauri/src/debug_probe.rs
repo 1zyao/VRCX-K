@@ -61,6 +61,14 @@ pub mod policy {
     /// `TOKEN_BYTES * 2` so a legitimate token plus `\r\n` always fits.
     pub const MAX_TOKEN_LINE: usize = 512;
 
+    /// Longest a single client session may last before the probe drops it.
+    ///
+    /// ⚠ The accept loop serves ONE client at a time, so a client that connects and then
+    /// goes silent would otherwise block every future attempt for the life of the
+    /// process. A debugging session is interactive and short; half an hour is far above
+    /// any legitimate use and far below "until the app is killed".
+    pub const MAX_SESSION: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
     /// The name an instance with this pid should bind.
     ///
     /// ⚠ The pid is part of the name ON PURPOSE. The abstract namespace is global
@@ -132,7 +140,7 @@ pub mod imp {
     //! [`is_debuggable`] genuinely differs (Android reads a JNI flag; Linux reports
     //! `debug_assertions`, which is the closest honest analogue — see its docs).
 
-    use super::policy::{socket_name, MAX_TOKEN_LINE, TOKEN_BYTES};
+    use super::policy::{socket_name, MAX_SESSION, MAX_TOKEN_LINE, TOKEN_BYTES};
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -463,6 +471,57 @@ pub mod imp {
         let mut file = std::fs::File::create(path)?;
         file.write_all(bytes)?;
         file.sync_all()
+    }
+
+    /// Serve one admitted client by mounting the REAL `hands.*` handlers on it.
+    ///
+    /// This is the point of the whole probe: the client speaks kkrpc to the same
+    /// `Peer`, the same `hands::register_hands_handlers` and the same
+    /// `hands_hello::send_hello` that production uses — only the transport differs
+    /// (`UnixStream` instead of stdin/stdout). Nothing here re-implements anything, so
+    /// the bytes a harness measures are the bytes the shipped code produces.
+    ///
+    /// # The three orderings, copied deliberately from `examples/hands-e2e.rs`
+    ///
+    /// 1. **Register handlers BEFORE starting the reader.** A frame that arrives before
+    ///    its handler exists is dispatched as an unknown method and lost.
+    /// 2. **`send_hello` AFTER the reader starts**, matching `host.rs`, so the driver
+    ///    observes production's ordering rather than a convenient one.
+    /// 3. **Block until the link closes**, so the accept loop does not admit a second
+    ///    client while this one is live. The signal is `Peer::link_failure()`, which the
+    ///    reader sets to `Closed` on EOF. ⚠ The poll is bounded by [`MAX_SESSION`] so a
+    ///    client that connects and then goes silent cannot hold the single-threaded
+    ///    accept loop hostage.
+    ///
+    /// Returns how long the client stayed connected, which the caller logs: a session
+    /// that lasted ~0s ("connected and vanished") should be visible rather than
+    /// indistinguishable from a healthy one.
+    pub fn serve_hands(stream: UnixStream) -> std::io::Result<u64> {
+        use std::time::{Duration, Instant};
+
+        // Two owned handles from one stream: `try_clone` is the only way, and it is what
+        // lets `Peer::new` and `Peer::start_reader` each take ownership.
+        let writer = stream.try_clone()?;
+        let reader = stream;
+
+        let peer = crate::kkrpc_peer::Peer::new(writer);
+        crate::hands::register_hands_handlers(&peer); // (1)
+        peer.start_reader(reader);
+        crate::hands_hello::send_hello(&peer); // (2)
+
+        let started = Instant::now();
+        loop {
+            if peer.link_failure().is_some() {
+                // EOF or a read error: this client is done. `link_failure` is per-Peer
+                // and each client gets a fresh Peer, so there is no stale state to clear.
+                return Ok(started.elapsed().as_secs());
+            }
+            if started.elapsed() > MAX_SESSION {
+                eprintln!("[debug-probe] session exceeded {MAX_SESSION:?}; dropping the client");
+                return Ok(started.elapsed().as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
