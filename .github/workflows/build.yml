@@ -494,8 +494,8 @@ jobs:
       # 这一步回答"壳+脸能编译打包"之外的第二个问题：**装到设备上能不能跑起来**。
       # 此前的 mobile job 只 find 到 APK 就结束，从不安装、不启动、不看日志。
       #
-      # 历史：c9d948fb 曾写下等价步骤（mobile-compat.yml），但在 8f34872d 被
-      # **暂缓**（提交信息原文 "drop the emulator smoke for now (slowest/fragile
+      # 历史：等价步骤曾写在 `mobile-compat.yml` 里，后来被**暂缓**（提交信息原文
+      # "drop the emulator smoke for now (slowest/fragile
       # step); current goal is proving shell+face compile to an APK"）。关键事实：
       # 那 4 次 run 里该步骤**全部是 skipped**（卡在前面的 Java/SDK/构建步骤），
       # 即那段脚本【从未真正执行过】。所以本步不是"把删掉的代码加回来"，而是

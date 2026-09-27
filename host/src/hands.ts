@@ -256,7 +256,7 @@ const lookupSlot = createSecretSlot<(entryId: string) => VRCXKPluginManifest | u
  *     Object.keys(ctx.hands.api) -> ["stat","read"]
  *
  * Reaching it skips `record()`, i.e. the `[cap]` audit line and the `#24` overreach
- * warning — the same class of hole as the `private bridge` field fixed in `76d48743`.
+ * warning — the same class of hole as the `private bridge` field on ShellStdioBridge.
  * A module-level function is not on the prototype at all, so there is nothing to reach.
  */
 function rawApi(self: HandsService): HandsSysAPI {
@@ -363,7 +363,7 @@ export class HandsService extends Service {
    *     ctx.hands.api              -> REACHABLE
    *     Object.keys(ctx.hands.api) -> ["stat","read"]
    *
-   * That is the SAME class of hole as the `private bridge` field fixed in `76d48743`:
+   * That is the SAME class of hole as the `private bridge` field on ShellStdioBridge:
    * reaching the raw API skips `record()` (no `[cap]` audit line, no `#24` warning) and the
    * caller-fiber binding the stream guards rely on. See `rawApi()` below the class.
    */

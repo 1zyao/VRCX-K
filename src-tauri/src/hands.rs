@@ -2774,8 +2774,8 @@ mod tests {
         // to fire only on an EXPLICIT `truncate` leaves the whole suite green (69/69
         // in `hands::`), and `{offset: 5}` goes back to O_TRUNC-then-seek — a 20-byte
         // file written with 3 bytes becomes `size=8`, `hex=0000000000424242`, head
-        // zeroed. That is exactly the corruption `e95ba827` fixed, silently
-        // returning. Both halves have to be pinned, and this is the missing one.
+        // zeroed. That is exactly the corruption the `truncate` / `offset` split fixed,
+        // silently returning. Both halves have to be pinned, and this is the missing one.
         let intent = write_intent(&json!({ "offset": 5 })).expect("in place");
         assert!(
             !intent.truncate,
@@ -2926,8 +2926,8 @@ mod tests {
         // wrong" class of regression stays green: delete the `truncate(true)` line that
         // `FileWriter::open` passes to `OpenOptions` and those tests all still pass —
         // while the disk keeps "new content + old tail", which is exactly the
-        // `{"alpha":9}"beta":2}` corruption `e95ba827` fixed: the JSON is already broken,
-        // the caller receives `success`, and **no layer reports anything**.
+        // `{"alpha":9}"beta":2}` corruption the `truncate` / `offset` split fixed: the JSON is
+        // already broken, the caller receives `success`, and **no layer reports anything**.
         //
         // So this asserts what the file finally LOOKS LIKE, not what the intent was: seed
         // a file longer than the new content to create the "short write over a long file"
