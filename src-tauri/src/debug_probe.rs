@@ -221,6 +221,45 @@ pub mod imp {
         }
     }
 
+    /// Where the token may be published, best first.
+    ///
+    /// ⚠ **The order is the whole point, and getting it wrong is silent.** The first
+    /// entry is the app's EXTERNAL files dir (`/sdcard/Android/data/<pkg>/files`), the
+    /// only place that is simultaneously adb-readable, app-writable without a runtime
+    /// permission, and closed to other apps. The fallbacks are app-private dirs, which
+    /// adb CANNOT read — they are kept so the probe still works when external storage is
+    /// unmounted, and the caller LOGS which one was used so a harness failure is
+    /// diagnosable instead of mysterious.
+    ///
+    /// ⚠ Tauri's own `app_data_dir()` is deliberately NOT first: it resolves under
+    /// `/data/data/<pkg>/`, and `adb shell ls /data/data/` returns `Permission denied`
+    /// (measured on a device). A token there is unreachable by the very harness it is
+    /// meant for.
+    #[cfg(target_os = "android")]
+    pub fn token_candidates(app: &tauri::AppHandle) -> Vec<String> {
+        use tauri::Manager as _;
+        let mut out = Vec::new();
+        if let Some(window) = app.get_webview_window("main") {
+            if let Some(dir) = super::jni::external_dir_via_webview(&window) {
+                out.push(dir);
+            }
+        }
+        // Fallbacks. Reached only when external storage is unavailable; the log line in
+        // `start` says which one won, so this never silently degrades.
+        let paths = app.path();
+        for candidate in [
+            paths.app_data_dir().ok(),
+            paths.app_config_dir().ok(),
+            paths.app_cache_dir().ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(candidate.to_string_lossy().into_owned());
+        }
+        out
+    }
+
     /// Bind the abstract socket for `pid`.
     ///
     /// Returns the listener plus the name it bound, so a caller can LOG the exact
@@ -465,6 +504,79 @@ pub mod imp {
         Ok(Some((name, admitted)))
     }
 
+    /// Start the probe on a background thread, or decline. **This is what a caller uses.**
+    ///
+    /// # Why a thread
+    ///
+    /// `run` blocks for the life of the app (it is an accept loop). Calling it from
+    /// `.setup()` would freeze startup, so the whole thing goes to a thread and
+    /// `.setup()` returns immediately.
+    ///
+    /// # Why the debuggability check happens on the CALLING thread
+    ///
+    /// ⚠ The check needs a webview JNI handle, and tauri's `with_webview` posts work to
+    /// the webview's own thread. Doing the check HERE — before spawning — keeps the
+    /// security decision on the thread that owns the window, and means a decline costs
+    /// nothing (no thread is even created).
+    ///
+    /// # Why it is not a hard error at the call site
+    ///
+    /// Returns `Ok(None)` for "correctly declined" and logs everything else. A startup
+    /// path that aborts because a DEBUG helper failed would be worse than the helper
+    /// being absent — and this whole feature is inert on every user device anyway.
+    #[cfg(target_os = "android")]
+    pub fn start_in_background(app: &tauri::AppHandle) -> std::io::Result<()> {
+        if !is_debuggable(app) {
+            // Not an error; see the doc comment. `is_debuggable` already logged why.
+            return Ok(());
+        }
+
+        let token = mint_token()?;
+        if !super::policy::is_well_formed_token(&token) {
+            // A generator that produced something unusable must not be papered over.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "minted a malformed token",
+            ));
+        }
+        let candidates = token_candidates(app);
+        if candidates.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no directory available to publish the token",
+            ));
+        }
+        let pkg = app.config().identifier.clone();
+        let pid = std::process::id();
+
+        std::thread::spawn(move || {
+            match run(
+                true, // already checked on the calling thread
+                pid,
+                &token,
+                &candidates,
+                &pkg,
+                || false, // no stop condition: the probe lives as long as the app
+                |stream| {
+                    // ⚠ `serve_hands` returns the session LENGTH, which `run` does not
+                    // use. Log it here rather than widening `run`'s bound: a session of
+                    // ~0s ("connected and vanished") is a real symptom worth seeing, and
+                    // logging it at the call site keeps `run` reusable with any `serve`.
+                    let secs = serve_hands(stream)?;
+                    eprintln!("[debug-probe] client session ended after {secs}s");
+                    Ok(())
+                },
+            ) {
+                Ok(Some((name, admitted))) => {
+                    eprintln!("[debug-probe] session ended after {admitted} client(s) on @{name}");
+                }
+                Ok(None) => {}
+                Err(err) => eprintln!("[debug-probe] failed to start: {err}"),
+            }
+        });
+        Ok(())
+    }
+
     /// Flush helper: the token file is small, but an unflushed write would publish
     /// an empty file that then fails `handshake` for reasons no one can see.
     pub fn write_all_and_sync(path: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -584,6 +696,56 @@ pub mod jni {
         Some(flags & FLAG_DEBUGGABLE != 0)
     }
 
+    /// The app's OWN external files directory — where the token must be published.
+    ///
+    /// # ⚠ Why this needs JNI at all, and why `app_data_dir()` is the WRONG answer
+    ///
+    /// Tauri's Android path resolver offers `app_data_dir` / `app_config_dir` /
+    /// `app_cache_dir`, and **all of them resolve under `/data/data/<pkg>/`** — the
+    /// app's PRIVATE sandbox. Measured on a real device: `adb shell ls /data/data/`
+    /// returns **`Permission denied`**. A token written there could never be read by
+    /// the harness, so the probe would bind a socket nobody can authenticate to.
+    ///
+    /// `Context.getExternalFilesDir(null)` returns `/sdcard/Android/data/<pkg>/files`,
+    /// the one location satisfying all three requirements at once: **adb can read it**,
+    /// the **app writes it with no runtime permission**, and **Android 11+ scoped
+    /// storage keeps other apps out**. (That combination was measured directly: a
+    /// 64 KiB random file was written there by `adb shell` and read back by `adb pull`
+    /// with a matching md5.)
+    ///
+    /// Returns `None` when the directory is unavailable (external storage not mounted),
+    /// so the caller falls through to its remaining candidates rather than publishing a
+    /// token somewhere it cannot be read.
+    pub fn external_files_dir(env: &mut jni::JNIEnv, activity: &JObject) -> Option<String> {
+        // `Context.getExternalFilesDir(String type)` -> `File`, or null if unavailable.
+        // A null `String` asks for the `files/` root.
+        let null_type = JObject::null();
+        let file = env
+            .call_method(
+                activity,
+                "getExternalFilesDir",
+                "(Ljava/lang/String;)Ljava/io/File;",
+                &[JValue::Object(&null_type)],
+            )
+            .ok()?
+            .l()
+            .ok()?;
+
+        // ⚠ `null` is a legitimate answer from this API (external storage unmounted),
+        // and calling `getAbsolutePath` on it would throw.
+        if file.is_null() {
+            return None;
+        }
+
+        let path = env
+            .call_method(&file, "getAbsolutePath", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        let java_str = jni::objects::JString::from(path);
+        env.get_string(&java_str).ok().map(|s| s.into())
+    }
+
     /// Run [`read_flag_debuggable`] through tauri's webview JNI bridge.
     ///
     /// ⚠ Returns `None` when there is no window, no JNI environment, or the call did
@@ -635,9 +797,35 @@ pub mod jni {
         handle.exec(
             |env: &mut jni::JNIEnv, activity: &JObject, _webview: &JObject| {
                 let _ = read_flag_debuggable(env, activity);
+                let _ = external_files_dir(env, activity);
                 let _ = JValue::Int(0);
             },
         );
+    }
+
+    /// Read the external files dir through the same webview bridge as the flag.
+    ///
+    /// Same fire-and-forget caveat and the same bounded wait as
+    /// [`probe_via_webview`]; returns the directory, or `None` if it could not be
+    /// determined. ⚠ Unlike the flag, a failure here is NOT a security decision — the
+    /// caller simply has no adb-readable place to put the token, and says so.
+    pub fn external_dir_via_webview(window: &tauri::WebviewWindow) -> Option<String> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (sender, receiver) = mpsc::channel();
+        let dispatched = window
+            .with_webview(move |platform| {
+                platform.jni_handle().exec(move |env, activity, _webview| {
+                    let _ = sender.send(external_files_dir(env, activity));
+                });
+            })
+            .is_ok();
+
+        if !dispatched {
+            return None;
+        }
+        receiver.recv_timeout(Duration::from_secs(5)).ok().flatten()
     }
 }
 

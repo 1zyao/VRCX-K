@@ -359,6 +359,25 @@ pub fn run() {
             // on mobile, so there is nothing to set up there.
             #[cfg(desktop)]
             tray::setup(app.handle())?;
+
+            // Android only: start the debug self-probe IF this process is debuggable.
+            //
+            // ⚠ IT MUST BE HERE, NOT IN `main()`: the debuggability check reads our own
+            // `ApplicationInfo` over a WEBVIEW's JNI handle, and tauri builds the config
+            // windows immediately before running this closure
+            // (`tauri-2.11.5/src/app.rs:2524` then `:2530`). So this is the earliest
+            // point where a handle exists — and calling earlier would just report "no
+            // window" and stay closed.
+            //
+            // ⚠ A failure here is logged, not propagated: this is a debug-only helper,
+            // and making startup depend on it would mean a broken debug aid could stop
+            // the app from launching for a user who never asked for it.
+            #[cfg(target_os = "android")]
+            {
+                if let Err(err) = debug_probe::imp::start_in_background(app.handle()) {
+                    eprintln!("[shell] debug probe not started: {err}");
+                }
+            }
             // Deep links: consume the URLs the OS hands us. Registered here
             // rather than in its own `.setup()` because `Builder::setup` is a
             // single slot — a second call would silently replace this one and
