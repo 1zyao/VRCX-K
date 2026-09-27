@@ -1045,6 +1045,25 @@ impl FileWriter {
     }
 }
 
+/// The sink for `hands.write`.
+///
+/// ⚠ KNOWN BOUNDARY (measured, not suspected — raised in the #40 review): **this write runs
+/// on the reader thread.** `kkrpc_peer.rs:1440` states it outright ("Dispatch is
+/// single-threaded on the reader thread"), and the sink is invoked from that dispatch, so
+/// every `write_all` below is synchronous on the thread that also parses inbound frames.
+///
+/// The asymmetry is deliberate on the producer side — `Peer::spawn_producer` moved reads to
+/// their own thread precisely because running a whole credit batch inside the reader stalled
+/// every other frame (`hol-credit.mjs` isolated that cause). **The sink side never got the
+/// same treatment**, so a slow disk (or write-back pressure, or a FUSE/network mount) blocks
+/// all inbound frames for the duration of one chunk.
+///
+/// ⚠ It is NOT quantified: on a local disk the page cache absorbs the write, so the effect
+/// is bounded and invisible in the probes run so far. `kkrpc_peer.rs:770` already recognises
+/// the same hazard on the CLOSE path and releases the table lock to avoid it — the dispatch
+/// path has no equivalent. Fixing it needs a sink queue plus a dedicated thread (the shape
+/// `spawn_producer` already establishes); until then this comment is the honest statement of
+/// the limit rather than a claim that it is fine.
 struct DeferredWriter {
     writer: FileWriter,
     reply: DeferredReply,
