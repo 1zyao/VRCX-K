@@ -35,6 +35,7 @@
 import { type Context, Service } from "cordis"
 import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
 import { callerName, overreachWarning } from "./overreach"
+import { createSecretSlot } from "./service-secret"
 import type { ShellStdioBridge } from "./stdio"
 
 declare module "cordis" {
@@ -63,10 +64,16 @@ function describe(error: unknown): string {
  * Whether the app should launch with the system is a user decision, so this
  * service never turns it on by itself; the UI owns the toggle.
  */
+/**
+ * ⚠ Bridge and manifest lookup live in {@link createSecretSlot} slots, not in fields.
+ * See `service-secret.ts` for the measured alternatives — the short version is that a
+ * `private` field is compile-time only, so a plugin read the whole `ShellStdioBridge`
+ * (skipping `record()`, the `#24` warning, and the caller-fiber binding).
+ */
+const bridgeSlot = createSecretSlot<ShellStdioBridge>()
+const lookupSlot = createSecretSlot<(entryId: string) => VRCXKPluginManifest | undefined>()
+
 export class AutostartService extends Service {
-  private bridge?: ShellStdioBridge
-  /** Manifest lookup for the `#24` check; see the file header. */
-  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
   private readonly auditLine: (line: string) => void
 
   constructor(ctx: Context, options: { audit?: (line: string) => void } = {}) {
@@ -76,7 +83,7 @@ export class AutostartService extends Service {
 
   /** Give the service the manifest registry so `#24` can compare declare vs actual. */
   useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
-    this.manifestLookup = lookup
+    lookupSlot.set(this, lookup)
   }
 
   /**
@@ -90,16 +97,16 @@ export class AutostartService extends Service {
   private record(self: unknown, method: string): void {
     const who = callerName(self) ?? "<unknown>"
     this.auditLine(`[cap] ${who} -> autostart.${method}`)
-    const warning = overreachWarning(self, `autostart.${method}`, this.manifestLookup)
+    const warning = overreachWarning(self, `autostart.${method}`, lookupSlot.get(this))
     if (warning) this.auditLine(warning)
   }
 
   attachShell(bridge: ShellStdioBridge): void {
-    this.bridge = bridge
+    bridgeSlot.set(this, bridge)
   }
 
   detachShell(): void {
-    this.bridge = undefined
+    bridgeSlot.clear(this)
   }
 
   /**
@@ -118,7 +125,7 @@ export class AutostartService extends Service {
    * which maps the indeterminate case to `undefined` rather than lying.
    */
   async readEnabled(): Promise<boolean | undefined> {
-    const api = this.bridge?.shell.autostart
+    const api = bridgeSlot.get(this)?.shell.autostart
     if (!api) return false
     try {
       return await api.isEnabled()
@@ -133,11 +140,11 @@ export class AutostartService extends Service {
   }
   /** Whether this platform has the capability at all. */
   get supported(): boolean {
-    return this.bridge?.shell.autostart !== undefined
+    return bridgeSlot.get(this)?.shell.autostart !== undefined
   }
 
   get attached(): boolean {
-    return this.bridge !== undefined
+    return bridgeSlot.has(this)
   }
 
   /** Turn autostart on or off. A verdict, not a bool. */
@@ -146,8 +153,9 @@ export class AutostartService extends Service {
     // Distinguishing "no shell" from "mobile" matters: the first is a waiting
     // state that will resolve, the second never will, and a UI offering a toggle
     // needs to know which it is looking at.
-    if (!this.bridge) return { status: "no-shell" }
-    const api = this.bridge.shell.autostart
+    const bridge = bridgeSlot.get(this)
+    if (!bridge) return { status: "no-shell" }
+    const api = bridge.shell.autostart
     if (!api) return { status: "unsupported" }
     try {
       const verdict = await api.setEnabled(enabled)

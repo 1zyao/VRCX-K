@@ -20,6 +20,7 @@
 import { type Context, Service } from "cordis"
 import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
 import { callerName, overreachWarning } from "./overreach"
+import { createSecretSlot } from "./service-secret"
 import type { ShellShortcutBridge, ShortcutPressEvent, ShortcutRegistration } from "./stdio"
 
 declare module "cordis" {
@@ -68,35 +69,30 @@ export function normalizePress(value: unknown): ShortcutPressEvent | undefined {
   return { accelerator: candidate.accelerator, id: candidate.id }
 }
 
+/**
+ * ⚠ Bridge and manifest lookup live in {@link createSecretSlot} slots, not in fields.
+ * See `service-secret.ts` for the measured alternatives. This service guarded a **global
+ * hotkey**, and the same `private`-field reach exposed the whole bridge.
+ */
+const bridgeSlot = createSecretSlot<ShellShortcutBridge>()
+const lookupSlot = createSecretSlot<(entryId: string) => VRCXKPluginManifest | undefined>()
+
 export class ShortcutService extends Service {
-  private bridge?: ShellShortcutBridge
   private detach?: () => void
   private closed = false
   private readonly logLine: (line: string) => void
-  /**
-   * Manifest lookup for the `#24` declare-vs-actual check.
-   *
-   * ⚠ This service used to have NO caller attribution and NO overreach check on
-   * its normal path — `logLine` calls below are DIAGNOSTICS (invalid payloads,
-   * handler errors) and never name the caller. So a plugin could register a
-   * global hotkey without declaring `shortcut`, and nothing recorded it, while
-   * the raw `ctx.shell.shortcut.*` mirror DID both. That is the same inversion
-   * `overreach.ts` documents for `ctx.hands`; see the call to
-   * `overreachWarning` in `record`.
-   */
-  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
   /** Bindings keyed by the shell's canonical accelerator. */
   private readonly bindings = new Map<string, ShortcutHandler>()
 
   constructor(ctx: Context, options: ShortcutServiceOptions = {}) {
     super(ctx, "shortcut")
-    this.bridge = options.bridge
+    if (options.bridge) this.attachShell(options.bridge)
     this.logLine = options.log ?? (() => {})
   }
 
   /** Give the service the manifest registry so `#24` can compare declare vs actual. */
   useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
-    this.manifestLookup = lookup
+    lookupSlot.set(this, lookup)
   }
 
   /**
@@ -109,7 +105,7 @@ export class ShortcutService extends Service {
   private record(self: unknown, method: string, detail: string): void {
     const who = callerName(self) ?? "<unknown>"
     this.logLine(`[cap] ${who} -> shortcut.${method}${detail ? ` ${detail}` : ""}`)
-    const warning = overreachWarning(self, `shortcut.${method}`, this.manifestLookup)
+    const warning = overreachWarning(self, `shortcut.${method}`, lookupSlot.get(this))
     if (warning) this.logLine(warning)
   }
 
@@ -122,14 +118,14 @@ export class ShortcutService extends Service {
   attachShell(bridge: ShellShortcutBridge): void {
     if (this.closed) return
     this.detach?.()
-    this.bridge = bridge
+    bridgeSlot.set(this, bridge)
     this.detach = bridge.onPress((event) => this.dispatchPress(event))
   }
 
   detachShell(): void {
     this.detach?.()
     this.detach = undefined
-    this.bridge = undefined
+    bridgeSlot.clear(this)
   }
 
   /** Register a chord and bind a handler to it. */
@@ -138,7 +134,7 @@ export class ShortcutService extends Service {
     // attributed — an undeclared attempt must not become invisible just because
     // it did not succeed.
     this.record(this, "register", accelerator)
-    const bridge = this.bridge
+    const bridge = bridgeSlot.get(this)
     if (this.closed || !bridge) return { status: "no-shell" }
     let registration: ShortcutRegistration
     try {
@@ -160,7 +156,7 @@ export class ShortcutService extends Service {
   /** Release a chord and drop its handler. */
   async unregister(accelerator: string): Promise<ShortcutRegisterResult> {
     this.record(this, "unregister", accelerator)
-    const bridge = this.bridge
+    const bridge = bridgeSlot.get(this)
     if (this.closed || !bridge) return { status: "no-shell" }
     let registration: ShortcutRegistration
     try {
@@ -220,7 +216,7 @@ export class ShortcutService extends Service {
     this.closed = true
     this.detach?.()
     this.detach = undefined
-    this.bridge = undefined
+    bridgeSlot.clear(this)
     this.bindings.clear()
   }
 }

@@ -45,6 +45,7 @@ import Loader from "@cordisjs/plugin-loader"
 import { Context } from "cordis"
 import { createShellCapabilities, ShellHandle } from "../src/capability"
 import type { VRCXKPluginManifest } from "../src/contracts/pluginManifest.generated"
+import { HandsService } from "../src/hands"
 import { AutostartService } from "../src/shell-extras"
 import { ShortcutService } from "../src/shortcut"
 import type {
@@ -442,5 +443,125 @@ describe("undeclared calls to ctx.tray / ctx.shortcut / ctx.autostart must warn 
     // …but there is no accusation of any kind.
     expect(audits.some((line) => line.includes("overreach"))).toBe(false)
     expect(tray.revision).toBeGreaterThanOrEqual(1)
+  }, 20_000)
+
+  // ---------------------------------------------------------------------------
+  // The bridge must not be reachable from a plugin (#40 review, claim 1).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * ⚠ THE REGRESSION THIS PINS.
+   *
+   * A TypeScript `private` field is a **compile-time** modifier only. At runtime the
+   * property is an ordinary own property, enumerable and readable by anyone holding the
+   * service — so `private bridge?: ShellStdioBridge` handed every plugin the WHOLE shell
+   * bridge with one property access. Measured by running a real plugin through a real
+   * loader entry before the fix:
+   *
+   *     ctx.hands.bridge = VISIBLE
+   *     Object.keys(ctx.hands) = ["ctx","name","bridge","auditLine","manifestLookup"]
+   *
+   * Three consequences, all of which this test keeps closed:
+   *   1. the plugin skips `record()` ⇒ no `[cap]` audit line and no `#24` overreach
+   *      warning, so an undeclared capability call becomes invisible;
+   *   2. it skips the caller-fiber binding streams depend on ⇒ the
+   *      "still producing after unload" leak reopens;
+   *   3. the `shell.deepLink.register` narrowing was defeated by a property access.
+   * `manifestLookup` leaked for the same reason, letting one plugin read another's
+   * declared manifest.
+   *
+   * ⚠ Assert on the KEYS, not just `bridge === undefined`: a future edit that re-adds
+   * the field under a different name (or adds a getter) would still be a leak, and a
+   * `bridge`-only assertion would stay green.
+   */
+  test("a plugin cannot reach the shell bridge through the service instance", async () => {
+    const seen: Record<string, unknown> = {}
+    const audits: string[] = []
+    const root = await mkdtemp(join(tmpdir(), "vrcxk-bridge-leak-"))
+    await mkdir(join(root, "plugins"), { recursive: true })
+    // `inject` is required for the property read at all (Cordis throws otherwise), and a
+    // malicious plugin can declare it freely — which is exactly why the leak mattered.
+    await writeFile(
+      join(root, "plugins", "probe.ts"),
+      `export const name = "probe"
+export const inject = ["hands", "shortcut", "autostart"]
+export function apply(ctx: any) {
+  const g: any = globalThis
+  g.__leakProbe = {}
+  for (const name of ["hands", "shortcut", "autostart"]) {
+    try {
+      const svc = ctx[name]
+      g.__leakProbe[name + ":keys"] = Object.keys(svc)
+      g.__leakProbe[name + ":bridge"] = svc.bridge === undefined ? "undefined" : "VISIBLE"
+      // Skip \`ctx\`/\`name\` deliberately: the service's own Cordis context legitimately
+      // carries the capabilities namespace, so a "hands" key on it says nothing about a
+      // bridge leak. Including it produced a false positive naming all three services.
+      for (const key of Object.keys(svc)) {
+        if (key === "ctx" || key === "name") continue
+        const value = svc[key]
+        if (value && typeof value === "object" && "__BRIDGE_MARKER" in value) {
+          g.__leakProbe[name + ":LEAKED_VIA_" + key] = "VISIBLE"
+        }
+      }
+    } catch (error) {
+      g.__leakProbe[name + ":threw"] = String(error)
+    }
+  }
+}
+`,
+    )
+    await writeFile(join(root, "cordis.yml"), "- id: probe\n  name: ./plugins/probe.ts\n")
+
+    const ctx = new Context()
+    ctx.baseUrl = `${pathToFileURL(root).href}/`
+    const fake = fakeBridge()
+    const handle = new ShellHandle((line) => audits.push(line))
+    handle.attach(fake.bridge)
+    createShellCapabilities(ctx, handle)
+    // A distinctive marker so a leak is unmistakable rather than merely "some object".
+    ;(fake.bridge as unknown as Record<string, unknown>).__BRIDGE_MARKER = "LEAKED"
+    // ⚠ `ctx.hands` must actually be provided: the probe plugin declares
+    // `inject: ["hands", ...]`, and Cordis keeps such a plugin PENDING — `apply` never runs
+    // and the probe reports nothing, which is why the anti-vacuous assertion below exists.
+    const hands = new HandsService(ctx, { audit: (line) => audits.push(line) })
+    hands.attachShell(fake.bridge)
+    hands.useManifests(() => undefined)
+    new ShortcutService(ctx, { bridge: fake.bridge.shortcut, log: (line) => audits.push(line) })
+    const autostart = new AutostartService(ctx, { audit: (line) => audits.push(line) })
+    autostart.attachShell(fake.bridge)
+
+    await ctx.plugin(Loader)
+    ctx.loader.builtins.include = Include
+    await ctx.plugin(Include, { path: "./cordis.yml", enableLogs: false })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    const probe =
+      (globalThis as unknown as { __leakProbe?: Record<string, unknown> }).__leakProbe ?? {}
+    for (const [key, value] of Object.entries(probe)) seen[key] = value
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+
+    // Anti-vacuous: if the plugin never ran, every assertion below would "pass" for the
+    // wrong reason (an empty object has no leaks). Require evidence it executed.
+    expect(
+      Object.keys(seen).length,
+      "the probe plugin must have run and reported — an empty result is not evidence",
+    ).toBeGreaterThan(0)
+
+    // The load-bearing assertions.
+    expect(seen["hands:bridge"], "ctx.hands must not expose the bridge").toBe("undefined")
+    expect(seen["hands:keys"], "no bridge/manifest field may appear on ctx.hands").not.toContain(
+      "bridge",
+    )
+    expect(seen["hands:keys"], "no manifestLookup field may appear on ctx.hands").not.toContain(
+      "manifestLookup",
+    )
+    expect(seen["shortcut:bridge"], "ctx.shortcut must not expose the bridge").toBe("undefined")
+    expect(seen["shortcut:keys"]).not.toContain("bridge")
+    expect(seen["autostart:keys"]).not.toContain("bridge")
+    expect(seen["autostart:keys"]).not.toContain("manifestLookup")
+
+    // And nothing reachable from any enumerable key may carry the bridge.
+    const leaked = Object.keys(seen).filter((key) => key.includes("LEAKED_VIA_"))
+    expect(leaked, `bridge reachable through: ${leaked.join(", ")}`).toEqual([])
   }, 20_000)
 })

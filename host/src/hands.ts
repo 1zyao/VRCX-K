@@ -38,6 +38,7 @@
 import { type Context, Service } from "cordis"
 import type { VRCXKPluginManifest } from "./contracts/pluginManifest.generated"
 import { callerName, overreachWarning } from "./overreach"
+import { createSecretSlot } from "./service-secret"
 import type {
   HandsChange,
   HandsErrorCode,
@@ -231,22 +232,23 @@ export function normalizeChange(value: unknown): HandsChange | undefined {
   }
 }
 
+/**
+ * ⚠ The bridge and manifest lookup are held in {@link createSecretSlot} slots, not in
+ * fields. See `service-secret.ts` for the three approaches that were measured and why a
+ * `private` field, a `WeakMap` keyed by `this`, and a bare symbol property all fail — the
+ * short version is that a plugin could read the whole `ShellStdioBridge`, which skips
+ * `record()` (no `[cap]` audit line, no `#24` warning), skips the caller-fiber binding
+ * streams depend on, and defeats the `deepLink.register` narrowing.
+ */
+const bridgeSlot = createSecretSlot<ShellStdioBridge>()
+const lookupSlot = createSecretSlot<(entryId: string) => VRCXKPluginManifest | undefined>()
+
 export class HandsService extends Service {
-  private bridge?: ShellStdioBridge
   private readonly auditLine: HandsAudit
-  /**
-   * Manifest lookup for `#24` overreach detection.
-   *
-   * Set by `useManifests` once the registry exists. `undefined` means "manifests
-   * are not loaded", which is NOT the same as "this plugin is undeclared" — see
-   * `overreachWarning`, which returns nothing in that case rather than warning on
-   * every call.
-   */
-  private manifestLookup?: (entryId: string) => VRCXKPluginManifest | undefined
 
   constructor(ctx: Context, options: HandsServiceOptions = {}) {
     super(ctx, "hands")
-    this.bridge = options.bridge
+    if (options.bridge) this.attachShell(options.bridge)
     this.auditLine = options.audit ?? (() => {})
   }
 
@@ -258,27 +260,28 @@ export class HandsService extends Service {
    * unchecked while the raw mirror was covered.
    */
   useManifests(lookup: (entryId: string) => VRCXKPluginManifest | undefined): void {
-    this.manifestLookup = lookup
+    lookupSlot.set(this, lookup)
   }
 
   /** Attach or detach the shell bridge (services are provided before it exists). */
   attachShell(bridge: ShellStdioBridge): void {
-    this.bridge = bridge
+    bridgeSlot.set(this, bridge)
   }
 
   detachShell(): void {
-    this.bridge = undefined
+    bridgeSlot.clear(this)
   }
 
   get attached(): boolean {
-    return this.bridge !== undefined
+    return bridgeSlot.has(this)
   }
 
   private get api() {
-    if (!this.bridge) {
+    const bridge = bridgeSlot.get(this)
+    if (!bridge) {
       throw new HandsError("EUNSUPPORTED: no shell attached")
     }
-    return this.bridge.hands
+    return bridge.hands
   }
 
   /**
@@ -303,7 +306,7 @@ export class HandsService extends Service {
     // this — the raw escape hatch (`ctx.shell.hands.*`) was checked while this
     // was not, which is the exact inversion `#24` exists to prevent. It is the
     // same shared helper the mirror uses, so the rule cannot drift between them.
-    const warning = overreachWarning(self, `hands.${method}`, this.manifestLookup)
+    const warning = overreachWarning(self, `hands.${method}`, lookupSlot.get(this))
     if (warning) this.auditLine(warning)
   }
 
