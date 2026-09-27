@@ -159,6 +159,32 @@ export function capabilityOf(method: string): string | undefined {
 }
 
 /**
+ * The entry name a declaration must list to cover `method`.
+ *
+ * ⚠ WHY THIS IS NOT `.split(".").slice(1)`, which is what it used to be (#40 review).
+ *
+ * A RAW call carries an extra segment: `shell.window.show` has the capability `shell` at the
+ * head and the sub-domain `window` next. Dropping only the first segment yields
+ * **`window.show`**, which matches NEITHER legal spelling — `shell: ["window"]` (sub-domain
+ * form) nor `window: ["show"]` (curated form). So a **narrow** declaration was judged
+ * `out-of-scope` and warned about, while `window: true` passed silently.
+ *
+ * That inverted the incentive the `#24` warning is supposed to create: declaring PRECISELY
+ * earned you a warning and declaring the whole domain did not, so the lesson an author takes
+ * away is "declare less precisely". Measured before the fix:
+ *
+ *     { window: ["show"] } + shell.window.show -> out-of-scope  (a false positive)
+ *     { window: true }      + shell.window.show -> granted
+ */
+function grantEntry(method: string): string {
+  const parts = method.split(".")
+  // `shell.<sub>.<entry…>` ⇒ `<entry…>` (the curated capability's own leaf).
+  if (parts[0] === "shell" && parts.length > 2) return parts.slice(2).join(".")
+  // `shell.<sub>` ⇒ `<sub>`, and `<capability>.<entry…>` ⇒ `<entry…>`.
+  return parts.slice(1).join(".")
+}
+
+/**
  * Is `method` covered by the declaration for `capability`?
  *
  * Three outcomes, and the third is the point:
@@ -179,9 +205,10 @@ export function checkGrant(
   if (grant === false) return "out-of-scope"
   if (!Array.isArray(grant)) return "undeclared"
 
-  // The declaration may name either the capability's sub-entry (`read` for
-  // `hands.read`) or the raw shell sub-domain (`notify` for `shell.notify`).
-  const leaf = method.split(".").slice(1).join(".")
+  // The declaration may name the capability's own sub-entry (`read` for `hands.read`), the
+  // raw shell sub-domain (`notify` for `shell.notify`), or the full method. See `grantEntry`
+  // for why the raw case needs its own rule.
+  const leaf = grantEntry(method)
   if (grant.includes(leaf) || grant.includes(method)) return "granted"
   // A bare capability name in the list also counts as a grant of that capability.
   if (grant.includes(capability)) return "granted"

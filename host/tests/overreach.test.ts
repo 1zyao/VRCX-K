@@ -132,6 +132,34 @@ describe("the pure grant check", () => {
   test("the full method path also counts", () => {
     expect(checkGrant(["notify.send"], "notify", "notify.send")).toBe("granted")
   })
+
+  /**
+   * ⚠ THE REGRESSION for #40 review's "narrow list false positive on the raw path".
+   *
+   * A raw call carries an EXTRA segment: `shell.window.show` has the capability `shell` at
+   * the head and the sub-domain `window` next. The entry name used to be
+   * `method.split(".").slice(1).join(".")` = **`window.show`**, which matches neither legal
+   * spelling (`shell: ["window"]` nor `window: ["show"]`). So a NARROW declaration was
+   * judged `out-of-scope` and warned about, while `window: true` passed silently.
+   *
+   * That inverted the incentive the warning exists to create: declaring precisely earned you
+   * a warning, so the lesson an author takes away is "declare less precisely".
+   */
+  test("a NARROW grant covers the raw call it names, in both spellings", () => {
+    // Curated spelling: the sub-domain's own key, listing the entry.
+    expect(checkGrant(["show"], "window", "shell.window.show")).toBe("granted")
+    // Sub-domain spelling: `shell` listing the sub-domain.
+    expect(checkGrant(["window"], "shell", "shell.window")).toBe("granted")
+    // The full method path still counts.
+    expect(checkGrant(["shell.window.show"], "window", "shell.window.show")).toBe("granted")
+  })
+
+  test("a narrow grant still REFUSES an entry it does not name", () => {
+    // ⚠ The fix must not turn the check into a constant: widening is what the warning asks
+    // for, so an unnamed entry must still be reported.
+    expect(checkGrant(["hide"], "window", "shell.window.show")).toBe("out-of-scope")
+    expect(checkGrant(["notify"], "shell", "shell.window")).toBe("out-of-scope")
+  })
 })
 
 describe("the raw shell mirror maps to its sub-domain", () => {
