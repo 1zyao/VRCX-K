@@ -105,10 +105,25 @@ function rotate(path: string): void {
 
 /** One line, timestamped so a support bundle can be ordered. */
 function write(line: string): void {
-  const stamped = `${new Date().toISOString()} ${line}\n`
   console.error(line)
+  // ⚠ stderr gets the caller's exact text; the FILE gets the shared path below, which is
+  // also what `logWithSecret` uses. Splitting these is what let the two drift: the file
+  // side used to be copy-pasted into `logWithSecret`, so a change to rotation or size
+  // accounting here would silently apply to one caller and not the other.
+  writeFileLine(line)
+}
+
+/**
+ * The single file-writing path: rotation, stamping and size bookkeeping in ONE place.
+ *
+ * `line` is written verbatim (already stamped or not) — callers pass the text they want on
+ * disk, which is what lets `logWithSecret` write the REDACTED text while stderr gets the
+ * full one.
+ */
+function writeFileLine(line: string): void {
   const path = logPath()
   if (!path) return
+  const stamped = `${new Date().toISOString()} ${line}\n`
   try {
     rotate(path)
     appendFileSync(path, stamped)
@@ -191,19 +206,11 @@ export function log(...args: unknown[]): void {
 export function logWithSecret(redacted: string, secret: string): void {
   // stderr: the full line, exactly as before this function existed.
   console.error(`[host] ${secret}`)
-  // The file: the redacted one, through the normal path so rotation, stamping and
-  // the size bookkeeping all stay in one place.
-  const path = logPath()
-  if (!path) return
-  const stamped = `${new Date().toISOString()} [host] ${redacted}\n`
-  try {
-    rotate(path)
-    appendFileSync(path, stamped)
-    if (knownSize !== undefined) knownSize += Buffer.byteLength(stamped)
-  } catch {
-    // Same rule as `write`: never let logging break the host.
-    knownSize = undefined
-  }
+  // The file: the redacted one, through the SAME path as `write` — rotation, stamping and
+  // size bookkeeping live in exactly one place, so they cannot drift between the two
+  // callers. ⚠ The previous version's comment claimed this while the code COPY-PASTED the
+  // body; a change to `write` would have silently applied to one caller only.
+  writeFileLine(`[host] ${redacted}`)
 }
 
 /** Absolute path of the log file, or `undefined` when file logging is off. */

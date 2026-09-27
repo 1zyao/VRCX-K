@@ -224,7 +224,7 @@ describe("logWithSecret: stderr keeps the value, the FILE does not", () => {
       `import { logWithSecret } from ${JSON.stringify(moduleUrl)}\n` +
         `logWithSecret(${JSON.stringify(redacted)}, ${JSON.stringify(secret)})\n`,
     )
-    const proc = Bun.spawnSync(["bun", entry], {
+    const proc = Bun.spawnSync([process.execPath, entry], {
       env: { ...process.env, VRCXK_LOG_DIR: logDir },
       stdout: "pipe",
       stderr: "pipe",
@@ -276,7 +276,7 @@ describe("logWithSecret: stderr keeps the value, the FILE does not", () => {
       )
       const env = { ...process.env }
       delete env.VRCXK_LOG_DIR
-      const proc = Bun.spawnSync(["bun", entry], { env, stdout: "pipe", stderr: "pipe" })
+      const proc = Bun.spawnSync([process.execPath, entry], { env, stdout: "pipe", stderr: "pipe" })
       expect(proc.exitCode).toBe(0)
       expect(proc.stderr.toString()).toContain("secret-line")
       expect(proc.stdout.toString()).toBe("")

@@ -62,7 +62,7 @@ function runWithLogDir(
 ): { stdout: string; stderr: string; exitCode: number } {
   const entry = join(logDir, "entry.ts")
   writeFileSync(entry, `import { log } from ${JSON.stringify(logModuleUrl())}\n${snippet}\n`)
-  const proc = Bun.spawnSync(["bun", entry], {
+  const proc = Bun.spawnSync([process.execPath, entry], {
     env: { ...process.env, VRCXK_LOG_DIR: logDir },
     stdout: "pipe",
     stderr: "pipe",
@@ -121,7 +121,7 @@ describe("the host log file", () => {
     )
     const env = { ...process.env }
     delete env.VRCXK_LOG_DIR
-    const proc = Bun.spawnSync(["bun", entry], { env, stdout: "pipe", stderr: "pipe" })
+    const proc = Bun.spawnSync([process.execPath, entry], { env, stdout: "pipe", stderr: "pipe" })
     expect(proc.exitCode).toBe(0)
     const stderr = proc.stderr.toString()
     expect(stderr).toContain("stderr-only")

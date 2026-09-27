@@ -301,10 +301,11 @@ function record(self: HandsService, method: string, detail: string): void {
 
   // Overreach: declared vs actual (#24).
   //
-  // ⚠ `ctx.hands` is the SUPPORTED entry point and it had NO check before this — the raw
-  // escape hatch (`ctx.shell.hands.*`) was checked while this was not, which is the exact
-  // inversion `#24` exists to prevent. It is the same shared helper the mirror uses, so the
-  // rule cannot drift between them.
+  // ⚠ `ctx.hands` is the ONLY route to these primitives — there is no `ctx.shell.hands`
+  // mirror to inherit a check from (`RAW_SHELL` in `capability.ts` has no `hands` key; an
+  // earlier comment here claimed otherwise). So `#24` needs this call explicitly, and it
+  // uses the same shared helper the mirror uses for its own sub-domains, so the rule
+  // cannot drift.
   const warning = overreachWarning(self, `hands.${method}`, lookupSlot.get(self))
   if (warning) self.auditLine(warning)
 }

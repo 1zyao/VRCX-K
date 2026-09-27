@@ -390,10 +390,14 @@ export type DeepLinkCapability = {
  *
  * `ctx.hands` is NOT built here: it is a `Service` subclass with its own state
  * (a shell attachment and per-stream lifecycle guards), so `host/src/index.ts`
- * constructs it the way it constructs `TrayService`/`ShortcutService`. The raw
- * `hands.*` wire mirror is reachable through `ctx.shell.hands` for the escape-
- * hatch path, but the curated service is the supported entry point — only it
- * binds a stream's life to its caller.
+ * constructs it the way it constructs `TrayService`/`ShortcutService`.
+ *
+ * ⚠ There is **no** raw `ctx.shell.hands` mirror. An earlier version of this comment said
+ * there was, and `hands.ts` repeated the claim — but `RAW_SHELL` below has **no `hands`
+ * key** (checked: `notify`/`openUrl`/…/`tray` only). `ctx.hands` is therefore the ONLY
+ * route to these primitives, curated by design: it is what binds a stream's life to its
+ * caller, and it is why `#24` needs its own check on this path rather than inheriting the
+ * mirror's.
  */
 export function createShellCapabilities(ctx: Context, handle: ShellHandle): void {
   buildNode(ctx, "shell", handle, RAW_SHELL)
