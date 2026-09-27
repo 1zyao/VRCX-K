@@ -647,6 +647,18 @@ cwd/execPath/runtime），**手一声不吭**。于是脑无法判断「我在�
 6. **Android 真机**：文件访问的 SAF fd 桥与 `notify` 的 inotify 后端**都只经过源码阅读**。
    本轮新增的只是**交叉编译验证**：`hands.rs` 与 `kkrpc_peer.rs` 在
    `aarch64-linux-android` 上 `cargo check` **通过**。**编译通过 ≠ 能跑**，证据缺口不变。
+   > ⚠ **2026-09-27 更正：把这两件事并列是错的。**
+   > 「SAF fd 桥**只经过源码阅读**」暗示它**已经写好了、只是没在真机验证过** —— 而实测
+   > **它在代码库里根本不存在**：四个原语（`read`/`write`/`stat`/`watch`）**全部取
+   > `str_arg` 即路径**，`content://` 只出现在 `dialog_opts.rs` 的 picker 返回值处理里，
+   > 而 §4.3 说的 `tauri-plugin-fs` **不是本仓库的依赖**（只在 `docs/probes/` 的探针
+   > crate 里出现过）。⇒ **§4.3 描述的是"未来需求"，不是"未验证的现有代码"。**
+   > 真正的缺口是「**还没写**」，不是「没验证」—— 这两者的排期含义完全不同。
+   > `notify` 的 inotify 后端那一半则是真的"未验证"（`notify 8.2.0` 在
+   > `cfg(any(linux, android))` 下 `RecommendedWatcher = INotifyWatcher`，非 poll 回退，
+   > 已核实源码）。
+   > 详见 [`android-debuggable-probe-design.md`](android-debuggable-probe-design.md) §7
+   > 与该文件配套的 `docs/probes/debug-probe/`。
 7. **手的文件能力归属哪个里程碑**：**未定**。本提案只提供输入，不主张排期。
 
 ### 9.1 落地时**新发现**的两条（不在原提案里）
