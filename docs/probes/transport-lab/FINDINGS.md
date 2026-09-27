@@ -194,13 +194,21 @@ whole bun column "unverified, no artifact"; that gap is closed — see the note 
 
 | Operation | node max lag (256 MiB) | bun max lag (256 MiB) |
 |---|---|---|
-| IDLE floor | 15.78 ms | **1.94 ms** |
-| **CONTROL `readFileSync`** | **0 samples (frozen 95.7 ms)** | **0 samples (frozen 81.6 ms)** |
-| `fs/promises readFile` | 1.37 ms | **11.96 ms** |
-| `Bun.file().arrayBuffer()` | — (node cannot run it) | **2.03 ms** |
-| `Bun.file().stream()` chunked | — (node cannot run it) | **2.9 ms** |
-| `writeFile` one call | 1.35 ms | **2.0 ms** |
-| **`Buffer.alloc` + fill (pure CPU)** | **frozen 64 ms, 0 samples** | **frozen 60.6 ms, 0 samples** |
+| IDLE floor | 16.6 ms | **2.02 ms** |
+| **CONTROL `readFileSync`** | **0 samples (frozen 78 ms)** | **0 samples (frozen 80.2 ms)** |
+| `fs/promises readFile` | 1.25 ms | **13.4 ms** |
+| `Bun.file().arrayBuffer()` | — (node cannot run it) | **1.79 ms** |
+| `Bun.file().stream()` chunked | — (node cannot run it) | **2.79 ms** |
+| `writeFile` one call | 10.04 ms | **2.07 ms** |
+| **`Buffer.alloc` + fill (pure CPU)** | **frozen 59 ms, 0 samples** | **frozen 73.7 ms, 0 samples** |
+
+⚠ **Every number above was read back out of the two committed `.json` artifacts, not
+transcribed from a terminal.** The first version of this table quoted an *earlier* bun
+run than the one whose artifact was checked in — the two differed materially
+(`readFile` 11.96 vs 13.4 ms, `stream` 2.9 vs 2.79 ms, `writeFile` 2.0 vs 2.07 ms).
+That is the exact "document and artifact disagree" failure this file keeps warning
+about, committed by the same edit that added the warning. The numbers are now
+machine-read from the artifacts.
 
 Artifacts: `results/evloop-node-v24.9.0-256MiB-report.txt` and
 `results/evloop-bun-1.4.2-256MiB-report.txt` (each with a matching `.json`; the `.json`
@@ -218,10 +226,14 @@ The old `evloop-report.txt` was replaced rather than kept: regenerating node at 
 reproduced it closely (idle floor 15.78 → 16.6 ms, `readFile` 1.37 → 1.25 ms), so it was
 a genuine re-measurement of the same configuration and not a different experiment.
 
-⚠ **Variance is real; treat single numbers as indicative.** Two consecutive bun runs on
-this machine gave `Bun.file().stream()` max lag of **12.89 ms** and **2.9 ms**, and
-`writeFile` 3960 ms vs 1209 ms of work. So differences of a few ms between runtimes are
-**not** a ranking — only the order-of-magnitude conclusions below are load-bearing.
+⚠ **Variance is real; treat single numbers as indicative.** This is measured, not
+asserted, and the evidence is deliberately NOT the committed artifact:
+three bun runs of the same configuration on this machine gave
+`Bun.file().stream()` max lag of **12.89 / 2.9 / 2.79 ms**, and `writeFile` work of
+**3960 / 1209 / 873 ms**. Only the last is the checked-in run; the other two were
+superseded and are **not reproducible from the repo**. ⇒ differences of a few ms
+between runtimes are **not** a ranking — only the order-of-magnitude conclusions below
+are load-bearing.
 
 **What the artifacts DO support** (and what this section is actually claiming):
 
