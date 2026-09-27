@@ -193,8 +193,25 @@ await unlink(bigFile).catch(() => {})
 await unlink(outFile).catch(() => {})
 
 mkdirSync(join(here, "results"), { recursive: true })
+
+// ⚠ ONE FILE PER (RUNTIME, SIZE), because this probe is meant to be run more than once
+// with materially different inputs, and its first version overwrote its own evidence.
+//
+// The first version wrote a single `evloop.json` / `evloop-report.txt` pair, so a
+// second run SILENTLY DESTROYED the first — nothing in the filename or the header said
+// the earlier run had existed. It was caught by accident: a bun run overwrote the
+// tracked node artifact and `git status` showed the report as modified.
+//
+// ⚠ Naming by RUNTIME ALONE IS NOT ENOUGH, and that was learned the hard way too: a
+// `--sizeMiB=32` verification run then clobbered the committed 256 MiB node artifact,
+// because both are `node-v24.9.0`. **Every input that changes what is measured belongs
+// in the name.** Hence `<runtime>-<size>MiB`.
+const stem = `evloop-${runtime}-${SIZE_MIB}MiB`
+const jsonPath = join(here, "results", `${stem}.json`)
+const reportPath = join(here, "results", `${stem}-report.txt`)
+
 writeFileSync(
-  join(here, "results", "evloop.json"),
+  jsonPath,
   JSON.stringify({ generatedAt: new Date().toISOString(), sizeMiB: SIZE_MIB, runtime, results }, null, 2),
 )
 
@@ -293,6 +310,8 @@ if (!controlWorks) {
 lines.push("")
 
 const text = lines.join("\n")
-writeFileSync(join(here, "results", "evloop-report.txt"), text)
+writeFileSync(reportPath, text)
 console.log(text)
+console.log(`\nwrote ${jsonPath}`)
+console.log(`wrote ${reportPath}`)
 process.exit(0)

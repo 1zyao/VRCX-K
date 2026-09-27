@@ -10,7 +10,7 @@ instead of trusting it.
 | `backpressure-report.txt` | `02-backpressure.mjs` | the producer stops at the **32-chunk credit window** (8 MiB); the ungated control reaches **256 chunks** (64 MiB) — **8x** |
 | `hol-report.txt` | `03-head-of-line.mjs` | RPC latency while a bulk transfer runs on the same connection |
 | `priority-report.txt` | `04-shared-vs-separate.mjs` | shared tunnel vs a separate connection |
-| `evloop-report.txt` | `05-event-loop.mjs` | event-loop lag per file API; the **`Buffer.alloc` freeze** |
+| `evloop-node-v24.9.0-256MiB-report.txt` / `evloop-bun-1.4.2-256MiB-report.txt` | `05-event-loop.mjs` | event-loop lag per file API; the **`Buffer.alloc` freeze** — **one file per runtime**, see below |
 | `folder-report.txt` | `06-folder-upload.mjs` | one request per file vs one packed blob (RTT-dependent) |
 | `conc2-report.txt` | `07-concurrency.mjs` | concurrency scaling (**2.17x at level 4 — the producer's own conclusion is that parallelism IS worth offering**) and its memory cost |
 
@@ -21,6 +21,21 @@ that change what is measured (`--sizeMiB`, `--frames`, `--size`, `--chunk`,
 `--total`, `--rttMs`, `--sizeMiB`). Several reports were produced with **non-default
 flags**, and an earlier version of `FINDINGS.md` silently quoted the *defaults*
 instead — which is how this directory and that document came to disagree.
+
+### ⚠ …and for probes meant to run on BOTH runtimes, the RUNTIME goes in the filename
+
+`05-event-loop.mjs` can run under `node` **and** `bun`, and the two measure different
+things. It used to write a single `evloop-report.txt`, so the second run **silently
+destroyed the first** — nothing in the filename or the header recorded that the other
+runtime's evidence had ever existed. It was found by accident (a bun run overwrote the
+tracked node artifact, and `git status` showed the report modified).
+
+**The rule**: a probe that is meant to be run more than once with materially different
+inputs must name its output after those inputs. `evloop-<runtime>-<size>MiB-report.txt` is the worked example.
+
+⚠ **Single numbers are indicative, not a ranking.** Two consecutive bun runs gave
+`Bun.file().stream()` max lag of 12.89 ms and 2.9 ms, and `writeFile` 3960 ms vs
+1209 ms of work. Only order-of-magnitude conclusions survive that variance.
 
 **Two known cases, both corrected in `FINDINGS.md`:**
 

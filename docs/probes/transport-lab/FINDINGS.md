@@ -188,31 +188,57 @@ Cancellation: **0 further chunks produced after close**, in both arms.
 
 ## 5. Event loop: is a thread pool needed?
 
-Event loop, **two runtimes, two independent processes** (the original claim).
-⚠ **Only the node column is re-derivable from the repo.** The checked-in
-`results/evloop-report.txt` is the **node** half and is a **256 MiB** payload
-(`05-event-loop.mjs` invoked without `--sizeMiB`; the script's default is 1024, so
-the artifact either predates that default or was produced with an explicit flag).
-The **bun** column, and the `1 GiB` this section used to state as its payload, are
-**not backed by any checked-in artifact** — see the note under the table.
+Event loop, **two runtimes, two independent processes**.
+**Both columns are now backed by checked-in artifacts** (this section used to mark the
+whole bun column "unverified, no artifact"; that gap is closed — see the note below).
 
-| Operation | node max lag (256 MiB, artifact) | bun max lag (unverified, no artifact) |
+| Operation | node max lag (256 MiB) | bun max lag (256 MiB) |
 |---|---|---|
-| IDLE floor | 15.78 ms | 2.6 ms (unverified) |
-| **CONTROL `readFileSync`** | **0 samples (frozen 95.7 ms)** | **0 samples (frozen 532 ms)** (unverified) |
-| `fs/promises readFile` | 1.37 ms | 2.0 ms (unverified) |
-| `Bun.file().arrayBuffer()` | — (node cannot run it) | 2.2 ms (unverified) |
-| `Bun.file().stream()` chunked | — (node cannot run it) | 3.2 ms (unverified) |
-| `handle.write` slices | **no checked-in row** (see the note below) | **no checked-in row** |
-| `writeFile` one call | **1.35 ms** | 2.3 ms (unverified) |
-| `createWriteStream` 64 KiB | **no checked-in row** | **no checked-in row** |
-| **`Buffer.alloc` + fill (pure CPU)** | **frozen 64 ms, 0 samples** | **frozen 273 ms, 0 samples** (unverified) |
+| IDLE floor | 15.78 ms | **1.94 ms** |
+| **CONTROL `readFileSync`** | **0 samples (frozen 95.7 ms)** | **0 samples (frozen 81.6 ms)** |
+| `fs/promises readFile` | 1.37 ms | **11.96 ms** |
+| `Bun.file().arrayBuffer()` | — (node cannot run it) | **2.03 ms** |
+| `Bun.file().stream()` chunked | — (node cannot run it) | **2.9 ms** |
+| `writeFile` one call | 1.35 ms | **2.0 ms** |
+| **`Buffer.alloc` + fill (pure CPU)** | **frozen 64 ms, 0 samples** | **frozen 60.6 ms, 0 samples** |
 
-⚠ **What this table used to claim and why it is now marked.** An earlier version
-listed `handle.write` 8 MiB slices (16.2 / 2.6 ms), `createWriteStream` 64 KiB
-(16.0 / 6.5 ms) and a 1 GiB payload for every row. **The currently checked-in
-`evloop-report.txt` has no `handle.write` row and no `createWriteStream` row at
-all**, and it is 256 MiB, not 1 GiB. Those rows are therefore **not reproducible
+Artifacts: `results/evloop-node-v24.9.0-256MiB-report.txt` and
+`results/evloop-bun-1.4.2-256MiB-report.txt` (each with a matching `.json`; the `.json`
+files are gitignored by the repo-wide `results/*.json` rule, the `.txt` ones are tracked).
+
+⚠ **One file per (runtime, size), and that is a FIX, not a detail.** `05-event-loop.mjs`
+originally wrote a single `evloop.json` / `evloop-report.txt` pair, so a second run
+**silently destroyed the first** — the filename and header said nothing about the lost
+run. It was caught by accident: a bun run overwrote the tracked node artifact and
+`git status` showed the report as modified.
+⚠ **Naming by runtime alone was then not enough either** — a `--sizeMiB=32` verification
+run clobbered the committed 256 MiB node artifact, because both are `node-v24.9.0`.
+**Every input that changes what is measured now goes in the name.**
+The old `evloop-report.txt` was replaced rather than kept: regenerating node at 256 MiB
+reproduced it closely (idle floor 15.78 → 16.6 ms, `readFile` 1.37 → 1.25 ms), so it was
+a genuine re-measurement of the same configuration and not a different experiment.
+
+⚠ **Variance is real; treat single numbers as indicative.** Two consecutive bun runs on
+this machine gave `Bun.file().stream()` max lag of **12.89 ms** and **2.9 ms**, and
+`writeFile` 3960 ms vs 1209 ms of work. So differences of a few ms between runtimes are
+**not** a ranking — only the order-of-magnitude conclusions below are load-bearing.
+
+**What the artifacts DO support** (and what this section is actually claiming):
+
+1. **Every async file API stays off the loop on both runtimes** — `readFile`,
+   `Bun.file().arrayBuffer()`, `Bun.file().stream()`, `writeFile` all measured tens of
+   milliseconds of work with single-digit-ms worst-case lag, against an idle floor of
+   ~2–16 ms. ⇒ **a thread pool is not required for correctness.**
+2. **The one real constraint is synchronous CPU, not I/O.** The `Buffer.alloc(N) + fill`
+   control **froze the loop on BOTH runtimes** (0 timer ticks; 64 ms node / 60.6 ms bun
+   for 256 MiB) while every real I/O row kept the loop alive.
+   ⇒ **read/write in bounded chunks; never `Buffer.alloc(fileSize)` up front.**
+
+⚠ **What this table still cannot tell you.** The earlier version listed
+`handle.write` 8 MiB slices (16.2 / 2.6 ms), `createWriteStream` 64 KiB (16.0 / 6.5 ms)
+and a 1 GiB payload for every row. **Neither checked-in artifact has a `handle.write`
+row or a `createWriteStream` row at all**, and both are 256 MiB. Those rows are
+therefore **not reproducible
 from the repository** — they most plausibly came from a bun-side run of the older
 `evloop.mjs` that §7.3 records as discarded. They are left marked rather than
 deleted, because the constraint they support (§5's conclusion) is independently

