@@ -801,9 +801,19 @@ fn register_write(peer: &Arc<Peer>) {
                         reply: reply.clone(),
                         mode,
                     });
-                    // `consume_stream` opens the credit window, so the host
-                    // starts sending only after this returns. If it refuses,
-                    // the reply is still owed.
+                    // ⚠ `consume_stream` opens the credit window, so the host starts sending
+                    // only after this returns. If it refuses, the reply is still owed.
+                    //
+                    // ⚠ THIS USED TO SEND TWO FRAMES FOR ONE REQUEST (#40 review). On the
+                    // opening-`pull` failure path `consume_stream` calls `sink.finish(Err(..))`,
+                    // which answered — and then this line answered again with the classified
+                    // message, so the classification was the frame that got lost.
+                    //
+                    // The fix is in `DeferredReply` itself (it now answers at most once), NOT
+                    // here: "one request, one reply" is a property of the reply, so enforcing
+                    // it at this one call site would leave every other pair of senders free to
+                    // reintroduce the same bug. With the guard in place this line is the
+                    // authoritative answer whenever the sink did not already give one.
                     if let Err(error) = target.consume_stream(&sid, sink) {
                         // `consume_refusal` returns the FULL message, because the
                         // dead-transport case must stay un-prefixed — see its docs.

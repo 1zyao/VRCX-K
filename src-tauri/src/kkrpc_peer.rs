@@ -138,15 +138,33 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 /// `hands.write` must not answer until the incoming stream has ended, so the
 /// request is answered from the stream's completion instead of from the handler
 /// body. Handed to a handler registered through [`Peer::on_deferred`].
+///
+/// ⚠ **Answers AT MOST ONCE, across every clone.** `send`/`fail` are no-ops after the first
+/// answer. That is not tidiness — a request id answered twice puts two `t:"r"` frames on the
+/// wire for one request, and the host's pending-sender table has already dropped the first,
+/// so the second is either ignored noise or lands on a REUSED id. Measured case (#40 review):
+/// `consume_stream`'s opening `pull` write fails, its handler calls `sink.finish(Err(..))`
+/// which answers, and then the caller answers AGAIN with the classified message — the
+/// classification is the frame that gets lost.
+///
+/// The guard lives here rather than at that call site because "one request, one reply" is a
+/// property of the reply, not of one caller: this is the only place that can enforce it for
+/// all of them.
 #[derive(Clone)]
 pub struct DeferredReply {
     peer: Arc<Peer>,
     id: String,
+    /// Shared across clones, so a clone cannot answer after the original did.
+    answered: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DeferredReply {
     fn new(peer: Arc<Peer>, id: String) -> Self {
-        Self { peer, id }
+        Self {
+            peer,
+            id,
+            answered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     /// The request id this reply will answer.
@@ -157,15 +175,32 @@ impl DeferredReply {
         &self.id
     }
 
+    /// Claim the right to answer, or `false` if someone already did.
+    fn claim(&self) -> bool {
+        !self
+            .answered
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Send the request's successful result.
+    ///
+    /// A second call (from any clone) writes nothing — see the type's note.
     pub fn send(&self, value: Value) {
+        if !self.claim() {
+            return;
+        }
         let _ = self
             .peer
             .write(&json!({ "t": "r", "id": self.id, "v": value }));
     }
 
     /// Fail the request. The host maps `e.m` to the rejection's message.
+    ///
+    /// A second call (from any clone) writes nothing — see the type's note.
     pub fn fail(&self, message: impl Into<String>) {
+        if !self.claim() {
+            return;
+        }
         let _ = self.peer.write(&json!({
             "t": "r",
             "id": self.id,
@@ -2171,6 +2206,68 @@ mod tests {
     }
 
     // --- framing edge cases ------------------------------------------------
+
+    /// ⚠ THE REGRESSION for #40 review's "double-frame reply on a failed write pull".
+    ///
+    /// A request id answered twice puts two `t:"r"` frames on the wire for one request. The
+    /// host has already dropped the pending sender by then, so the second frame is noise at
+    /// best and can land on a REUSED id at worst. The measured path: `consume_stream`'s
+    /// opening `pull` write fails, its handler answers via `sink.finish(Err(..))`, and the
+    /// caller then answers again with the classified message — so the classification, which
+    /// is the whole point of `consume_refusal`, was the frame that got lost.
+    #[test]
+    fn a_deferred_reply_answers_at_most_once() {
+        let (reply, sink) = test_support::reply_with_sink();
+
+        reply.fail("first");
+        let after_first = {
+            let bytes = sink.lock().expect("sink");
+            String::from_utf8_lossy(&bytes).lines().count()
+        };
+        assert_eq!(after_first, 1, "the first answer must be written");
+
+        // Both a second `fail` and a `send` must be no-ops.
+        reply.fail("second");
+        reply.send(json!("value"));
+        let frames: Vec<String> = {
+            let bytes = sink.lock().expect("sink");
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            frames.len(),
+            1,
+            "a second answer must write nothing; got {frames:?}"
+        );
+        assert!(
+            frames[0].contains("first"),
+            "the FIRST answer is the one that survives; got {}",
+            frames[0]
+        );
+    }
+
+    /// The guard must hold across CLONES too — `hands.write` clones the reply into its sink,
+    /// so a guard that only covers the original would miss exactly the case above.
+    #[test]
+    fn a_cloned_deferred_reply_cannot_answer_after_the_original() {
+        let (reply, sink) = test_support::reply_with_sink();
+        let clone = reply.clone();
+
+        clone.fail("from the clone");
+        reply.fail("from the original");
+
+        let frames: Vec<String> = {
+            let bytes = sink.lock().expect("sink");
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(frames.len(), 1, "got {frames:?}");
+        assert!(frames[0].contains("from the clone"), "got {}", frames[0]);
+    }
 
     #[test]
     fn a_reply_without_a_value_resolves_to_null() {
