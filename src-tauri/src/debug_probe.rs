@@ -69,6 +69,13 @@ pub mod policy {
     /// any legitimate use and far below "until the app is killed".
     pub const MAX_SESSION: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+    /// Longest a client may stay silent mid-handshake before it is dropped.
+    ///
+    /// ⚠ A client that connects and sends nothing would otherwise block the
+    /// **single-threaded** accept loop forever, denying service to every later client.
+    /// A real client sends its token line immediately, so this is generous.
+    pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// The name an instance with this pid should bind.
     ///
     /// ⚠ The pid is part of the name ON PURPOSE. The abstract namespace is global
@@ -140,8 +147,10 @@ pub mod imp {
     //! [`is_debuggable`] genuinely differs (Android reads a JNI flag; Linux reports
     //! `debug_assertions`, which is the closest honest analogue — see its docs).
 
-    use super::policy::{socket_name, MAX_SESSION, MAX_TOKEN_LINE, TOKEN_BYTES};
-    use std::io::{Read, Write};
+    use super::policy::{socket_name, HANDSHAKE_TIMEOUT, MAX_SESSION, MAX_TOKEN_LINE, TOKEN_BYTES};
+    // `Write` is deliberately absent: the only writer here is `serve_hands`'s `write_all`
+    // on a cloned handle, which is behind the `pub` API rather than this module's code.
+    use std::io::Read;
     use std::os::unix::net::{UnixListener, UnixStream};
 
     // ⚠ The abstract-socket constructor lives under a DIFFERENT module path on each
@@ -289,6 +298,13 @@ pub mod imp {
     /// confirm to a scanner that it found a live probe socket; closing silently
     /// makes a wrong guess indistinguishable from a port that is not there.
     ///
+    /// ⚠ **A silent client must not be able to wedge the accept loop.** The loop serves
+    /// one client at a time, so a client that connects and then sends nothing would block
+    /// here forever — and because it also holds the single-threaded accept loop, no later
+    /// client could ever be served. `set_read_timeout` bounds each `read`, and the
+    /// resulting `WouldBlock`/`TimedOut` is treated as "this client is not a client"
+    /// rather than as an error to propagate.
+    ///
     /// ⚠ **Reads ONE BYTE AT A TIME, and that is not laziness — it is the whole
     /// correctness argument.** The token line is followed IMMEDIATELY by kkrpc
     /// frames on the same socket, so any buffered reader here would swallow part of
@@ -305,6 +321,10 @@ pub mod imp {
         buf: &mut String,
     ) -> std::io::Result<ClientOutcome> {
         buf.clear();
+        // ⚠ Set here rather than by the caller: this is the only blocking read in the
+        // probe that is not already bounded (`accept_loop` bounds its own waits), and a
+        // caller that forgot would reintroduce the wedge.
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         let mut byte = [0u8; 1];
         loop {
             match stream.read(&mut byte) {
@@ -370,17 +390,6 @@ pub mod imp {
         Err(last.unwrap_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "no candidate directory")
         }))
-    }
-
-    /// Serve one admitted client by handing its stream to `serve`.
-    ///
-    /// Kept tiny and separate from the accept loop so the loop's error handling
-    /// (which must NOT die on a single bad client) is readable on its own.
-    pub fn serve_admitted<F>(stream: UnixStream, serve: F) -> std::io::Result<()>
-    where
-        F: FnOnce(UnixStream) -> std::io::Result<()>,
-    {
-        serve(stream)
     }
 
     /// Run the accept loop until `should_stop` says otherwise.
@@ -575,14 +584,6 @@ pub mod imp {
             }
         });
         Ok(())
-    }
-
-    /// Flush helper: the token file is small, but an unflushed write would publish
-    /// an empty file that then fails `handshake` for reasons no one can see.
-    pub fn write_all_and_sync(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
     }
 
     /// Serve one admitted client by mounting the REAL `hands.*` handlers on it.
