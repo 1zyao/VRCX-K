@@ -160,4 +160,67 @@ fn main() {
     println!("SERVER session lasted {secs}s");
     client.join().expect("client thread");
     println!("DONE");
+
+    timeout_scenario();
+}
+
+/// ⚠ THE SESSION-TIMEOUT CHECK, on real Linux (#40 review).
+///
+/// The server cap is injected so this does not wait thirty minutes. What is asserted is the
+/// CLIENT's view: after the cap, a read must report EOF. Before the fix, `serve_hands` logged
+/// "dropping the client" and returned, but the `Peer`'s cloned handle plus its parked reader
+/// thread kept the socket open — so the harness saw a live socket that answered nothing, and
+/// `accept_loop` (one client at a time) went on to admit the next one.
+fn timeout_scenario() {
+    use std::io::Read;
+    use std::time::Duration;
+
+    let pid = std::process::id();
+    let name = debug_probe::policy::socket_name(pid.wrapping_add(7_000_000));
+    let addr = {
+        use std::os::linux::net::SocketAddrExt as _;
+        std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).expect("addr")
+    };
+    let listener = std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind");
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        debug_probe::imp::serve_hands_with_timeout(stream, Duration::from_millis(150))
+    });
+
+    let mut client = std::os::unix::net::UnixStream::connect_addr(&addr).expect("connect");
+    // A read timeout so an un-closed socket surfaces as a timeout rather than hanging.
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set_read_timeout");
+
+    // ⚠ DRAIN to EOF rather than reading one byte. `serve_hands` sends `hands.hello`
+    // immediately, so the first bytes are that frame — a single-byte read returns `Ok(1)` on
+    // a healthy connection and would report a false failure. What matters is what happens
+    // AFTER the buffered frames are consumed: EOF (the fix) or a bind-forever timeout (the
+    // bug).
+    let mut buf = [0u8; 4096];
+    let mut total = 0usize;
+    let verdict = loop {
+        match client.read(&mut buf) {
+            Ok(0) => break Ok(total),
+            Ok(n) => total += n,
+            Err(err) => break Err(err),
+        }
+    };
+    server.join().expect("server thread").expect("no io error");
+
+    match verdict {
+        Ok(total) => println!(
+            "TIMEOUT-SCENARIO ok: the socket was CLOSED (EOF) after the cap, \
+             after draining {total} byte(s) of frames"
+        ),
+        Err(err) => {
+            println!(
+                "TIMEOUT-SCENARIO FAILED: {err} after {total} byte(s) — a timed-out read \
+                 means the connection was never closed"
+            );
+            std::process::exit(1);
+        }
+    }
 }

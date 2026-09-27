@@ -610,11 +610,26 @@ pub mod imp {
     /// that lasted ~0s ("connected and vanished") should be visible rather than
     /// indistinguishable from a healthy one.
     pub fn serve_hands(stream: UnixStream) -> std::io::Result<u64> {
+        serve_hands_with_timeout(stream, MAX_SESSION)
+    }
+
+    /// [`serve_hands`] with the session cap injected, so the timeout path can be tested.
+    ///
+    /// ⚠ The split exists because [`MAX_SESSION`] is thirty minutes: a test that had to wait
+    /// for the real value would never run. The production entry point passes the constant,
+    /// so the shipped behaviour is unchanged.
+    pub fn serve_hands_with_timeout(
+        stream: UnixStream,
+        max_session: std::time::Duration,
+    ) -> std::io::Result<u64> {
         use std::time::{Duration, Instant};
 
-        // Two owned handles from one stream: `try_clone` is the only way, and it is what
-        // lets `Peer::new` and `Peer::start_reader` each take ownership.
+        // Three owned handles from one stream: `try_clone` is the only way, and it is what
+        // lets `Peer::new`, `Peer::start_reader` and the timeout path each take ownership.
+        // ⚠ The third one exists so the timeout can actually SHUT THE SOCKET DOWN — see the
+        // `MAX_SESSION` branch below for why returning is not enough.
         let writer = stream.try_clone()?;
+        let shutdown = stream.try_clone()?;
         let reader = stream;
 
         let peer = crate::kkrpc_peer::Peer::new(writer);
@@ -629,8 +644,23 @@ pub mod imp {
                 // and each client gets a fresh Peer, so there is no stale state to clear.
                 return Ok(started.elapsed().as_secs());
             }
-            if started.elapsed() > MAX_SESSION {
-                eprintln!("[debug-probe] session exceeded {MAX_SESSION:?}; dropping the client");
+            if started.elapsed() > max_session {
+                // ⚠ SAYING "dropping the client" IS NOT DROPPING IT (#40 review).
+                //
+                // Returning here only ends THIS function. The `Peer` keeps the socket alive
+                // through its own cloned handle and its reader thread is still parked in
+                // `read_line`, so the connection stays open, the harness sees a live socket
+                // that answers nothing, and `accept_loop` (which serves ONE client at a
+                // time) admits the next one while this one is still attached — the serial
+                // arbitration the design relies on is silently gone.
+                //
+                // Shutting the socket down makes the reader's `read_line` return `Ok(0)`,
+                // which is the same EOF path a normal disconnect takes, so the reader exits
+                // and `link_failure` becomes `Closed` exactly as it would have.
+                let _ = shutdown.shutdown(std::net::Shutdown::Both);
+                eprintln!(
+                    "[debug-probe] session exceeded {max_session:?}; the connection is closed"
+                );
                 return Ok(started.elapsed().as_secs());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1430,5 +1460,71 @@ mod socket_tests {
             "the published token must be exactly the one the handshake compares against"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠ THE REGRESSION for #40 review's "`MAX_SESSION` timeout does not drop the old
+    /// connection".
+    ///
+    /// Returning from `serve_hands` only ends THAT function: the `Peer` keeps the socket
+    /// alive through its own cloned handle, and its reader thread stays parked in
+    /// `read_line`. So the connection stayed open, the harness saw a socket that answered
+    /// nothing, and `accept_loop` — which serves ONE client at a time — went on to admit the
+    /// next one, silently losing the serial arbitration the design relies on.
+    ///
+    /// The assertion is on the CLIENT's view, not on a log line: after the cap, a read on the
+    /// peer must report EOF (0 bytes). A log saying "closed" while the socket lives is
+    /// exactly the failure this pins.
+    #[test]
+    fn the_session_timeout_actually_closes_the_connection() {
+        use std::io::Read;
+        use std::time::Duration;
+
+        let pid = std::process::id();
+        let (listener, name) = bind(pid.wrapping_add(7_000_000)).expect("bind");
+
+        // The server side runs the REAL entry point with a cap short enough to test. The
+        // production `serve_hands` passes `MAX_SESSION` (30 min), which is why the timeout is
+        // injectable at all.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            serve_hands_with_timeout(stream, Duration::from_millis(150))
+        });
+
+        // The client connects, says nothing, and waits past the cap.
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+            .expect("abstract addr");
+        let mut client = std::os::unix::net::UnixStream::connect_addr(&addr).expect("connect");
+        // A read timeout so an un-closed socket surfaces as a timeout instead of hanging.
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+
+        // ⚠ DRAIN to EOF rather than reading one byte. `serve_hands` sends `hands.hello`
+        // immediately, so the first bytes are that frame — a single-byte read returns `Ok(1)`
+        // on a healthy connection and would report a false failure. What matters is what
+        // happens AFTER the buffered frames are consumed: EOF (the fix) or a read timeout
+        // (the bug). Measured on real Linux: 3761 bytes of frames arrive before EOF.
+        let mut buf = [0u8; 4096];
+        let mut total = 0usize;
+        let verdict = loop {
+            match client.read(&mut buf) {
+                Ok(0) => break Ok(total),
+                Ok(n) => total += n,
+                Err(err) => break Err(err),
+            }
+        };
+        server.join().expect("server thread").expect("no io error");
+
+        // ⚠ EOF is the fix; `WouldBlock`/`TimedOut` means the socket is STILL OPEN.
+        match verdict {
+            Ok(total) => assert!(
+                total > 0,
+                "expected the hello frame before EOF, drained nothing"
+            ),
+            Err(err) => panic!(
+                "expected EOF after the session cap, but the read failed with {err} after \
+                 {total} byte(s) — a timed-out read means the connection was never closed"
+            ),
+        }
     }
 }
