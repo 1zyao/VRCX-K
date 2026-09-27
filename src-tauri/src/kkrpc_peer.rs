@@ -340,6 +340,27 @@ fn next_id(prefix: &str) -> String {
 /// (`docs/probes/hand-io/04-binary-framing.mjs`; FINDINGS §5.1). The cost is
 /// changing BOTH ends, not impossibility. The three shapes below exist because we
 /// currently keep the stock codec — not because bytes are impossible here.
+/// Decode a JSON array of byte values, **rejecting** anything that is not one.
+///
+/// ⚠ This replaced a `filter_map(Value::as_u64)`, which silently SKIPPED a non-byte element.
+/// `[1, "x", 2]` therefore decoded to two bytes and reported success: a silently SHORT
+/// chunk, i.e. **data loss reported as a clean read** — the worst shape for a file
+/// primitive, and inconsistent with the object-shaped branch, which already rejected
+/// strictly. Both array-shaped branches now share this rule.
+///
+/// The `<= u8::MAX` bound matters for the same reason: `300 as u8` is `44`, so an
+/// out-of-range byte used to become a *different valid byte* rather than an error.
+fn decode_byte_sequence(entries: &[Value], what: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry.as_u64() {
+            Some(byte) if byte <= u64::from(u8::MAX) => bytes.push(byte as u8),
+            _ => return Err(format!("{what} carries a non-byte element: {entry}")),
+        }
+    }
+    Ok(bytes)
+}
+
 fn decode_chunk(value: Option<&Value>) -> Result<Vec<u8>, String> {
     let Some(value) = value else {
         return Err("stream frame carries no value".into());
@@ -349,23 +370,25 @@ fn decode_chunk(value: Option<&Value>) -> Result<Vec<u8>, String> {
             .decode(encoded)
             .map_err(|error| format!("bad base64 chunk: {error}")),
         // Node Buffer: {"type":"Buffer","data":[byte,…]}
-        Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("Buffer") => map
-            .get("data")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(Value::as_u64)
-                    .map(|byte| byte as u8)
-                    .collect::<Vec<u8>>()
-            })
-            .ok_or_else(|| "Buffer-shaped chunk has no data array".to_string()),
+        Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("Buffer") => {
+            let entries = map
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "Buffer-shaped chunk has no data array".to_string())?;
+            decode_byte_sequence(entries, "Buffer-shaped chunk")
+        }
         // Uint8Array: {"0":byte,"1":byte,…}. Keys are contiguous by construction.
         Value::Object(map) => {
             let mut bytes = Vec::with_capacity(map.len());
             for index in 0..map.len() {
                 match map.get(&index.to_string()).and_then(Value::as_u64) {
-                    Some(byte) => bytes.push(byte as u8),
+                    Some(byte) if byte <= u64::from(u8::MAX) => bytes.push(byte as u8),
+                    Some(byte) => {
+                        return Err(format!(
+                            "unrecognised stream value shape: byte map key {index} is out of \
+                             range ({byte})"
+                        ))
+                    }
                     None => {
                         return Err(format!(
                             "unrecognised stream value shape: object is not a \
@@ -376,11 +399,7 @@ fn decode_chunk(value: Option<&Value>) -> Result<Vec<u8>, String> {
             }
             Ok(bytes)
         }
-        Value::Array(entries) => Ok(entries
-            .iter()
-            .filter_map(Value::as_u64)
-            .map(|byte| byte as u8)
-            .collect()),
+        Value::Array(entries) => decode_byte_sequence(entries, "stream array chunk"),
         other => Err(format!(
             "unrecognised stream value shape: {}",
             match other {
@@ -2214,6 +2233,37 @@ mod tests {
         // correctly; the cost is recorded, not hidden.
         let decoded = decode_chunk(Some(&json!({ "0": 90, "1": 91 }))).expect("decode");
         assert_eq!(decoded, vec![90u8, 91]);
+    }
+
+    /// ⚠ THE REGRESSION for #40 review's "silently drops illegal elements".
+    ///
+    /// `filter_map(Value::as_u64)` SKIPPED anything that was not a `u64`, so a chunk
+    /// carrying `[65, "x", 66]` decoded to `b"AB"` and reported success — a silently
+    /// SHORT chunk, i.e. **data loss reported as a clean read**. The object-shaped
+    /// branch already rejected strictly, so the two disagreed about the same input.
+    #[test]
+    fn a_buffer_chunk_with_a_non_byte_element_is_refused_not_shortened() {
+        let error = decode_chunk(Some(&json!({ "type": "Buffer", "data": [65, "x", 66] })))
+            .expect_err("a non-byte element must fail, not be dropped");
+        assert!(error.contains("non-byte"), "got: {error}");
+    }
+
+    #[test]
+    fn an_array_chunk_with_a_non_byte_element_is_refused_not_shortened() {
+        // Same rule for the bare-array shape.
+        let error =
+            decode_chunk(Some(&json!([65, null, 66]))).expect_err("a non-byte element must fail");
+        assert!(error.contains("non-byte"), "got: {error}");
+    }
+
+    /// ⚠ An out-of-range value used to become a DIFFERENT VALID BYTE: `300 as u8 == 44`.
+    /// A truncating cast is the same silent-corruption shape as dropping an element.
+    #[test]
+    fn an_out_of_range_byte_is_refused_instead_of_wrapping() {
+        let error = decode_chunk(Some(&json!([300]))).expect_err("300 must not silently become 44");
+        assert!(error.contains("non-byte"), "got: {error}");
+        let error = decode_chunk(Some(&json!({ "0": 300 }))).expect_err("300 must not wrap");
+        assert!(error.contains("out of range"), "got: {error}");
     }
 
     #[test]

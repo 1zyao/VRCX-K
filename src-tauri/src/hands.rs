@@ -490,12 +490,16 @@ fn register_list(peer: &Arc<Peer>) {
             let path = str_arg(&args, 0);
             let opts = args.get(1).cloned().unwrap_or_else(|| json!({}));
             // Batch size is a caller choice, bounded so a single frame cannot
-            // grow without limit.
-            let batch = opts
-                .get("batch")
-                .and_then(Value::as_u64)
-                .unwrap_or(STAT_PREVIEW_MAX as u64)
-                .clamp(1, 4096) as usize;
+            // grow without limit. ⚠ A present-but-wrong type is REFUSED rather than
+            // silently replaced by the default — see `opt_u64`.
+            let batch = match opt_u64(&opts, "batch", "hands.list") {
+                Ok(value) => value.unwrap_or(STAT_PREVIEW_MAX as u64),
+                Err(error) => {
+                    reply.fail(error);
+                    return;
+                }
+            }
+            .clamp(1, 4096) as usize;
 
             // The not-a-directory check lives in `DirectoryReader::open`, so it
             // cannot be skipped by a second caller. Doing it again here would be
@@ -594,7 +598,15 @@ fn register_read(peer: &Arc<Peer>) {
         Arc::new(move |reply: DeferredReply, args: Vec<Value>| {
             let path = str_arg(&args, 0);
             let opts = args.get(1).cloned().unwrap_or_else(|| json!({}));
-            let offset = opts.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            // ⚠ Same rule as `hands.write`'s offset: present-but-wrong type is refused,
+            // absent means 0. `{offset: "5"}` used to resume from 0 and look like it worked.
+            let offset = match opt_u64(&opts, "offset", "hands.read") {
+                Ok(value) => value.unwrap_or(0),
+                Err(error) => {
+                    reply.fail(error);
+                    return;
+                }
+            };
 
             match FileReader::open(&path, offset) {
                 Ok(reader) => {
@@ -1131,10 +1143,14 @@ fn register_watch(peer: &Arc<Peer>) {
         Arc::new(move |reply: DeferredReply, args: Vec<Value>| {
             let path = str_arg(&args, 0);
             let opts = args.get(1).cloned().unwrap_or_else(|| json!({}));
-            let recursive = opts
-                .get("recursive")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            // ⚠ `{recursive: "yes"}` used to mean "non-recursive" and report success.
+            let recursive = match opt_bool_strict(&opts, "recursive", "hands.watch") {
+                Ok(value) => value.unwrap_or(false),
+                Err(error) => {
+                    reply.fail(error);
+                    return;
+                }
+            };
 
             match FileWatcher::start(&path, recursive) {
                 Ok(watcher) => {
@@ -1578,6 +1594,42 @@ fn str_arg(args: &[Value], index: usize) -> String {
         .to_string()
 }
 
+/// Read an optional integer option, **refusing** a present-but-wrong type.
+///
+/// ⚠ The distinction this exists to preserve: an ABSENT option means "use the default",
+/// which is legitimate and must keep working. A PRESENT option of the wrong type is a
+/// caller mistake and must be refused — `unwrap_or(default)` conflates the two, so
+/// `{batch: "8"}` silently used the default while looking like it had asked for 8.
+///
+/// `hands.write`'s `offset` already refused this way; three other sites did not, which
+/// made the same PR disagree with itself about the same kind of input. This is that rule,
+/// in one place, so the next option cannot be added with the lenient spelling by accident.
+fn opt_u64(opts: &Value, key: &str, method: &str) -> Result<Option<u64>, String> {
+    match opts.get(key) {
+        // ⚠ `null` counts as absent: JSON has no "undefined", and a client that
+        // serialises an optional field as `null` means the same thing as omitting it.
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            encode_error(
+                Code::Unsupported,
+                format!("{method}: `{key}` must be a non-negative integer, got {value}"),
+            )
+        }),
+    }
+}
+
+/// Same rule as [`opt_u64`], for a boolean option.
+fn opt_bool_strict(opts: &Value, key: &str, method: &str) -> Result<Option<bool>, String> {
+    match opts.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(value) => Err(encode_error(
+            Code::Unsupported,
+            format!("{method}: `{key}` must be a boolean, got {value}"),
+        )),
+    }
+}
+
 /// `notify` hands back its own error type; only the io-ish part is useful here.
 fn classify_anyhow(error: &notify::Error) -> Code {
     match error.kind {
@@ -1790,6 +1842,58 @@ impl DeferredReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⚠ THE REGRESSION for #40 review's "silent fallback on a type error".
+    ///
+    /// The distinction that matters: ABSENT means "use the default" (legitimate, and must
+    /// keep working); PRESENT-BUT-WRONG-TYPE is a caller mistake and must be refused.
+    /// `unwrap_or(default)` conflated them, so `{batch: "8"}` looked like it asked for 8
+    /// while actually using the default — a caller cannot tell that from success.
+    ///
+    /// `hands.write`'s `offset` already refused; these three did not, so the same PR
+    /// disagreed with itself about the same kind of input.
+    #[test]
+    fn an_absent_option_uses_the_default_but_a_wrong_typed_one_is_refused() {
+        // Absent ⇒ default. This half must not regress into a refusal.
+        assert_eq!(opt_u64(&json!({}), "batch", "hands.list"), Ok(None));
+        // ⚠ `null` is the JSON spelling of "not provided" and must behave as absent.
+        assert_eq!(
+            opt_u64(&json!({ "batch": null }), "batch", "hands.list"),
+            Ok(None)
+        );
+        assert_eq!(
+            opt_u64(&json!({ "batch": 8 }), "batch", "hands.list"),
+            Ok(Some(8))
+        );
+
+        // Present but wrong type ⇒ refuse, and NAME the option in the message so the
+        // caller knows which field to fix.
+        let error = opt_u64(&json!({ "batch": "8" }), "batch", "hands.list")
+            .expect_err("a string batch must be refused, not silently defaulted");
+        assert!(error.contains("batch"), "got: {error}");
+        assert!(error.contains("non-negative integer"), "got: {error}");
+        // A negative number is not a `u64`, so it lands here too rather than wrapping.
+        let error = opt_u64(&json!({ "offset": -1 }), "offset", "hands.read")
+            .expect_err("a negative offset must be refused");
+        assert!(error.contains("offset"), "got: {error}");
+    }
+
+    #[test]
+    fn a_wrong_typed_boolean_option_is_refused() {
+        assert_eq!(
+            opt_bool_strict(&json!({}), "recursive", "hands.watch"),
+            Ok(None)
+        );
+        assert_eq!(
+            opt_bool_strict(&json!({ "recursive": true }), "recursive", "hands.watch"),
+            Ok(Some(true))
+        );
+        // `{recursive: "yes"}` used to mean "non-recursive" and report success.
+        let error = opt_bool_strict(&json!({ "recursive": "yes" }), "recursive", "hands.watch")
+            .expect_err("a string recursive must be refused");
+        assert!(error.contains("recursive"), "got: {error}");
+        assert!(error.contains("boolean"), "got: {error}");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

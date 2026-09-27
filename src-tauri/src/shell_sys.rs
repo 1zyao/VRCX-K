@@ -1327,11 +1327,19 @@ mod tests {
     /// the ordinary `cargo test` loop on every platform. Same signal, no longer
     /// dependent on remembering to look.
     ///
-    /// ⚠ What a test like this cannot do is notice a helper that is MISSING from
-    /// the list, so it asserts the list in the source note is exactly the set of
-    /// `#[cfg(desktop)]` items it discovers. Adding a desktop-only helper
-    /// therefore fails until the gate and the note are updated together — which is
-    /// the habit the warning used to protect.
+    /// ⚠ A test like this must check BOTH directions, and for a while this one did not.
+    /// Walking only NAMED → gated leaves an unlisted helper invisible: the list could rot
+    /// silently while the test stayed green — the exact "single source of truth" failure
+    /// it exists to prevent. It now also walks gated → NAMED, so adding a desktop-only
+    /// helper fails until the gate and the note are updated together.
+    ///
+    /// ⚠ Two traps in that reverse walk, both hit while writing it:
+    ///   1. **`#[cfg(desktop)]` is not the same as desktop-only.** An item defined TWICE —
+    ///      once under `#[cfg(desktop)]` and once under `#[cfg(not(desktop))]` — exists on
+    ///      mobile too, so it must NOT be required in NAMED (e.g. `WINDOW_ACTIONS`, whose
+    ///      mobile variant is a shorter list). The first version accused it.
+    ///   2. **Only `fn`/`const` count as helpers.** `#[cfg(desktop)] use tauri_plugin_deep_link::…`
+    ///      is an import; the first version accused it too.
     #[test]
     fn the_desktop_only_helpers_are_gated_and_listed() {
         // Read our own source as TEXT: the property is about the file, and no
@@ -1401,6 +1409,86 @@ mod tests {
                 "`{name}` is desktop-only but not `#[cfg(desktop)]`-gated, so on \
                  mobile it compiles with no caller and `clippy -D warnings` fails \
                  the mobile build with `never used`"
+            );
+        }
+
+        // ⚠ THE REVERSE DIRECTION, which the doc-comment above claimed but the test did
+        // not implement. Everything above walks NAMED → gated, so a `#[cfg(desktop)]`
+        // item that was never added to NAMED was invisible: the list could rot silently
+        // while the test stayed green. That is precisely the "single source of truth"
+        // failure this test exists to prevent.
+        //
+        // This walks gated → NAMED: every desktop-ONLY item must appear in NAMED.
+        //
+        // ⚠ "desktop-only" is not the same as "carries #[cfg(desktop)]". An item defined
+        // TWICE — once under `#[cfg(desktop)]` and once under `#[cfg(not(desktop))]` —
+        // exists on mobile too (e.g. `WINDOW_ACTIONS`, whose mobile variant is a shorter
+        // list), so it is legitimately absent from NAMED. The first version of this check
+        // missed that distinction and accused `WINDOW_ACTIONS` of being unlisted; that was
+        // a bug in the check, not a gap in the list.
+        /// The item name declared immediately after the first attribute at `start`,
+        /// skipping further attributes and doc comments. `None` when the attribute gates
+        /// something that is not a `fn`/`const` (a `use` import, a `mod`, …).
+        ///
+        /// ⚠ The `fn`/`const` restriction matters: `#[cfg(desktop)] use tauri_plugin_deep_link::…`
+        /// is an IMPORT, not a desktop-only helper, and an earlier version of this walk
+        /// accused it of being unlisted.
+        fn item_after(lines: &[&str], start: usize) -> Option<String> {
+            for candidate in lines.iter().skip(start + 1) {
+                let trimmed = candidate.trim_start();
+                if trimmed.starts_with("#[") || trimmed.starts_with("//") || trimmed.is_empty() {
+                    continue;
+                }
+                if !(trimmed.starts_with("fn ") || trimmed.starts_with("const ")) {
+                    return None;
+                }
+                return trimmed
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .nth(1)
+                    .map(str::to_string);
+            }
+            None
+        }
+
+        let mut gated_names: Vec<String> = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("#[cfg(desktop)]") {
+                if let Some(name) = item_after(&lines, index) {
+                    gated_names.push(name);
+                }
+            }
+        }
+
+        // Every name that has its OWN `#[cfg(not(desktop))]` definition — those items
+        // exist on mobile too, so they are not desktop-only and must not be required here.
+        let mut mobile_names: Vec<String> = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("#[cfg(not(desktop))]") {
+                if let Some(name) = item_after(&lines, index) {
+                    mobile_names.push(name);
+                }
+            }
+        }
+
+        // Anti-vacuous: if the walk found nothing, the assertions below would pass for
+        // the wrong reason (an empty set is trivially consistent).
+        assert!(
+            !gated_names.is_empty(),
+            "no `#[cfg(desktop)]` items were discovered, so the reverse check would \
+             pass without looking at anything — the walk above is broken"
+        );
+
+        for name in &gated_names {
+            // An item defined both ways is not desktop-only: `WINDOW_ACTIONS` has a
+            // shorter mobile variant, so it legitimately stays out of NAMED.
+            if mobile_names.contains(name) {
+                continue;
+            }
+            assert!(
+                NAMED.contains(&name.as_str()),
+                "`{name}` is desktop-only (`#[cfg(desktop)]` with no mobile counterpart) but \
+                 is MISSING from the NAMED list above. That list is meant to be the complete \
+                 set of desktop-only helpers, so add it (and the note) together."
             );
         }
     }
