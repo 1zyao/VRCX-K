@@ -54,6 +54,10 @@ function Get-RegistryExport([string]$Key, [string]$Path) {
 # 变成脚本崩溃 —— 那样后面的断言就全跑不到、失败清单也不完整。统一走这个安全取值。
 function Get-RegValue([string]$Key, [string]$Name) {
   if (-not (Test-Path $Key)) { return $null }
+  # 默认值在 PowerShell 注册表提供程序里的名字是字面量 '(default)'；**空字符串会直接绑定失败**
+  # （`Get-ItemProperty -Name ''`），而这个异常会在 ErrorActionPreference=Stop 下中断整个脚本 ——
+  # 本地那次键不存在、这条分支没走到，所以是 CI 上第一次真正取默认值时才炸出来的。
+  if ([string]::IsNullOrEmpty($Name)) { $Name = '(default)' }
   $item = Get-ItemProperty -Path $Key -Name $Name -ErrorAction SilentlyContinue
   if ($null -eq $item) { return $null }
   $property = $item.PSObject.Properties[$Name]
