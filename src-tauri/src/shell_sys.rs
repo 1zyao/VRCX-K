@@ -434,6 +434,20 @@ pub enum SchemeClaim {
     Absent,
     /// Something is registered **and it is this very executable**: re-registering is a
     /// no-op and removing it is our own undo.
+    ///
+    /// ⚠ `allow(dead_code)` is deliberate, platform-scoped, and load-bearing — the lint is
+    /// denied crate-wide, and it **did** fail CI (ubuntu's `clippy -D warnings`) the first
+    /// time this landed:
+    ///
+    ///   - only the **Windows** probe can construct `Ours`: it reads
+    ///     `Software\Classes\<scheme>\shell\open\command` and compares it with our own path;
+    ///   - every other desktop reports an existing handler as [`SchemeClaim::Foreign`],
+    ///     because those platforms expose no way to tell *whose* it is.
+    ///
+    /// Deleting the variant is not an option: the Windows build constructs it, and the
+    /// verdict's truth table is unit-tested on all platforms. So the honest statement is
+    /// "part of the contract here, never built on this target".
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Ours,
     /// Something is registered and we cannot show it is ours; the string is what the OS
     /// reports as the current handler, so the error text can name it.
