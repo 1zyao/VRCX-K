@@ -494,16 +494,30 @@ pub fn run() {
             // owns what a URL MEANS (log in, join an instance); the shell only
             // proves it arrived.
             //
-            // ⚠ This hook is currently UNREACHABLE, so it is the intended
-            // consumer for the day a scheme is chosen — not a working delivery
-            // path today. On Windows/Linux the emission is the config-gated
-            // `handle_cli_arguments` described on `init()` above, and no scheme
-            // is declared in `tauri.conf.json`. Registering one at runtime via
-            // `shell.deepLink.register` does NOT change that: the plugin's own
-            // docs say dynamic schemes "WON'T be processed" there. On macOS the
-            // plugin uses `RunEvent::Opened` instead (which does not read the
-            // config), but the bundle only advertises URL types the config
-            // declares, so the OS still has nothing to deliver.
+            // ⚠ Since issue #41 a scheme IS declared
+            // (`plugins.deep-link.desktop.schemes = ["vrcxk"]`), so on Windows/Linux the
+            // emission is the config-gated `handle_cli_arguments` and on macOS it is
+            // `RunEvent::Opened`. Before that the hook was wired but unreachable: the plugin's
+            // docs are explicit that dynamically registered schemes "WON'T be processed"
+            // there, so a runtime `register` could never have made it fire.
+            // ⚠ THE HOOK ALONE IS NOT ENOUGH ON WINDOWS/LINUX — the URL that LAUNCHED the app
+            // arrives before this listener exists, and is emitted into nothing:
+            //
+            //   - Tauri runs every plugin's `setup` inside `Builder::build()`
+            //     (`tauri-2.11.5/src/app.rs:2440` → `initialize_plugins`), and the deep-link
+            //     plugin's `init_deep_link` calls `handle_cli_arguments` there — which on
+            //     Windows/Linux parses argv and does `emit("deep-link://new-url", …)`
+            //     (`tauri-plugin-deep-link-2.4.10/src/lib.rs:75-81`, `:196-222`);
+            //   - THIS closure runs later (`app.rs:2521` → `setup(app)` → `app.setup.take()`).
+            //
+            // So a cold-start `vrcxk://…` fires into an empty listener set and is lost —
+            // measured: on Windows the app started, the host came up, and no URL ever arrived,
+            // while the same URL worked whenever the app was already running. macOS is
+            // unaffected because it uses `RunEvent::Opened` (after setup) instead of argv.
+            //
+            // `get_current()` is the plugin's own answer to this: it holds the URLs that
+            // triggered the launch. Draining it right after registering the listener makes the
+            // two orders equivalent, and it is harmless when nothing triggered the app.
             #[cfg(desktop)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt as _;
@@ -513,6 +527,17 @@ pub fn run() {
                         event.urls().iter().map(|url| url.to_string()).collect();
                     forward_deep_link(&deeplink_handle, urls);
                 });
+                let launch_handle = app.handle().clone();
+                match app.deep_link().get_current() {
+                    Ok(Some(urls)) if !urls.is_empty() => {
+                        forward_deep_link(
+                            &launch_handle,
+                            urls.iter().map(|url| url.to_string()).collect(),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => eprintln!("[shell] deep link get_current: {err}"),
+                }
             }
             let handle = app.handle().clone();
             std::thread::spawn(move || {
