@@ -315,24 +315,48 @@ Against that: `HKCU\Software\Classes\vrcx` (the incumbent VRCX's own class key, 
 `reg export` 5 times across install / cold / warm / failed attempts) was **identical throughout** — the
 install writes only `HKCU\Software\Classes\vrcxk`, and the runtime gate is bounded to the declared name.
 
-### 7.1 ⚠ Two things Windows still does NOT verify, and one environment trap
+### 7.1 ⚠ Two things Windows still does NOT verify, and the measured reason why
 
-1. **The installer's own registry write.** On this machine an installer started from the agent session
-   cannot write even its own temp file (`Error writing temporary file`); with the target inside the
-   workspace the payload installs but **every `WriteRegStr` silently no-ops** (not even the standard
-   `Uninstall\vrcx-k` entry appears), while `pwsh`/`cmd` perform the same writes fine. ⚠ **This is not
-   our packaging**: a **20-line NSIS installer built with the same makensis** reproduces it exactly,
-   and another **unsigned NSIS installer on the same machine** (a .NET/CefSharp product, 148.7 MiB)
-   *did* install successfully — so it is neither "NSIS is broken" nor "unsigned installers are blocked".
-   The remaining question is *which* context blocks it (the agent session's process tree, or the HIPS
-   product installed on the machine); it is orthogonal to the product code.
+1. **The installer's own file and registry writes.** Measured on this machine, and reduced to a clean
+   asymmetry — **same context, same operations, different binary** (all runs launched the way a user
+   does, through Explorer, in the logged-in session at High integrity, outside the agent's process tree):
+
+   | actor | `mkdir` on C: | write a 6.9 MB `.exe` to C: | write `HKCU\Software\Classes\…` |
+   |---|---|---|---|
+   | `cmd` (Microsoft-signed) | ✅ | ✅ | ✅ |
+   | our freshly built, **unsigned** NSIS installer | ❌ | ❌ (exits 0 having written nothing) | ❌ (silent no-op) |
+
+   Supporting measurements, each ruling out one explanation:
+   - **Not our packaging**: a **20-line NSIS installer built with the same makensis** behaves identically,
+     and `tauri build --bundles nsis` produced a byte-valid installer that installs **completely** when
+     its target is on **D:** (`tauri-app.exe`, `host.exe`, `cordis.yml`, `plugins/`, `uninstall.exe` all
+     present) while writing **nothing** to the same relative path on **C:**.
+   - **Not a path or ACL problem**: in the *same* context `cmd` creates the directory, writes the very
+     same 6.9 MB executable there, and creates the class key.
+   - **Not "NSIS is broken here"**: another **unsigned NSIS installer** (a .NET/CefSharp product,
+     148.7 MiB) *did* install on this machine.
+   - **Not the agent's sandbox**: the DSH file policy for the session was `danger-full-access` and the
+     failures reproduce in a plain Explorer-launched session.
+   - The machine runs two third-party **kernel file-system filters**: Huorong's `sysdiag`
+     (altitude 324600, 7 instances) and `EasyAntiCheat_EOSSys` (both C: and D:). A **per-binary** rule in
+     such a product — "unknown program modifies the system drive / a file association" — produces exactly
+     this shape. ⚠ Huorong's own `hips.db` had **0 rows** and its `applog.db` only *recorded that our
+     binaries ran*, so its UI log does **not** show this class of denial: absence of a log entry here is
+     not evidence of absence.
+   - **This also blocked producing the fallback**: WiX's `light.exe` cannot build the MSI here — it dies
+     in .NET's `TempFileCollection.CreateTempDirectoryWithAce` (`access denied` / `1314 a required
+     privilege is not held`), the same "create a temp dir *with a security descriptor*" step that the
+     MSVC linker and the NSIS stub fail at.
+
+   ⇒ The uninstall-path criterion therefore needs a machine without that block: **CI (`windows-latest`)
+   or another Windows box**. Nothing about it is product code.
 2. **`NSIS_HOOK_POSTUNINSTALL` at runtime.** The hook is compiled into the installer (read out of the
    rendered `.nsi`) and a packaging test ties every declared scheme to its `DeleteRegKey` (fault-injected
    to prove it fails when the cleanup is removed) — but no real uninstall has been run, because of (1).
-3. ⚠ **A false "the host never started"**: the host log lives under `%LOCALAPPDATA%\<identifier>\logs`,
-   and the agent session's process tree could not write there, so the same binary that logs fine when a
-   human launches it looked like it never started. Assert on a channel the launcher's own context owns,
-   or launch it the way a user would.
+3. ⚠ **A false "the host never started" — also a per-binary effect, not a path one.** The host log lives
+   under `%LOCALAPPDATA%\<identifier>\logs`; when the app was launched from the agent's tree the same
+   binary wrote no log, and when a human launched it the log appeared. Same lesson as (1): assert on a
+   channel the launcher's own context owns, or launch it the way a user would.
 
 
 
