@@ -348,11 +348,32 @@ install writes only `HKCU\Software\Classes\vrcxk`, and the runtime gate is bound
      privilege is not held`), the same "create a temp dir *with a security descriptor*" step that the
      MSVC linker and the NSIS stub fail at.
 
-   ⇒ The uninstall-path criterion therefore needs a machine without that block: **CI (`windows-latest`)
-   or another Windows box**. Nothing about it is product code.
-2. **`NSIS_HOOK_POSTUNINSTALL` at runtime.** The hook is compiled into the installer (read out of the
-   rendered `.nsi`) and a packaging test ties every declared scheme to its `DeleteRegKey` (fault-injected
-   to prove it fails when the cleanup is removed) — but no real uninstall has been run, because of (1).
+   ⇒ The uninstall-path criterion therefore needs a machine without that block. **Done — in CI**, and
+   that is now the durable home for it: `.github/workflows/installer-acceptance.yml` builds the NSIS
+   bundle on `windows-latest` and runs `scripts/installer-acceptance.ps1`
+   (manual / weekly / only when packaging or hook files change). First green run **36462916457**:
+
+   ```
+   installer exit code: 0
+   PASS: 自有类键 HKCU\Software\Classes\vrcxk 出现
+     shell\open\command = "C:\Users\runneradmin\AppData\Local\vrcx-k\tauri-app.exe" "%1"
+   PASS: 命令串指向安装出来的 exe / 安装目录里确实有那个 exe 文件 / 带 URL Protocol 值
+   PASS: 安装器写了 Uninstall 条目（Install 段跑到了底）
+   PASS: 安装后，别人的 vrcx 类键逐字节未变
+   uninstaller exit code: 0
+   PASS: 卸载后自有类键 HKCU\Software\Classes\vrcxk 确实被删（acceptance criterion）
+   PASS: 卸载后 Uninstall 条目也不在了
+   PASS: 卸载后，别人的 vrcx 类键仍然逐字节未变
+   ### VERDICT: all assertions passed ###
+   ```
+
+   ⚠ The script guards one **false green** on purpose: if the install phase never wrote the key, it
+   records the uninstall assertion as **"cannot verify" (FAIL)** instead of letting "the key is absent"
+   pass vacuously — that is the same trap this session hit twice elsewhere.
+2. **`NSIS_HOOK_POSTUNINSTALL` at runtime — now verified** (the `PASS` above, on a real Windows runner):
+   the hook is compiled into the installer (read out of the rendered `.nsi`), a packaging test ties every
+   declared scheme to its `DeleteRegKey` (fault-injected), and the CI run above shows the key actually
+   disappearing after a real uninstall while the foreign key stays byte-identical.
 3. ⚠ **A false "the host never started" — also a per-binary effect, not a path one.** The host log lives
    under `%LOCALAPPDATA%\<identifier>\logs`; when the app was launched from the agent's tree the same
    binary wrote no log, and when a human launched it the log appeared. Same lesson as (1): assert on a
