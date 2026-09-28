@@ -213,7 +213,78 @@ that is gap ④, and it is why this harness cannot exist without patching the tr
    in fact succeeded four lines earlier (`Finished release … Finished 1 bundle at: …`). A path bug
    in the harness read exactly like a build failure.
 2. ⚠ **A `PASS` on the LaunchServices claim can be inherited from an earlier run**: the freshly
-   built app had already been auto-registered by macOS, so the claim check passed even in the run
+   built app had already been auto-registered by macOS, so the claim claim check passed even in the run
    where the harness was looking at the wrong path. Assert on the app side (Web 6) as well, or the
    claim check alone can be satisfied by a stale registration.
+
+## 6. The REAL name, with BOTH halves — and the cold-start defect it exposed
+
+`run-real-name.sh` is the acceptance run for the declared name: it patches **nothing** (the tree
+declares `vrcxk` and the host's own `ctx.deepLink` logs arrivals), so what it measures is production
+wiring. It needs a tree carrying **both** the shell change and the host consumer.
+
+### 6.1 First run: the cold start did nothing — and the reason was NOT delivery
+
+```
+PASS: Info.plist declares vrcxk
+PASS: LaunchServices claims vrcxk
+COLD START (app not running, the URL launches it):
+    [host] ready 15:37:29.256
+    (no deepLink.opened)
+FAIL: the cold-start URL never reached the host
+WARM:  PASS — [host] deepLink.opened vrcxk://world/wrld_2
+```
+
+A temporary file-based diagnostic inside the shell settled where it was lost, because a bundled
+app's stderr goes nowhere:
+
+```
+[forward_deep_link] urls=["vrcxk://user/usr_1"] peer=true      ← the shell DID get the URL…
+[replay] batches=0 dropped=0 peer=true                          ← …with the peer already up, so nothing was queued
+```
+
+⇒ The URL took the **"delivered"** path. The loss was **host-side and structural**: `expose` is
+registered in `connectShellStdio()`, but the service that consumes `deepLink.opened`
+(`ctx.deepLink`) attaches **after** `await shell.ready(...)`. A notification landing in that window
+was emitted into an **empty handler set** and vanished silently — the shell-side replay queue cannot
+help, because it only engages when there is no peer at all.
+
+**Fix (host PR):** `fanout(..., { retainUntilSubscribed: true })` — the deep-link notification keeps
+its newest value in **one slot** until the first subscriber arrives, then hands it over once. Only
+deep links opt in: a URL is still a valid intent seconds later, whereas a tray click or hotkey press
+is a momentary input (replaying one after startup could fire an action the user has moved past).
+
+### 6.2 After the fix — all assertions pass
+
+```
+########## 4. COLD START — no app running, the URL launches it ##########
+opened vrcxk://user/usr_1 at 23:42:13 with the app NOT running
+    2026-09-28T15:42:15.523Z [host] ready {…}
+    2026-09-28T15:42:15.526Z [host] deepLink.opened vrcxk://user/usr_1
+PASS: the cold-start URL reached the host (production consumer, nothing patched)
+
+########## 5. WARM — the app is running, a second URL arrives ##########
+PASS: a second activation reached the host while the app was running
+    2026-09-28T15:42:15.526Z [host] deepLink.opened vrcxk://user/usr_1
+    2026-09-28T15:42:24.336Z [host] deepLink.opened vrcxk://world/wrld_2
+
+### VERDICT: all assertions passed ###
+```
+
+⚠ **Read the timing, it is the evidence**: the URL line lands **3 ms after `ready`** — i.e. it was
+handed over by the retention slot, not delivered live (a live delivery would have been logged while
+the host was still booting, and before the consumer existed).
+
+### 6.3 Two traps that cost a whole round each
+
+1. ⚠ **Running this against the SHELL branch alone produces a false failure — and a misleading one.**
+   With no `ctx.deepLink` in the tree, the URL *is* delivered and simply leaves no trace, so the
+   output reads exactly like "delivery is broken" (it even matches the pre-#41 symptom). Check
+   `grep -q deepLinks.attachShell <tree>/host/src/index.ts` first; the script now does.
+2. ⚠ **The macOS cold-start URL arrives LATE — after `ready`.** Measured twice (15:32:44 ready for a
+   15:32:42 open; and the run above). The shell-side queue therefore does **not** cover the macOS cold
+   start; what covers it is the host-side retention above. The queue remains the mechanism for the
+   windows where the peer genuinely does not exist yet (host restart, and platforms that deliver the
+   URL at process start rather than ~2 s later).
+
 

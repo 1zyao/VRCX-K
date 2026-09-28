@@ -234,6 +234,11 @@ issue 的验收标准要求「若写 `schemes`：macOS 上一条真机验证」�
 ⚠ **两条必须写在结论旁边的限定**：
 
 1. 用的是**临时 scheme 名**（真名仍待裁定），所以这一条证明的是**链路**，不是**名字**。
+   —— 真名 `vrcxk` 的验收后来补做了，见 `docs/probes/mac-deeplink/run-real-name.sh` 与 FINDINGS §6：
+   内置 `.app` 带 `CFBundleURLTypes=vrcxk`、LaunchServices 认领、**冷启动与热启动都到达宿主**。
+   ⚠ 真名验收还**暴露并修掉了一个真实缺陷**：宿主侧「expose 已注册、消费方尚未订阅」的窗口会把通知
+   丢进空的 handler 集合（`fanout` 现在为 deepLink 保留最新一条，交给第一个订阅者）。这一条**不是**
+   壳侧队列能覆盖的 —— 当时 `peer=true`，走的是「已投递」分支。
 2. 「宿主收到」是靠**临时插进 `host/src/index.ts` 的一行日志**观测到的 —— 因为产品今天**没有**
    `deepLink` 消费方（那正是缺口④）。⇒ 这条验证**恰好演示了④为什么必须落地**：没有消费方，
    URL 到达与否在产品里根本不可观测。
@@ -262,7 +267,34 @@ issue 的验收标准要求「若写 `schemes`：macOS 上一条真机验证」�
 
 **第 2 步**
 
-8. 脸的「本应用认领了哪些 scheme」+ 撤销入口（(c) 的 UI 部分）。
+9. 脸的「本应用认领了哪些 scheme」+ 撤销入口（(c) 的 UI 部分）。
+
+### 6.1 落地现状（2026-09-28，三个 PR）
+
+| PR | 内容 | 覆盖裁定 | 状态 |
+|---|---|---|---|
+| [#44](https://github.com/VRChatCN-Kipfel/VRCX-K/pull/44) | 本文档 + `docs/probes/mac-deeplink/`（机制探针、真实应用探针、**真名验收探针**） | 裁定记录 | CI 绿 |
+| [#45](https://github.com/VRChatCN-Kipfel/VRCX-K/pull/45) | 壳：声明 `vrcxk`、归属探测 + 声明白名单门、`unregister` 路由、未投递队列、**NSIS 卸载清理**（第 0 步 1–4 与第 1 步 6–7 的 NSIS 侧） | ①②③(NSIS 侧)④(壳侧) | CI 绿 |
+| [#46](https://github.com/VRChatCN-Kipfel/VRCX-K/pull/46) | 宿主：`ctx.deepLink` 消费方、`HostWsAPI.deepLink` 注销入口、契约登记、**通知保留槽**（第 1 步 8 + 缺口④） | ②(宿主/脸侧)④(宿主侧) | CI 绿 |
+
+⚠ **两条与原计划不同的实测结论**（详见 §5.5 与 `docs/probes/mac-deeplink/FINDINGS.md` §6）：
+
+1. **macOS 的冷启动 URL 是「晚到」的** —— 它在 `ready` **之后**才到壳（实测两次）。所以壳侧
+   未投递队列**不覆盖 macOS 冷启动**；覆盖它的是**宿主侧的通知保留槽**（`fanout(..., {retainUntilSubscribed})`），
+   因为真正丢 URL 的窗口是「宿主的 expose 已注册、`ctx.deepLink` 还没订阅」。
+   队列仍然覆盖**peer 确实不存在**的窗口（宿主重启，以及在进程启动时就投递 URL 的平台）。
+2. **加一个插件可见的服务必须同时登记**（`capabilityInventory` 的 `HOST_SERVICES`/`REQUESTABLE_CAPABILITIES`
+   + manifest schema 的 `permissions.deepLink` + 重生成镜像 + `#24` 三档测试），否则
+   `capability-surfaces.test.ts` 与 `check:contracts` 会红——这正是 PR #40 的教训被复用的地方。
+
+**仍未做的**（诚实列出）：
+
+- **MSI/WiX 侧的注册与卸载清理**只做了源码阅读（模板写 `Root="HKLM"`），**未实测**（§7.2）。
+- **Windows 上的安装 → 双击链接 → 卸载**这条真机链路尚未跑过（需要在本机装一次构建产物并再卸载；
+  它会真的写/删 `HKCU\Software\Classes\vrcxk`）。这是验收标准里「卸载路径」那一条的判据。
+- `register → unregister` 的**往返**没有自动化测试：两个调用都在 `AppHandle` 之后，单测构造不出来
+  （与 `ctx.autostart` 同样的限制）；被覆盖的是**判据与探测**（含真实注册表用例）与「外来键绝不被碰」。
+
 
 ---
 
@@ -320,7 +352,7 @@ issue 的验收标准要求「若写 `schemes`：macOS 上一条真机验证」�
 | ①②③④ 全有明确结论后才重新暴露 `register` | §7 四条裁定 + 本文档本身 | 本文档即「写下来」的载体；裁定结论回填到本节 |
 | 一条测试钉住「认领已存在的类键会被拒绝」，且**在真实注册表语义下成立** | 第 0 步 §6.2 | 单元层已有一半（`validate_deep_link_scheme` 的 11 条用例）；缺的是**真机**：先人工建 `HKCU\Software\Classes\vrcxktest`，再断言注册被拒且原值未变 |
 | 若实现 `unregister`：注册 → 注销后键回到注册前状态（含被覆盖的既有键） | 第 0 步 §6.1 | 「自有新键」可断言全等；「被覆盖的既有键」**结构上无法恢复** ⇒ 按本文 §4.2 写进文档明说，并把测试限定为前者 |
-| 若写 `schemes`：macOS 真机验证 | 已**提前完成**（§5.4 机制 + §5.5 真实应用），第 1 步 §6.6 只需换成**真名**重跑一次 | 机制与 bundler 两半都已实测通过：`CFBundleURLTypes` → Apple Event → delegate；真实 `.app` 带 scheme、LaunchServices 认领、`open` 从 SSH 落到宿主日志。⚠ 判据**不能**用 `open` 的退出码（实测会给假绿），也**不能**把 bundle 建在 `/tmp`（会假红） |
+| 若写 `schemes`：macOS 真机验证 | 已**完成**（§5.4 机制 → §5.5 真实应用 → **`docs/probes/mac-deeplink/run-real-name.sh` 用真名 `vrcxk` 的冷启动 + 热启动验收**） | 机制与 bundler 两半都已实测；真名验收在生产代码上全绿：内置 `.app` 的 `CFBundleURLTypes` 带 `vrcxk`、LaunchServices 认领、**冷启动**（应用未运行 → URL 拉起它）与热启动都落到宿主日志。⚠ 判据**不能**用 `open` 的退出码（实测会给假绿），也**不能**把 bundle 建在 `/tmp`（会假红），也**不能**只送壳分支的树（会得到一个看起来一模一样的假失败 —— FINDINGS §6.3） |
 | 卸载路径：卸载后自有前缀的键确实被删 | 第 1 步 §6.6 | NSIS：装 → 卸 → 读注册表断言键消失；**并补一条「命令串被改过时键会残留」的用例**（这是模板判据的真实边界） |
 
 ---

@@ -408,6 +408,23 @@ root), not `<tree>/src-tauri/target` — a wrong path reads exactly like a faile
 side too. Getting the source onto that Mac is its own problem: **github.com is ~20 s to first byte
 and a clone timed out at 75 s**, so ship the tracked tree over the LAN (`git archive` + `scp`).
 
+### `mac-deeplink/run-real-name.sh` — the acceptance run, on production code
+
+Patches **nothing**: the tree declares the real scheme (`vrcxk`) and the host's own `ctx.deepLink`
+logs arrivals, so this measures production wiring. It needs a tree with **both** halves (the shell
+change *and* the host consumer) — against the shell branch alone it reports a **false failure**,
+because a delivered URL then leaves no trace anywhere.
+
+```bash
+bash docs/probes/mac-deeplink/run-real-name.sh <tree-with-both-halves> [scheme]
+```
+
+It is the run that exposed a **real defect** (macOS cold start: the app is launched by the URL, the
+URL arrives *after* `ready`, and the host dropped it in the window between its `expose` table being
+registered and `ctx.deepLink` subscribing) and then proved the fix: the URL line lands **3 ms after
+`ready`**, handed over by the host-side retention slot. All of it — raw output included — is in
+[`mac-deeplink/FINDINGS.md`](mac-deeplink/FINDINGS.md) §6.
+
 ## Re-running
 
 ```
