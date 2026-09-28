@@ -36,6 +36,7 @@ export const HOST_SERVICES = [
   "hands",
   "clipboard",
   "autostart",
+  "deepLink",
 ] as const
 export type HostService = (typeof HOST_SERVICES)[number]
 
@@ -57,6 +58,7 @@ export const REQUESTABLE_CAPABILITIES = [
   "hands",
   "clipboard",
   "autostart",
+  "deepLink",
 ] as const satisfies readonly HostService[]
 export type RequestableCapability = (typeof REQUESTABLE_CAPABILITIES)[number]
 

@@ -251,6 +251,10 @@
           "$ref": "#/$defs/PermissionGrant",
           "description": "Register the app to start with the system. Desktop only; the shell registers no such route on mobile."
         },
+        "deepLink": {
+          "$ref": "#/$defs/PermissionGrant",
+          "description": "Receive inbound custom-scheme URLs (`vrcxk://…`) as the OS hands them over. RECEIVE-ONLY on purpose: creating a registration is not exposed at all, and the undo lives on the face's ws API (`HostWsAPI.deepLink.unregister`) rather than on `ctx.deepLink`, because a cordis service is readable by every plugin. That asymmetry is the owner's 'selective exposure' decision (issue #41 §7.1 item 2). Desktop only — the shell registers no such notification on mobile."
+        },
         "hands": {
           "oneOf": [
             { "type": "boolean" },

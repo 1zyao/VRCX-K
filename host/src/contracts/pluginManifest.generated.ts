@@ -274,6 +274,10 @@ export interface Permissions {
    */
   autostart?: boolean | string[];
   /**
+   * Receive inbound custom-scheme URLs (`vrcxk://…`) as the OS hands them over. RECEIVE-ONLY on purpose: creating a registration is not exposed at all, and the undo lives on the face's ws API (`HostWsAPI.deepLink.unregister`) rather than on `ctx.deepLink`, because a cordis service is readable by every plugin. That asymmetry is the owner's 'selective exposure' decision (issue #41 §7.1 item 2). Desktop only — the shell registers no such notification on mobile.
+   */
+  deepLink?: boolean | string[];
+  /**
    * File primitives (stat/read/write/watch/list). Reaches the whole disk, so prefer a narrow list over `true`. Declaration only at this stage — not enforced (#24 is declare-and-warn, and the real boundary is M4's subprocess isolation). ⚠ `maxItems` MUST equal the `HandsPrimitive` enum length: adding a primitive to the enum without raising this made a 5-primitive grant INVALID, so the manifest was rejected and the `#24` warn silently switched off. A contract test pins the two together.
    */
   hands?:

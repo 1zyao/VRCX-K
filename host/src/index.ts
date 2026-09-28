@@ -9,7 +9,9 @@ import LoggerConsole from "@cordisjs/plugin-logger-console"
 import Timer from "@cordisjs/plugin-timer"
 import { Context } from "cordis"
 import { RPCTransportClosedError } from "kkrpc"
+import { bindDeepLinkAdmin } from "./api"
 import { createShellCapabilities, ShellHandle } from "./capability"
+import { DeepLinkService, unregisterDeclaredScheme } from "./deeplink"
 import { attachDevWatch, DevWatch, type DevWatchEvent } from "./dev-watch"
 import { declaresHeartbeat, FIBER_ACTIVE, FIBER_FAILED } from "./fiber"
 import { HandsService } from "./hands"
@@ -189,6 +191,13 @@ async function bootstrap() {
   const shortcuts = new ShortcutService(ctx, { log: (line) => log(line) })
   ctx.effect(() => () => shortcuts.close())
 
+  // Deep links (issue #41 gap ④): the shell proves a URL arrived, this owns what it MEANS.
+  // Always present so plugins can inject `ctx.deepLink`; with no shell attached the
+  // subscription simply never fires. ⚠ Before this existed, a URL that reached the host
+  // left no trace anywhere, which made #41's acceptance criterion untestable.
+  const deepLinks = new DeepLinkService(ctx, { log: (line) => log(line) })
+  ctx.effect(() => () => deepLinks.close())
+
   // Capability surface (M2-1): the raw `ctx.shell` mirror plus the curated
   // `ctx.notify`/`ctx.dialog`/`ctx.window`/`ctx.os` services. Registered before
   // the loader so plugins can inject them; the shell bridge attaches later.
@@ -328,6 +337,7 @@ async function bootstrap() {
     hands.useManifests(lookup)
     autostart.useManifests(lookup)
     shortcuts.useManifests(lookup)
+    deepLinks.useManifests(lookup)
     tray.useManifests(lookup)
   }
 
@@ -501,6 +511,19 @@ async function bootstrap() {
     // Desktop-only extras. `ctx.os` and `ctx.clipboard` are stateless mirrors and
     // need no attach; only autostart carries shell-attachment state.
     autostart.attachShell(shell)
+    // Deep links (issue #41 gap ④): subscribe to inbound URLs, and give the FACE the
+    // undo path. Note where the undo goes — `HostWsAPI.deepLink`, never `ctx.deepLink`:
+    // a cordis service is plugin-readable, and the owner's decision is that plugins may
+    // receive URLs but may not unregister the app's scheme (issue #41 §7.1 item 2).
+    deepLinks.attachShell(shell.deepLink)
+    bindDeepLinkAdmin({
+      unregister: (scheme) => unregisterDeclaredScheme(shell.deepLink, scheme),
+    })
+    ctx.effect(() => () => {
+      // The ws API outlives the shell (a restart replaces the bridge), so the binding is
+      // cleared on shutdown rather than left pointing at a dead bridge.
+      bindDeepLinkAdmin(undefined)
+    })
     // Bind the dev-watch relay now that the shell API proxy exists. Events
     // emitted before this point were logged only; the relay is fire-and-forget
     // so a shell without the handler (or a dropped pipe) never breaks dev.

@@ -27,6 +27,49 @@ export const HOST_STDIO_LOST_EXIT = 52
 export type HostWsAPI = {
   ping(): Promise<string>
   getVersion(): Promise<string>
+  /**
+   * Deep-link administration for the FACE (issue #41 §7.1 item 2).
+   *
+   * ⚠ Why the undo is here and not on `ctx.deepLink`: a cordis service is readable by
+   * every plugin (inject gates readiness, not access), so a method there is a
+   * plugin-visible capability. The owner's decision is "selective exposure" — the face
+   * may undo, a plugin may not — and the ws API is the surface the face already uses for
+   * `ping`/`getVersion`. The shell bounds what this can do: declared names only, and it
+   * never removes a key it does not own.
+   */
+  deepLink: {
+    /** Undo a registration under a name this build declares. */
+    unregister(scheme: string): Promise<DeepLinkAdminOutcome>
+  }
+}
+
+/**
+ * The face-facing outcome of an undo attempt.
+ *
+ * `absent` is a success: asking "make sure this is not registered" twice is legitimate.
+ * `no-shell` and `unsupported` are deliberately distinct — "there is no host to ask" and
+ * "the shell said no" need different words in a UI.
+ */
+export type DeepLinkAdminOutcome =
+  | { status: "removed" }
+  | { status: "absent" }
+  | { status: "unsupported"; error: string }
+  | { status: "no-shell" }
+
+/**
+ * The bridge-backed implementation, bound when a shell attaches.
+ *
+ * ⚠ Not a `ctx` lookup: `hostWsAPI` is created at module load, before any shell exists,
+ * and the shell can be replaced (a restart) or absent (a dev host) — so the live handler
+ * is a module-level binding rather than a captured reference.
+ */
+type DeepLinkAdmin = { unregister(scheme: unknown): Promise<DeepLinkAdminOutcome> }
+
+let deepLinkAdmin: DeepLinkAdmin | undefined
+
+/** Bind (or clear, with `undefined`) the handler `hostWsAPI.deepLink` delegates to. */
+export function bindDeepLinkAdmin(next: DeepLinkAdmin | undefined): void {
+  deepLinkAdmin = next
 }
 
 export const hostWsAPI: HostWsAPI = {
@@ -35,5 +78,11 @@ export const hostWsAPI: HostWsAPI = {
   },
   async getVersion() {
     return HOST_VERSION
+  },
+  deepLink: {
+    async unregister(scheme) {
+      if (!deepLinkAdmin) return { status: "no-shell" }
+      return deepLinkAdmin.unregister(scheme)
+    },
   },
 }

@@ -45,6 +45,7 @@ import Loader from "@cordisjs/plugin-loader"
 import { Context } from "cordis"
 import { createShellCapabilities, ShellHandle } from "../src/capability"
 import type { VRCXKPluginManifest } from "../src/contracts/pluginManifest.generated"
+import { DeepLinkService } from "../src/deeplink"
 import { HandsService } from "../src/hands"
 import { AutostartService } from "../src/shell-extras"
 import { ShortcutService } from "../src/shortcut"
@@ -105,9 +106,18 @@ function fakeBridge() {
     return { ok: true, revision: snapshot.revision }
   }
   const autostartCalls: boolean[] = []
+  const deepLinkBridge = {
+    onOpen() {
+      return () => {}
+    },
+    async unregister(scheme: string) {
+      return { ok: true, scheme, removed: true }
+    },
+  }
   const base = {
     tray: { setSnapshot: trayPush },
     shortcut: shortcutBridge,
+    deepLink: deepLinkBridge,
     shell: {
       autostart: {
         isEnabled: async () => false,
@@ -129,7 +139,7 @@ function fakeBridge() {
   }
 }
 
-type Surface = "tray" | "shortcut" | "autostart"
+type Surface = "tray" | "shortcut" | "autostart" | "deepLink"
 
 /**
  * Run one plugin call through a **real loader entry**, and collect the service's
@@ -184,10 +194,16 @@ async function runServiceThroughLoader(
       log: (line) => audits.push(line),
     })
     shortcut.useManifests(lookup)
-  } else {
+  } else if (surface === "autostart") {
     const autostart = new AutostartService(ctx, { audit: (line) => audits.push(line) })
     autostart.attachShell(fake.bridge)
     autostart.useManifests(lookup)
+  } else {
+    const deepLink = new DeepLinkService(ctx, {
+      bridge: fake.bridge.deepLink,
+      log: (line) => audits.push(line),
+    })
+    deepLink.useManifests(lookup)
   }
 
   await ctx.plugin(Loader)
@@ -334,6 +350,37 @@ describe("undeclared calls to ctx.tray / ctx.shortcut / ctx.autostart must warn 
     expect(result.autostartCalls).toEqual([true])
   }, 20_000)
 
+  test("ctx.deepLink.onUrl: warns when deepLink is undeclared", async () => {
+    // The fourth curated service (issue #41 gap ④). It is the mildest of the four in
+    // isolation — subscribing to URLs writes nothing — but it is the one that makes an
+    // activation OBSERVABLE, so an undeclared subscriber is exactly the case #24 exists to
+    // surface: without the warning, a plugin reacting to `vrcxk://…` is indistinguishable
+    // from one that never touched the capability.
+    const result = await runServiceThroughLoader(
+      "deepLink",
+      { os: true },
+      `export function apply(ctx: any) {
+         ctx.deepLink.onUrl(() => {})
+       }\n`,
+    )
+    const warn = result.audits.find((line) => line.includes("overreach"))
+    expect(warn, "an undeclared ctx.deepLink.onUrl must produce an overreach warning").toBeDefined()
+    expect(warn).toContain("deepLink.onUrl")
+    expect(warn).toContain("`deepLink`")
+  }, 20_000)
+
+  test("ctx.deepLink.onUrl: declared deepLink ⇒ no warning (anti-noise control)", async () => {
+    const result = await runServiceThroughLoader(
+      "deepLink",
+      { deepLink: true },
+      `export function apply(ctx: any) {
+         ctx.deepLink.onUrl(() => {})
+       }\n`,
+    )
+    expect(result.audits.some((line) => line.includes("[cap]"))).toBe(true)
+    expect(result.audits.some((line) => line.includes("overreach"))).toBe(false)
+  }, 20_000)
+
   test("all three services only record, never warn, when the plugin has no manifest", async () => {
     // #24 is explicit: if nothing was ever promised, there is nothing to violate.
     // Warning on a plugin that has no manifest is noise, and it turns "warnings"
@@ -371,6 +418,16 @@ describe("undeclared calls to ctx.tray / ctx.shortcut / ctx.autostart must warn 
     )
     expect(autostart.audits.some((line) => line.includes("[cap]"))).toBe(true)
     expect(autostart.audits.some((line) => line.includes("overreach"))).toBe(false)
+
+    const deepLink = await runServiceThroughLoader(
+      "deepLink",
+      undefined,
+      `export function apply(ctx: any) {
+         ctx.deepLink.onUrl(() => {})
+       }\n`,
+    )
+    expect(deepLink.audits.some((line) => line.includes("[cap]"))).toBe(true)
+    expect(deepLink.audits.some((line) => line.includes("overreach"))).toBe(false)
   }, 30_000)
 
   test("calls outside a narrow grant are reported as out-of-scope (not undeclared)", async () => {

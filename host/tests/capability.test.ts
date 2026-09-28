@@ -227,10 +227,18 @@ describe("capability surface (M2-1)", () => {
     // `register` on either layer must fail here. Asserting only the curated path
     // would be theatre: the raw mirror reaches the same route one property access
     // away.
+    //
+    // ⚠ AND NEITHER LAYER GETS `unregister` — that is the other half of issue #41
+    // §7.1 item 2 ("selective exposure"). The undo now exists (the shell route was
+    // added with the declared allowlist), but it is reachable from the HOST and the
+    // FACE only: `ctx.deepLink` is a cordis service every plugin can read, and this
+    // raw mirror is the escape hatch, so a plugin-visible `unregister` here would
+    // undo the narrowing as surely as a restored `register`. The face reaches it via
+    // `HostWsAPI.deepLink.unregister`, which is asserted in deeplink.test.ts.
     const ctx = new Context()
     createShellCapabilities(ctx, new ShellHandle(() => {}))
     const deepLink = ctx.shell.deepLink as
-      | { register?: unknown; isRegistered?: unknown }
+      | { register?: unknown; unregister?: unknown; isRegistered?: unknown }
       | undefined
     // The namespace exists at all — otherwise the assertions below would pass by
     // looking at `undefined`.
@@ -241,6 +249,10 @@ describe("capability surface (M2-1)", () => {
     expect(
       deepLink?.register,
       "register must stay removed: it makes an un-undoable machine-wide change",
+    ).toBeUndefined()
+    expect(
+      deepLink?.unregister,
+      "unregister must not be plugin-reachable: it belongs to HostWsAPI.deepLink (the face)",
     ).toBeUndefined()
   })
 })

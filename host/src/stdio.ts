@@ -502,9 +502,19 @@ export type ShellSysAPI = {
      * honest about what the host is allowed to ask for — leaving it declared would
      * let a future caller "restore" the capability by writing one arrow function,
      * which is exactly how a deliberate removal gets undone by accident.
+     *
+     * ⚠ `unregister` IS here while `register` is not, and that asymmetry is the
+     * owner's decision (issue #41 §7.1 item 2, "selective exposure"): the undo is
+     * reachable from the host and the face — which is what `HostWsAPI.deepLink`
+     * exists for — and NOT from a plugin, because nothing on the plugin's side
+     * (neither the curated services nor the raw `ctx.shell` mirror) lists it. The
+     * shell additionally bounds it to the names this build declares and refuses to
+     * remove a key it does not own, so the worst a caller can do is undo our own
+     * registration.
      */
     deepLink?: {
       isRegistered(scheme: string): Promise<boolean>
+      unregister(scheme: string): Promise<DeepLinkUnregisterResult>
     }
   }
   /**
@@ -567,11 +577,33 @@ export type ShellShortcutBridge = {
 /**
  * Host-facing view of the deep-link side of the shell bridge (desktop only).
  *
- * A purely local registration: `deepLink.opened` arrives on the exposed API, not
- * through the remote proxy.
+ * `onOpen` is a purely local registration: `deepLink.opened` arrives on the exposed
+ * API, not through the remote proxy.
  */
 export type ShellDeepLinkBridge = {
   onOpen(handler: (event: DeepLinkEvent) => void): () => void
+  /**
+   * Undo a registration under a name this build declares.
+   *
+   * ⚠ OPTIONAL on purpose: it is absent against a shell that predates the route
+   * (issue #41 §7.1 item 2 added it), and "this shell cannot undo it" is a
+   * different answer from "no shell is attached". Callers must not treat a missing
+   * method as a failed removal.
+   */
+  unregister?: (scheme: string) => Promise<DeepLinkUnregisterResult>
+}
+
+/**
+ * Result of `shell.deepLink.unregister` — mirrors the shell's verdict object.
+ *
+ * `removed: false` with `ok: true` means "there was nothing registered under that
+ * name", which is a legitimate answer to asking twice rather than an error.
+ */
+export type DeepLinkUnregisterResult = {
+  ok: boolean
+  scheme: string
+  removed?: boolean
+  error?: string
 }
 
 export type ShellStdioBridge = ShellSysAPI & {
@@ -881,6 +913,9 @@ export function connectShellStdio(
     },
   })
   const remote = channel.getAPI()
+  // Captured before the bridge object is built so the optional route can be narrowed
+  // without a non-null assertion (see the `deepLink` member below).
+  const deepLinkRoute = remote.shell.deepLink
   // Build the bridge explicitly. The remote proxy is function-shaped and its
   // `set` trap turns property assignment into an RPC, so own properties must
   // NOT be added on top of it (Object.create(remote) + `bridge.tray = ...`
@@ -907,6 +942,14 @@ export function connectShellStdio(
     },
     deepLink: {
       onOpen: (handler) => deepLinks.on(handler),
+      // ⚠ `shell.deepLink` is OPTIONAL in the wire type (a mobile shell registers no such
+      // route at all, and a shell older than issue #41 has no `unregister`), so an absent
+      // route must surface as "this shell cannot do it" rather than as a TypeError that
+      // looks like a refusal. Captured once here so the narrowing is real rather than a
+      // non-null assertion.
+      ...(deepLinkRoute
+        ? { unregister: (scheme: string) => deepLinkRoute.unregister(scheme) }
+        : {}),
     },
     /**
      * Whether a write to the shell has already failed. Bootstrap consults this

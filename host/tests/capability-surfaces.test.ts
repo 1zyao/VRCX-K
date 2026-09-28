@@ -19,6 +19,7 @@ import {
   REQUESTABLE_CAPABILITIES,
   SHELL_SUBDOMAINS,
 } from "../src/contracts/capabilityInventory"
+import { DeepLinkService } from "../src/deeplink"
 import { HandsService } from "../src/hands"
 import { AutostartService } from "../src/shell-extras"
 import { ShortcutService } from "../src/shortcut"
@@ -33,6 +34,7 @@ function bootServices(): Context {
   ctx.provide("signal", new ShutdownSignal())
   new TrayService(ctx, { log: () => {} })
   new ShortcutService(ctx, { log: () => {} })
+  new DeepLinkService(ctx, { log: () => {} })
   new HandsService(ctx, {})
   new AutostartService(ctx)
   createShellCapabilities(ctx, new ShellHandle(() => {}))
