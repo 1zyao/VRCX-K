@@ -388,6 +388,26 @@ Three findings that bite anyone writing a macOS deep-link test:
 It also carries a control for **script-executable bundles** (refused: `-10669`), and a
 location A/B driven by `PROBE_ROOT=…`.
 
+### `mac-deeplink/run-real-app.sh` — the real Tauri app, without waiting for the name
+
+`run.sh` proves macOS *delivers*; this one proves **our** chain does. It patches a **scratch tree**
+(declares a scratch scheme, and inserts a temporary logging consumer — required, because the host
+has no `deepLink` consumer today, which *is* gap ④), runs `bun run tauri build --bundles app`, and
+asserts **on the host side**. Measured result (macOS 26.6.2 arm64, rustc 1.98.1, bun 1.4.2):
+build **4 m 53 s**, bundler emits `CFBundleURLTypes`, LaunchServices claims the scheme, and
+`open "scheme://hello?a=1"` from SSH lands in the host log as
+`[probe] deepLink.opened received urls=["…"]` — the full chain.
+
+```bash
+bash docs/probes/mac-deeplink/run-real-app.sh <scratch-tree> [scheme]
+```
+
+⚠ Two traps it documents the hard way: the bundle lands in **`<tree>/target`** (cargo workspace
+root), not `<tree>/src-tauri/target` — a wrong path reads exactly like a failed build; and a
+`PASS` on the LaunchServices claim can be **inherited from a previous run**, so assert on the app
+side too. Getting the source onto that Mac is its own problem: **github.com is ~20 s to first byte
+and a clone timed out at 75 s**, so ship the tracked tree over the LAN (`git archive` + `scp`).
+
 ## Re-running
 
 ```

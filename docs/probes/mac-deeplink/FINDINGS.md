@@ -23,7 +23,9 @@
 | 6 | Is a **shell-script** `CFBundleExecutable` a usable URL handler? | **No.** `-10669` when the bundle is otherwise launchable, `-10814` when it is not | control section of the probe |
 | 7 | Does a **hyphen** in the scheme name break registration? | **No** (the guess that motivated the check was **wrong**) | `claimed schemes: … vrcxkprobe-hy:` |
 | 8 | Does the **bundle's location** matter? | **Yes.** Same script, bundles under `/tmp`: LaunchServices records the claim, `open` fails `-10814`, URL never delivered. Under `$HOME`: delivered | §2 run 1 vs run 2 (`PROBE_ROOT=/tmp/…`) |
-| 9 | What is **still unverified**? | The **real Tauri app**: that Mac has **no rustup and no bun**, and nothing here exercises Tauri's `RunEvent::Opened` plumbing or the bundler's `Info.plist` generation (that half is source-read only, see the decision brief §2). Also unmeasured: second-launch/instance behavior, and whether `LSUIElement` matters for a real Tauri bundle (this probe sets it) | — |
+| 9 | Does the **Tauri bundler** turn `plugins.deep-link.desktop.schemes` into a real `CFBundleURLTypes`? | **Yes — measured on a real `tauri build`** (`CFBundleURLSchemes = [vrcxkscratch]`, `CFBundleURLName = "com.vrcxk.app vrcxkscratch"`). This half was previously **source-read only** | §5, `run-real-app.sh` |
+| 10 | Does the **full chain** work on real hardware — macOS → shell → kkrpc/stdio → host? | **Yes.** `open "vrcxkscratch://hello?a=1"` from an SSH session → the host logged `[probe] deepLink.opened received urls=["vrcxkscratch://hello?a=1"]` | §5 |
+| 11 | What is **still unverified**? | The **product** side, not macOS: (a) the scheme **name** is an open owner decision, so §5 used a scratch one; (b) the host has **no `deepLink` consumer** in the product (that absence IS gap ④), so §5 had to insert a temporary logging consumer to have anything to assert on; (c) second-launch/instance behavior and `LSUIElement` were not measured | — |
 
 ## 1. What the probe does
 
@@ -141,8 +143,77 @@ hand-made probe — or a CI step that builds a bundle in a temp dir — will fai
    build + install + `open "vrcxk://…"` + assert **the host received `deepLink.opened`**.
    The remaining unknown is Tauri's own plumbing plus the bundler's `Info.plist` generation —
    not macOS.
-3. **That Mac needs prep** before the real test can run: `rustup` **MISSING**, `bun` **MISSING**
-   (measured §0.9). `git` and `python3` are present; Xcode (not just CLT) is installed at
-   `/Applications/Xcode.app`; 380 GB free; `github.com` reachable (HTTP 200, 3.6 s).
+3. **That Mac needed prep, and now has it** (2026-09-28): it had **no rustup and no bun**; both are
+   installed now (§5). `git` and `python3` are present; Xcode (not just CLT) is at
+   `/Applications/Xcode.app`; 380 GB free. ⚠ **github.com is unusable from it** (20 s to first
+   byte, a clone timing out at 75 s) — fetch sources over the LAN, or through the relay.
 4. This probe stays useful **after** the toolchains are installed: it is a name-independent smoke
    test that separates "macOS would not deliver" from "our app did not receive/forward".
+
+## 5. The real app — built and measured (2026-09-28, same Mac)
+
+`run-real-app.sh` does what §4.2 asks for, without waiting for the scheme-name decision: it patches
+a **scratch tree** with a **scratch scheme** (`vrcxkscratch`) and a **temporary logging consumer**,
+builds the real app, and asserts on the host side. Nothing was pushed; the tree is restored on exit.
+
+**Toolchain prep done first** (that Mac had none):
+
+| piece | result |
+|---|---|
+| rustup | ✅ installed `stable-aarch64-apple-darwin`, **rustc 1.98.1** (`--no-modify-path`, so `~/.cargo/bin` is not on the interactive PATH) |
+| bun | ✅ **1.4.2** (matches the repo's pin). ⚠ The official installer's GitHub download died with `curl: (16) Error in the HTTP2 framing layer`; it worked through the user's relay (`https://e.mcrete.top/<urlencode(target)>`, the shape its own homepage uses) |
+| source | ⚠ `git clone` from this Mac **timed out after 75 s** against github.com. 1.4 MiB of tracked files is enough for a build, so the tree was shipped over the LAN (`git archive` + `scp` + `tar -x`). Nothing in the build needs `.git` |
+
+Build: `bun run tauri build --bundles app` → **release build 4 m 53 s** (8 CPU / 16 GB), and the
+bundle carries the sidecar (`Contents/MacOS/host` 62.9 MB next to `tauri-app` 6.6 MB — the
+macOS sidecar path works).
+
+### Raw output
+
+```
+########## 3. did the BUNDLER put the scheme into the built app? ##########
+Array {
+    Dict {
+        CFBundleTypeRole = Editor
+        CFBundleURLName = com.vrcxk.app vrcxkscratch
+        CFBundleURLSchemes = Array {
+            vrcxkscratch
+        }
+    }
+}
+PASS: built Info.plist declares vrcxkscratch
+
+########## 4. does LaunchServices give OUR bundle the scheme? ##########
+claimed schemes:            vrcxkscratch:
+PASS: LaunchServices claims vrcxkscratch
+
+########## 5. launch (into the GUI session) and deliver a URL from SSH ##########
+--- host log before the URL ---
+2026-09-28T14:09:19.539Z [host] starting Cordis...
+2026-09-28T14:09:19.548Z [host] manifests: 0 registered (none), 1 without a usable declaration (2023438d:heartbeat)
+2026-09-28T14:09:19.555Z [host] ready {"schemaVersion":1,…,"host":{"platform":"macos","arch":"arm64","mode":"source"},…}
+--- opening vrcxkscratch://hello?a=1 ---
+open returned 0
+
+########## 6. ASSERT on the APP side ##########
+2026-09-28T14:09:23.425Z [host] [probe] deepLink.opened received urls=["vrcxkscratch://hello?a=1"]
+PASS: URL reached the host: macOS -> shell -> kkrpc/stdio -> host consumer
+
+### VERDICT: all assertions passed ###
+```
+
+(The host log is at `~/Library/Logs/com.vrcxk.app/host.log`, i.e. `app_log_dir()` — that is the
+observable end of the chain. Without the temporary consumer, **nothing** would have been logged:
+that is gap ④, and it is why this harness cannot exist without patching the tree.)
+
+### Two traps hit while writing this harness
+
+1. ⚠ **The bundle is under `<tree>/target`, not `<tree>/src-tauri/target`** — the cargo workspace
+   root is the repo root. The first run reported `FAIL: app bundle not found` for a build that had
+   in fact succeeded four lines earlier (`Finished release … Finished 1 bundle at: …`). A path bug
+   in the harness read exactly like a build failure.
+2. ⚠ **A `PASS` on the LaunchServices claim can be inherited from an earlier run**: the freshly
+   built app had already been auto-registered by macOS, so the claim check passed even in the run
+   where the harness was looking at the wrong path. Assert on the app side (Web 6) as well, or the
+   claim check alone can be satisfied by a stale registration.
+

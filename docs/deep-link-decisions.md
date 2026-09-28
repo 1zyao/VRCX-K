@@ -23,9 +23,9 @@
 
 **要 owner 回答的问题集中在 §7**，可以只答那四条。
 
-⚠ 与本文初版相比有一处**证据升级**：**macOS 侧的机制已经实测**（§5.4，探针 + 原始输出在
-`docs/probes/mac-deeplink/`），所以 ② 在 macOS 上不再属于「零验证」；仍未验证的是**真实 Tauri 应用**
-那一半（那台 Mac 还没有 rustup/bun）。
+⚠ 与本文初版相比有一处**证据升级**：**macOS 侧已经实测到端到端** —— 先用探针量机制（§5.4），
+再在那台 Mac 上装好工具链、用**临时 scheme** 真机构建并让 URL 一路落到宿主日志（§5.5）。
+所以 ② 在 macOS 上不再是「零验证」；仍未定的只有**名字**（§7.1）和 ④ 的消费方（产品侧）。
 
 ---
 
@@ -216,6 +216,29 @@ issue 的验收标准要求「若写 `schemes`：macOS 上一条真机验证」�
 **没有 rustup 也没有 bun**（已实测），所以「build + install + 双击/`open` + 断言宿主收到」仍是第 1 步的事。
 探针本身留着：它能区分「macOS 不投递」与「我们的应用没收到/没转发」。
 
+### 5.5 macOS 侧：**真实 Tauri 应用**也已经在真机上跑通了（同日补齐）
+
+§5.4 写完后又把工具链装上（rustup 1.98.1 + bun 1.4.2）、并在一个**临时工作树**里用
+**临时 scheme**（`vrcxkscratch`）+ 一个**临时日志消费方**把真实应用构建、安装、跑通：
+
+| 断言 | 结果 |
+|---|---|
+| bundler 把 `plugins.deep-link.desktop.schemes` 变成 `.app` 的 `CFBundleURLTypes` | ✅ `CFBundleURLSchemes = [vrcxkscratch]`（此前**只有源码阅读**） |
+| LaunchServices 把 scheme 判给我们的 bundle | ✅ `claimed schemes: vrcxkscratch:` |
+| `open "vrcxkscratch://hello?a=1"`（从 SSH 会话）→ 壳 → kkrpc/stdio → 宿主 | ✅ 宿主日志：`[probe] deepLink.opened received urls=["vrcxkscratch://hello?a=1"]` |
+
+⇒ **② 在 macOS 上从「机制」到「我们的链路」全部有实测证据**，含 62.9 MB 的 `host` sidecar 随包
+（release 构建 4m53s，8 核/16G）。仪器与原始输出：`docs/probes/mac-deeplink/run-real-app.sh` +
+`FINDINGS.md` §5。
+
+⚠ **两条必须写在结论旁边的限定**：
+
+1. 用的是**临时 scheme 名**（真名仍待裁定），所以这一条证明的是**链路**，不是**名字**。
+2. 「宿主收到」是靠**临时插进 `host/src/index.ts` 的一行日志**观测到的 —— 因为产品今天**没有**
+   `deepLink` 消费方（那正是缺口④）。⇒ 这条验证**恰好演示了④为什么必须落地**：没有消费方，
+   URL 到达与否在产品里根本不可观测。
+3. 未测：第二次启动/single-instance 转发、`LSUIElement` 的影响。
+
 ---
 
 ## 6. 建议的落地顺序
@@ -258,7 +281,8 @@ issue 的验收标准要求「若写 `schemes`：macOS 上一条真机验证」�
 |---|---|
 | 真机注册表行为（`HKCU\Software\Classes\<scheme>` 的写入/删除/冲突） | **本轮零验证** —— 写这份文档时 `pwsh` 不可用（`0xC0000142`），连 `cargo test` 都跑不了 |
 | MSI 侧的深链注册与卸载清理 | 只读了模板（`Root="HKLM"` + perUser 注释），**未实测** |
-| macOS 的 `CFBundleURLTypes` 实际投递 | ✅ **已实测**（2026-09-28，macOS 26.6.2 arm64，经 SSH）：`CFBundleURLTypes` → `kAEGetURL` Apple Event → **delegate `application:openURLs:`**（即 Tauri 的 `RunEvent::Opened` 路径）。探针与原始输出见 [`docs/probes/mac-deeplink/`](probes/mac-deeplink/FINDINGS.md)。⚠ 仍然**未验证**的是**真实 Tauri 应用**那一半（该机无 rustup/bun，bundler 的 `Info.plist` 生成只做了源码阅读） |
+| macOS 的 `CFBundleURLTypes` 实际投递 | ✅ **已实测**（2026-09-28，macOS 26.6.2 arm64，经 SSH）：`CFBundleURLTypes` → `kAEGetURL` Apple Event → **delegate `application:openURLs:`**（即 Tauri 的 `RunEvent::Opened` 路径）。探针与原始输出见 [`docs/probes/mac-deeplink/`](probes/mac-deeplink/FINDINGS.md) |
+| macOS 上**真实 Tauri 应用**的端到端（含 bundler 生成 `Info.plist`） | ✅ **已实测**（§5.5）：临时 scheme 构建出的 `.app` 确实带 `CFBundleURLTypes`，LaunchServices 认领，且 `open "…://…"` 从 SSH 会话投到**宿主日志**。⚠ 限定：用的是**临时 scheme 名**，且「宿主收到」靠**临时插入的一行日志**观测（产品暂无④的消费方）；未测 single-instance 转发与 `LSUIElement` |
 | 上游 `tauri-plugin-deep-link` 2.4.10 的 `unregister` 实现 | 本轮**未重读源码**，采信 issue 与 `shell_sys.rs` 注释的引用 |
 | Tauri 模板的行为（`SHCTX` 取值、判据等值比较） | 读的是 `dev` 分支的模板**文本**，与将来我们锁定的 Tauri 版本可能有漂移；落地时应改引 crate 内实际模板 |
 | 已装的 VRCX 与本应用的键冲突（若名字选错） | **未测**：注册表是后写者胜，无法靠阅读判断 |
@@ -273,7 +297,7 @@ issue 的验收标准要求「若写 `schemes`：macOS 上一条真机验证」�
 | ①②③④ 全有明确结论后才重新暴露 `register` | §7 四条裁定 + 本文档本身 | 本文档即「写下来」的载体；裁定结论回填到本节 |
 | 一条测试钉住「认领已存在的类键会被拒绝」，且**在真实注册表语义下成立** | 第 0 步 §6.2 | 单元层已有一半（`validate_deep_link_scheme` 的 11 条用例）；缺的是**真机**：先人工建 `HKCU\Software\Classes\vrcxktest`，再断言注册被拒且原值未变 |
 | 若实现 `unregister`：注册 → 注销后键回到注册前状态（含被覆盖的既有键） | 第 0 步 §6.1 | 「自有新键」可断言全等；「被覆盖的既有键」**结构上无法恢复** ⇒ 按本文 §4.2 写进文档明说，并把测试限定为前者 |
-| 若写 `schemes`：macOS 真机验证 | 第 0 步 §6.5（机制）→ 第 1 步 §6.6（真实应用） | **机制已先量**（§5.4 / `docs/probes/mac-deeplink/`）：`CFBundleURLTypes` → Apple Event → delegate 路径通了，且是在 SSH 会话里驱动/观测的。真实应用的验收则是：build + 安装 + `open "vrcxk://…"` + **断言宿主收到 `deepLink.opened`**。⚠ 判据**不能**用 `open` 的退出码（实测会给假绿），也**不能**把 bundle 建在 `/tmp`（会假红） |
+| 若写 `schemes`：macOS 真机验证 | 已**提前完成**（§5.4 机制 + §5.5 真实应用），第 1 步 §6.6 只需换成**真名**重跑一次 | 机制与 bundler 两半都已实测通过：`CFBundleURLTypes` → Apple Event → delegate；真实 `.app` 带 scheme、LaunchServices 认领、`open` 从 SSH 落到宿主日志。⚠ 判据**不能**用 `open` 的退出码（实测会给假绿），也**不能**把 bundle 建在 `/tmp`（会假红） |
 | 卸载路径：卸载后自有前缀的键确实被删 | 第 1 步 §6.6 | NSIS：装 → 卸 → 读注册表断言键消失；**并补一条「命令串被改过时键会残留」的用例**（这是模板判据的真实边界） |
 
 ---
