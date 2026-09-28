@@ -25,7 +25,8 @@
 | 8 | Does the **bundle's location** matter? | **Yes.** Same script, bundles under `/tmp`: LaunchServices records the claim, `open` fails `-10814`, URL never delivered. Under `$HOME`: delivered | §2 run 1 vs run 2 (`PROBE_ROOT=/tmp/…`) |
 | 9 | Does the **Tauri bundler** turn `plugins.deep-link.desktop.schemes` into a real `CFBundleURLTypes`? | **Yes — measured on a real `tauri build`** (`CFBundleURLSchemes = [vrcxkscratch]`, `CFBundleURLName = "com.vrcxk.app vrcxkscratch"`). This half was previously **source-read only** | §5, `run-real-app.sh` |
 | 10 | Does the **full chain** work on real hardware — macOS → shell → kkrpc/stdio → host? | **Yes.** `open "vrcxkscratch://hello?a=1"` from an SSH session → the host logged `[probe] deepLink.opened received urls=["vrcxkscratch://hello?a=1"]` | §5 |
-| 11 | What is **still unverified**? | The **product** side, not macOS: (a) the scheme **name** is an open owner decision, so §5 used a scratch one; (b) the host has **no `deepLink` consumer** in the product (that absence IS gap ④), so §5 had to insert a temporary logging consumer to have anything to assert on; (c) second-launch/instance behavior and `LSUIElement` were not measured | — |
+| 11 | Does the same hold on **Windows**, where the launch URL arrives as **argv**? | **Yes — after a fix.** Windows/Linux deliver it inside the deep-link plugin's own setup, which Tauri runs *before* the app's `.setup()` registers `on_open_url`, so the URL was emitted into an empty listener set. Draining `get_current()` after registering fixes it; measured: `deepLink.opened vrcxk://user/usr_1` at **6 ms after `ready`**, plus the warm case (§7) | §7 |
+| 12 | What is **still unverified**? | (a) the **installer's own** registry write and (b) the `NSIS_HOOK_POSTUNINSTALL` runtime behaviour — both blocked on this machine by a context that refuses installer writes (a 20-line NSIS installer reproduces it; another unsigned NSIS installer on the same box installed fine, so it is not NSIS and not "unsigned"). Everything else — scheme declaration, bundler output, LaunchServices/registry claim, cold + warm delivery on macOS **and** Windows, and the incumbent VRCX's key staying byte-identical — is measured. Also unmeasured: `LSUIElement`/second-instance details (§0.9) | §6.3, §7.1 |
 
 ## 1. What the probe does
 
@@ -286,5 +287,52 @@ the host was still booting, and before the consumer existed).
    start; what covers it is the host-side retention above. The queue remains the mechanism for the
    windows where the peer genuinely does not exist yet (host restart, and platforms that deliver the
    URL at process start rather than ~2 s later).
+
+## 7. Windows: the argv cold start, verified — and the packaging gap it exposed
+
+macOS delivers the launch URL through `RunEvent::Opened` (after setup). **Windows/Linux deliver it as
+**argv**, and that path runs *inside the deep-link plugin's own setup* — which Tauri calls from
+`Builder::build()` (`tauri-2.11.5/src/app.rs:2440` `initialize_plugins`) **before** the app's
+`.setup()` (`app.rs:2521`) where the shell registers `on_open_url`
+(`tauri-plugin-deep-link-2.4.10/src/lib.rs:75-81`, `:196-222` fire `emit("deep-link://new-url")`
+there). So the URL was emitted into an **empty listener set** and lost, every time. The fix is to drain
+`app.deep_link().get_current()` right after registering the listener (`src-tauri/src/lib.rs`).
+
+Measured on Windows (equivalent install = the rendered NSIS script's file layout + its exact registry
+writes, then the app launched **by a human** via the URL):
+
+```
+2026-09-28T17:22:43.060Z [host] ready {… "host":{"platform":"windows","arch":"x64","mode":"compiled"},…}
+2026-09-28T17:22:43.066Z [host] deepLink.opened vrcxk://user/usr_1      ← 6 ms after ready
+2026-09-28T17:23:32.529Z [host] deepLink.opened vrcxk://world/wrld_2    ← warm
+```
+
+⚠ **The timing is the signature again**: 6 ms after `ready`, exactly like macOS's 3 ms — the URL was
+captured at startup and handed over by the drain. Without the fix this line never appeared on Windows
+(measured), while the warm case always worked.
+
+Against that: `HKCU\Software\Classes\vrcx` (the incumbent VRCX's own class key, byte-compared with
+`reg export` 5 times across install / cold / warm / failed attempts) was **identical throughout** — the
+install writes only `HKCU\Software\Classes\vrcxk`, and the runtime gate is bounded to the declared name.
+
+### 7.1 ⚠ Two things Windows still does NOT verify, and one environment trap
+
+1. **The installer's own registry write.** On this machine an installer started from the agent session
+   cannot write even its own temp file (`Error writing temporary file`); with the target inside the
+   workspace the payload installs but **every `WriteRegStr` silently no-ops** (not even the standard
+   `Uninstall\vrcx-k` entry appears), while `pwsh`/`cmd` perform the same writes fine. ⚠ **This is not
+   our packaging**: a **20-line NSIS installer built with the same makensis** reproduces it exactly,
+   and another **unsigned NSIS installer on the same machine** (a .NET/CefSharp product, 148.7 MiB)
+   *did* install successfully — so it is neither "NSIS is broken" nor "unsigned installers are blocked".
+   The remaining question is *which* context blocks it (the agent session's process tree, or the HIPS
+   product installed on the machine); it is orthogonal to the product code.
+2. **`NSIS_HOOK_POSTUNINSTALL` at runtime.** The hook is compiled into the installer (read out of the
+   rendered `.nsi`) and a packaging test ties every declared scheme to its `DeleteRegKey` (fault-injected
+   to prove it fails when the cleanup is removed) — but no real uninstall has been run, because of (1).
+3. ⚠ **A false "the host never started"**: the host log lives under `%LOCALAPPDATA%\<identifier>\logs`,
+   and the agent session's process tree could not write there, so the same binary that logs fine when a
+   human launches it looked like it never started. Assert on a channel the launcher's own context owns,
+   or launch it the way a user would.
+
 
 
