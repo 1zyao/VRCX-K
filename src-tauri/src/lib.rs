@@ -731,13 +731,12 @@ mod packaging_tests {
     ///     like before), and the runtime allowlist would refuse every name;
     ///   - a name declared here that nobody meant ⇒ the installer claims it machine-wide.
     ///
-    /// The owner's decision (issue #41 §7.1 item 1) is the single name `vrcxk`;
-    /// `docs/hands-prior-art.md` §2.1/§2.3 records why `vrcx` and `vrchat` cannot be used.
-    #[test]
-    fn the_deep_link_scheme_is_declared_and_is_exactly_vrcxk() {
-        let base = conf("tauri.conf.json");
-        let desktop = at(&base, &["plugins", "deep-link", "desktop"]);
-        let schemes = desktop
+    /// The declared deep-link schemes, lowercased, straight out of the config.
+    ///
+    /// Shared by the two tests below so "what is declared" has one reading in the tests as
+    /// well — a second extraction is how a test starts passing for the wrong reason.
+    fn declared_schemes_in(conf: &Value) -> Vec<String> {
+        at(conf, &["plugins", "deep-link", "desktop"])
             .as_ref()
             .and_then(|value| at(value, &["schemes"]))
             .and_then(|value| {
@@ -748,13 +747,22 @@ mod packaging_tests {
                         .collect::<Vec<_>>()
                 })
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// The owner's decision (issue #41 §7.1 item 1) is the single name `vrcxk`;
+    /// `docs/hands-prior-art.md` §2.1/§2.3 records why `vrcx` and `vrchat` cannot be used.
+    #[test]
+    fn the_deep_link_scheme_is_declared_and_is_exactly_vrcxk() {
+        let base = conf("tauri.conf.json");
+        let schemes = declared_schemes_in(&base);
         assert_eq!(
             schemes,
             vec!["vrcxk".to_string()],
             "plugins.deep-link.desktop.schemes must declare exactly [\"vrcxk\"] (issue #41 \
              §7.1 item 1). Declaring none means the OS never delivers a URL; declaring extra \
-             names means the installer claims them machine-wide. Got {desktop:?}"
+             names means the installer claims them machine-wide. Got {:?}",
+            at(&base, &["plugins", "deep-link", "desktop"])
         );
 
         // The runtime gate parses this very subtree, so pin the shape it must accept —
@@ -768,5 +776,60 @@ mod packaging_tests {
             "the runtime allowlist must read the declared name from the config; a mismatch \
              here makes every registration refuse with 'not declared'"
         );
+    }
+
+    /// Declaring a scheme and cleaning it up on uninstall are **one** change.
+    ///
+    /// ⚠ This is the test that makes "add another scheme" safe. `plugins.deep-link.desktop.schemes`
+    /// makes the bundler register the name on four platforms; the NSIS uninstall path is what
+    /// removes the Windows one again. A name added to the config without a matching
+    /// `DeleteRegKey` in `windows/hooks.nsh` leaves a machine-wide registry key behind on every
+    /// uninstall — and **nothing else in the build could notice**, because the two live in
+    /// different files with no compiler, generator or schema between them. That is exactly the
+    /// class of drift this project keeps replacing with a gate.
+    ///
+    /// The hook file is read as TEXT on purpose: the property is about the file's content, and
+    /// no amount of running the app can observe it (the same technique as
+    /// `the_desktop_only_helpers_are_gated_and_listed`).
+    ///
+    /// ⚠ What this test does NOT cover: the MSI/WiX path writes the scheme under
+    /// `Root="HKLM"` and is cleaned up by MSI component semantics instead. That half is
+    /// unverified and is recorded as such in `docs/deep-link-decisions.md` §7.2.
+    #[test]
+    fn the_uninstaller_cleans_up_every_declared_scheme() {
+        let base = conf("tauri.conf.json");
+        let schemes = declared_schemes_in(&base);
+        assert!(
+            !schemes.is_empty(),
+            "there is nothing to clean up only because nothing is declared — which is itself \
+             the #41 defect, and it is pinned by the test above"
+        );
+
+        let hook_rel = at(&base, &["bundle", "windows", "nsis", "installerHooks"])
+            .and_then(|value| value.as_str().map(str::to_string))
+            .expect(
+                "bundle.windows.nsis.installerHooks must point at the cleanup hook: the \
+                 upstream template's own delete is guarded by exact command-string equality, \
+                 so four real cases leave the key registered machine-wide",
+            );
+        let hook_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&hook_rel);
+        let hook = std::fs::read_to_string(&hook_path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", hook_path.display()));
+
+        assert!(
+            hook.contains("!macro NSIS_HOOK_POSTUNINSTALL"),
+            "{} must define the uninstall hook, or Tauri includes a file that does nothing",
+            hook_path.display()
+        );
+        for scheme in &schemes {
+            let expected = format!("DeleteRegKey HKCU \"Software\\Classes\\{scheme}\"");
+            assert!(
+                hook.contains(&expected),
+                "{} declares the scheme {scheme:?} but does not delete it on uninstall \
+                 (expected a line containing `{expected}`). Adding a scheme means adding its \
+                 cleanup — see the file's header for why the bound is one exact name.",
+                hook_path.display()
+            );
+        }
     }
 }
