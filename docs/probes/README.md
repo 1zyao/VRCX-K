@@ -361,6 +361,33 @@ It also demonstrated a separate, harder constraint by crashing on the first run:
 **`this` inside a Service method is a per-caller shadow object, not the instance**, so
 `this.#privateMethod()` throws. See the proposal §6.2a and cordis `lib/index.js:136-143`.
 
+## `mac-deeplink/` (subdirectory, **macOS only**)
+
+Does a custom URL scheme actually reach an app on macOS — and can that be verified
+**over SSH**? `run.sh` builds two tiny AppKit apps from one source file (mode A measures
+**only** the `application:openURLs:` **delegate** path, which is the one Tauri/WRY maps to
+`RunEvent::Opened`; mode B additionally installs a `kAEGetURL` handler), registers them with
+`lsregister`, delivers a URL, and **asserts on the app side** — never on `open`'s exit status.
+Read [`mac-deeplink/FINDINGS.md`](mac-deeplink/FINDINGS.md) §0 first. Written for issue #41's
+acceptance criterion "若写 `schemes`：macOS 上一条真机验证".
+
+```bash
+ssh mac 'bash -s' < docs/probes/mac-deeplink/run.sh   # needs only clang + python3
+```
+
+Three findings that bite anyone writing a macOS deep-link test:
+
+- **argv is never the carrier.** The URL arrives as an Apple Event (`kAEGetURL`), which
+  `NSApplication` forwards to the delegate. A plain C handler logs `argc=1` while `open`
+  reports success.
+- **`open`'s exit status is not evidence of delivery** — measured both ways (exit 0 with
+  nothing delivered; non-zero while the LaunchServices claim exists).
+- **A bundle under `/tmp` gets a claim but is never handed the URL** (`-10814`). That is a
+  trap for hand-made probes and CI, not for the installed app.
+
+It also carries a control for **script-executable bundles** (refused: `-10669`), and a
+location A/B driven by `PROBE_ROOT=…`.
+
 ## Re-running
 
 ```

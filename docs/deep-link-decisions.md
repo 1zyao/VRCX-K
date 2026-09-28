@@ -23,6 +23,10 @@
 
 **要 owner 回答的问题集中在 §7**，可以只答那四条。
 
+⚠ 与本文初版相比有一处**证据升级**：**macOS 侧的机制已经实测**（§5.4，探针 + 原始输出在
+`docs/probes/mac-deeplink/`），所以 ② 在 macOS 上不再属于「零验证」；仍未验证的是**真实 Tauri 应用**
+那一半（那台 Mac 还没有 rustup/bun）。
+
 ---
 
 ## 1. 现状核实（每条都给了可复查的位置）
@@ -188,6 +192,30 @@ ${EndIf}
 **能不能在脑（宿主）缺席时也不丢 URL？** 即是否接受 5.1(A) 的队列（带一个上限）。
 如果选择「丢掉就算了」，请明确写下来 —— 因为用户双击链接没反应时，这就是唯一的解释。
 
+### 5.4 macOS 侧：机制已**先**验证（实测，见探针）
+
+issue 的验收标准要求「若写 `schemes`：macOS 上一条真机验证」，而 scheme 名字还没定、那台 Mac 上也
+还没有 Rust/bun。为了不让这一段在裁定前完全空白，本轮用一个**不依赖 Tauri、不依赖 scheme 名**的
+探针把 macOS 的机制先量了一遍：`docs/probes/mac-deeplink/`（`run.sh` + `FINDINGS.md`），
+在 macOS 26.6.2 arm64 上**经 SSH 驱动**、全部断言通过。
+
+三条结论（都对将来的验收方式有直接影响）：
+
+1. **`CFBundleURLTypes` 就够，投递走 Apple Event，不是 argv。** URL 到达应用是 `kAEGetURL`，
+   由 `NSApplication` 转交 **delegate 的 `application:openURLs:`** —— 这正是 Tauri/WRY 映射成
+   `RunEvent::Opened` 的那条路径（探针把「只装 delegate」与「额外自己装 AE handler」分成两模式分别量，
+   以免测到一条生产不走的路）。一个纯 C 处理器在同样条件下只会记 `argc=1`。
+2. **⚠ `open` 的退出码不能当判据**：实测两个方向都有 —— 返回 0 而 URL 根本没到应用（纯 C 处理器），
+   以及 claim 存在但返回非 0。⇒ macOS 验收必须**断言应用侧**（宿主是否收到 `deepLink.opened`），
+   这与本仓库「skip 不算 pass」是同一条纪律的另一种外衣。
+3. **⚠ bundle 放在 `/tmp` 下会「登记成功但不被投递」**：`lsregister` 能查到 claim，`open` 却报
+   `kLSApplicationNotFoundErr (-10814)`。这是**给验证仪器自己挖的坑**（安装到 `/Applications` 的真实
+   应用不受影响），手搓 bundle 或 CI 临时目录都会踩。
+
+**仍未验证的**：真实 Tauri 应用的端到端（含 bundler 生成 `Info.plist` 的那一半）——那台 Mac
+**没有 rustup 也没有 bun**（已实测），所以「build + install + 双击/`open` + 断言宿主收到」仍是第 1 步的事。
+探针本身留着：它能区分「macOS 不投递」与「我们的应用没收到/没转发」。
+
 ---
 
 ## 6. 建议的落地顺序
@@ -198,12 +226,15 @@ ${EndIf}
 2. 加「认领已存在的类键会被拒绝」的**真实注册表**语义测试（§9 第 2 条验收）。
 3. `forward_deep_link` 的未投递队列（5.1(A) 的机制部分，与「谁消费」无关）。
 4. 把「覆盖已有类键无法还原」写进已知边界文档。
+5. 保留并复跑 macOS 机制探针 `docs/probes/mac-deeplink/run.sh`（§5.4）——它在真实应用就绪前
+   是唯一能把「macOS 不投递」与「我们没收/没转发」分开的仪器。
 
 **第 1 步（等 §7 的第 1、2 条裁定）**
 
-5. 写 `plugins.deep-link.desktop.schemes`，四个平台一起生效；macOS 真机验收。
-6. `NSIS_HOOK_POSTUNINSTALL` 兜底清理（含 MSI 侧的决定）。
-7. `ctx.deepLink` Service + 宿主侧消费方 + `#24`/契约登记。
+6. 写 `plugins.deep-link.desktop.schemes`，四个平台一起生效；macOS 真机验收（机制已由 §5.4 先验证，
+   剩下的是 Tauri 那一半 + bundler 的 `Info.plist`）。
+7. `NSIS_HOOK_POSTUNINSTALL` 兜底清理（含 MSI 侧的决定）。
+8. `ctx.deepLink` Service + 宿主侧消费方 + `#24`/契约登记。
 
 **第 2 步**
 
@@ -227,7 +258,7 @@ ${EndIf}
 |---|---|
 | 真机注册表行为（`HKCU\Software\Classes\<scheme>` 的写入/删除/冲突） | **本轮零验证** —— 写这份文档时 `pwsh` 不可用（`0xC0000142`），连 `cargo test` 都跑不了 |
 | MSI 侧的深链注册与卸载清理 | 只读了模板（`Root="HKLM"` + perUser 注释），**未实测** |
-| macOS 的 `CFBundleURLTypes` 实际投递 | **零验证**（issue 的验收标准已要求真机） |
+| macOS 的 `CFBundleURLTypes` 实际投递 | ✅ **已实测**（2026-09-28，macOS 26.6.2 arm64，经 SSH）：`CFBundleURLTypes` → `kAEGetURL` Apple Event → **delegate `application:openURLs:`**（即 Tauri 的 `RunEvent::Opened` 路径）。探针与原始输出见 [`docs/probes/mac-deeplink/`](probes/mac-deeplink/FINDINGS.md)。⚠ 仍然**未验证**的是**真实 Tauri 应用**那一半（该机无 rustup/bun，bundler 的 `Info.plist` 生成只做了源码阅读） |
 | 上游 `tauri-plugin-deep-link` 2.4.10 的 `unregister` 实现 | 本轮**未重读源码**，采信 issue 与 `shell_sys.rs` 注释的引用 |
 | Tauri 模板的行为（`SHCTX` 取值、判据等值比较） | 读的是 `dev` 分支的模板**文本**，与将来我们锁定的 Tauri 版本可能有漂移；落地时应改引 crate 内实际模板 |
 | 已装的 VRCX 与本应用的键冲突（若名字选错） | **未测**：注册表是后写者胜，无法靠阅读判断 |
@@ -242,7 +273,7 @@ ${EndIf}
 | ①②③④ 全有明确结论后才重新暴露 `register` | §7 四条裁定 + 本文档本身 | 本文档即「写下来」的载体；裁定结论回填到本节 |
 | 一条测试钉住「认领已存在的类键会被拒绝」，且**在真实注册表语义下成立** | 第 0 步 §6.2 | 单元层已有一半（`validate_deep_link_scheme` 的 11 条用例）；缺的是**真机**：先人工建 `HKCU\Software\Classes\vrcxktest`，再断言注册被拒且原值未变 |
 | 若实现 `unregister`：注册 → 注销后键回到注册前状态（含被覆盖的既有键） | 第 0 步 §6.1 | 「自有新键」可断言全等；「被覆盖的既有键」**结构上无法恢复** ⇒ 按本文 §4.2 写进文档明说，并把测试限定为前者 |
-| 若写 `schemes`：macOS 真机验证 | 第 1 步 §6.5 | 装到真 Mac 上双击 `vrcxk://…`，断言 `deepLink.opened` 到达宿主 |
+| 若写 `schemes`：macOS 真机验证 | 第 0 步 §6.5（机制）→ 第 1 步 §6.6（真实应用） | **机制已先量**（§5.4 / `docs/probes/mac-deeplink/`）：`CFBundleURLTypes` → Apple Event → delegate 路径通了，且是在 SSH 会话里驱动/观测的。真实应用的验收则是：build + 安装 + `open "vrcxk://…"` + **断言宿主收到 `deepLink.opened`**。⚠ 判据**不能**用 `open` 的退出码（实测会给假绿），也**不能**把 bundle 建在 `/tmp`（会假红） |
 | 卸载路径：卸载后自有前缀的键确实被删 | 第 1 步 §6.6 | NSIS：装 → 卸 → 读注册表断言键消失；**并补一条「命令串被改过时键会残留」的用例**（这是模板判据的真实边界） |
 
 ---
@@ -266,3 +297,14 @@ ${EndIf}
 > 需要裁定四条（§7）：scheme 名字 / unregister 暴露面 / 安装器是否继续同时发 NSIS+MSI / URL 丢失语义。
 > 其中第 1、2 条不定，第 1 步无法开工；**第 0 步那四项（unregister 路由、真实注册表冲突测试、
 > 未投递队列、已知边界文档）不依赖任何裁定，可以并行推进。**
+
+> **补充（同日，macOS 侧已实测）**：issue 的验收标准要求「若写 `schemes`：macOS 上一条真机验证」，
+> 我在等裁定的同时用一个**不依赖 Tauri、不依赖 scheme 名**的探针把 macOS 的机制先量了：
+> `docs/probes/mac-deeplink/`（macOS 26.6.2 arm64，**经 SSH 驱动**，全部断言通过）。三条结论：
+> ① `CFBundleURLTypes` → URL 以 **Apple Event `kAEGetURL`** 到达，并由 `NSApplication` 转交
+> **delegate 的 `application:openURLs:`** —— 正是 Tauri 映射成 `RunEvent::Opened` 的那条路
+> （argv 从来不是载体）；② ⚠ **`open` 的退出码不能当判据**（实测既能「返回 0 而没投递」，
+> 也能「claim 在却返回非 0」）；③ ⚠ **bundle 建在 `/tmp` 会「登记成功但永不投递」**
+> （`kLSApplicationNotFoundErr -10814`）—— 手搓探针/CI 会踩，安装到 `/Applications` 的真实应用不会。
+> 仍未验证的是**真实 Tauri 应用**那一半：那台 Mac **没有 rustup 也没有 bun**（已实测），
+> 所以这一条仍留在第 1 步。
