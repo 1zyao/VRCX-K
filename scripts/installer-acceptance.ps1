@@ -19,6 +19,9 @@ issue #41 的「卸载路径」真机验收：装 → 断言 → 卸 → 断言�
 # ⚠ 为什么第 4 条要在这里测
 真机上「外来键不被碰」的真正证据是：安装/卸载**真的跑过一遍**之后，别人的键一个字节都没变。
 单测只能覆盖判据（`registration_verdict` 的真值表 + 真实注册表夹具），覆盖不了"安装器整体行为"。
+⚠ 对照的两半必须分清：**读写对照**用本脚本自有的探测名（可随便删建）；**既有的 `vrcx` 键只做只读比对** ——
+这条规则是踩过坑才立的：本脚本最初直接删建 `HKCU\Software\Classes\vrcx`，在开发机上把用户真实的 VRCX
+注册改成了假的（已用快照恢复）。见下方 `$foreignKey` 处的注释。
 #>
 [CmdletBinding()]
 param(
@@ -80,7 +83,15 @@ New-Item -ItemType Directory -Force $snapDir | Out-Null
 
 $ownKey = "HKCU:\Software\Classes\$Scheme"
 $ownKeyNative = "HKCU\Software\Classes\$Scheme"
-$foreignKey = 'HKCU:\Software\Classes\vrcx'          # 既有 VRCX 自己的类键：必须一个字节都不变
+$foreignKey = 'HKCU:\Software\Classes\vrcx-acceptance-foreign'
+# ⚠ 对照键必须是**我们自己的名字**，且只能由本脚本创建/删除。
+# 这里最初用的是 `HKCU\Software\Classes\vrcx` —— 那是**既有 VRCX 真正在用的键**。脚本会"先删再建"，
+# 于是本地冒烟时把开发机上真实的 VRCX 注册（DefaultIcon 指向 VRCX-Luo 的图标、shell 默认值 open）
+# 删掉、换成了假的 `C:\fake\vrcx.exe`；CI 上是干净机器所以完全看不出来，本机上是实打实的破坏
+# （已用测试前的逐字节快照恢复并校验）。
+# ⇒ 想验证"别人的键不被碰"，正确做法是：① 用一个**明确属于本脚本**的探测名做读写对照；
+#   ② 对真实存在的键只做**只读**导出比对（$realVrcxKey），绝不去动它。
+$realVrcxKey = 'HKCU:\Software\Classes\vrcx'   # 既有 VRCX 自己的键：只读，一个字节都不许变
 $uninstallEntry = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$Product"
 $installDir = Join-Path $env:LOCALAPPDATA $Product
 
@@ -94,13 +105,17 @@ if (-not $installer) {
 }
 Say "installer: $($installer.FullName) ($([math]::Round($installer.Length / 1MB, 1)) MiB)"
 
-Stage '1. 铺一个「别人的键」，作为全程对照'
+Stage '1. 铺对照：一个属于本脚本的探测键 + 一份既有 vrcx 键的只读快照'
+# ① 读写对照：名字明确属于本脚本，删/建都只影响它自己。
 if (Test-Path $foreignKey) { Remove-Item $foreignKey -Recurse -Force }
 New-Item -Path "$foreignKey\shell\open\command" -Force | Out-Null
 Set-ItemProperty $foreignKey -Name 'URL Protocol' -Value ''
 Set-ItemProperty "$foreignKey\shell\open\command" -Name '(default)' -Value '"C:\fake\vrcx.exe" "%1"'
 $foreignBefore = Get-RegistryExport $foreignKey (Join-Path $snapDir 'foreign-before.reg')
-Check ($foreignBefore -ne '<absent>') '对照键已建立（模拟既有 VRCX 的 vrcx:// 注册）'
+Check ($foreignBefore -ne '<absent>') '对照键（本脚本自有名字）已建立'
+# ② 只读对照：既有 VRCX 自己的键。可能不存在（CI 干净机器），那就记录 '<absent>' 并同样比对。
+$realBefore = Get-RegistryExport $realVrcxKey (Join-Path $snapDir 'real-vrcx-before.reg')
+Say "  既有 vrcx 键的起始状态: $(if ($realBefore -eq '<absent>') { '不存在（干净机器）' } else { '存在，已快照' })"
 
 Stage '2. 静默安装'
 if (Test-Path $ownKey) { Remove-Item $ownKey -Recurse -Force }
@@ -122,7 +137,9 @@ Check ((Get-RegValue $ownKey 'URL Protocol') -ne $null) `
   '自有类键带 URL Protocol 值（Windows 认它是协议处理器）'
 Check (Test-Path $uninstallEntry) '安装器写了 Uninstall 条目（Install 段跑到了底）'
 $foreignAfterInstall = Get-RegistryExport $foreignKey (Join-Path $snapDir 'foreign-after-install.reg')
-Check ($foreignBefore -eq $foreignAfterInstall) '安装后，别人的 vrcx 类键逐字节未变'
+Check ($foreignBefore -eq $foreignAfterInstall) '安装后，对照键（本脚本自有名字）逐字节未变'
+$realAfterInstall = Get-RegistryExport $realVrcxKey (Join-Path $snapDir 'real-vrcx-after-install.reg')
+Check ($realBefore -eq $realAfterInstall) '安装后，既有的 vrcx 类键逐字节未变（只读对照）'
 
 Stage '4. 静默卸载'
 $uninstaller = Join-Path $installDir 'uninstall.exe'
@@ -151,7 +168,9 @@ if (-not $ownKeyInstalled) {
   Check (-not (Test-Path $uninstallEntry)) '卸载后 Uninstall 条目也不在了'
 }
 $foreignAfterUninstall = Get-RegistryExport $foreignKey (Join-Path $snapDir 'foreign-after-uninstall.reg')
-Check ($foreignBefore -eq $foreignAfterUninstall) '卸载后，别人的 vrcx 类键仍然逐字节未变'
+Check ($foreignBefore -eq $foreignAfterUninstall) '卸载后，对照键（本脚本自有名字）仍然逐字节未变'
+$realAfterUninstall = Get-RegistryExport $realVrcxKey (Join-Path $snapDir 'real-vrcx-after-uninstall.reg')
+Check ($realBefore -eq $realAfterUninstall) '卸载后，既有的 vrcx 类键仍然逐字节未变（只读对照）'
 
 Stage '6. 结论'
 if ($failures.Count -gt 0) {
