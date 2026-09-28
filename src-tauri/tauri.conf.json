@@ -21,6 +21,15 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "vrcxk"
+        ]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

@@ -4017,6 +4017,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tauri-winrt-notification 0.8.1",
  "typify",
+ "windows-registry",
 ]
 
 [[package]]

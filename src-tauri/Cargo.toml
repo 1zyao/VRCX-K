@@ -137,6 +137,12 @@ tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 # shell's notification layer; actually used from F3 onward.
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8"
+# Reads `Software\Classes\<scheme>\shell\open\command` BEFORE registering a scheme, so a
+# class key this app did not write is never overwritten (issue #41: an existing key cannot
+# be restored — upstream `unregister` is a `remove_tree`). ⚠ Not a new crate in the graph:
+# `tauri-plugin-deep-link` 2.4.10 already depends on `windows-registry` 0.5, so naming it
+# here only makes an existing dependency direct (same reasoning as `jni` below).
+windows-registry = "0.5"
 
 # The debug-only self-probe reads our own `ApplicationInfo.flags` over JNI
 # (`src-tauri/src/debug_probe.rs`). ⚠ `jni` is ALREADY in the tree transitively

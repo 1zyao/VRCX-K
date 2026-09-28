@@ -7,6 +7,10 @@ mod app_lifecycle;
 // no capability: `policy` is pure, and `imp` refuses to serve unless the platform
 // says this very process is debuggable.
 pub mod debug_probe;
+// The bounded deep-link replay queue (issue #41 §7.1 item 4). Desktop-only because the
+// entire deep-link surface is: the shell registers no such route on mobile.
+#[cfg(desktop)]
+mod deeplink;
 mod dialog_opts;
 // ⚠ These three are `pub` so the `hands-e2e` EXAMPLE can mount them on a bare
 // stdio loop and exercise the real wire protocol without a webview (see
@@ -161,11 +165,14 @@ fn dispatch_app_command(
 /// The brain owns what a URL MEANS (log in, join an instance); the shell only
 /// proves it arrived.
 ///
-/// ⚠ Its only caller is the `on_open_url` hook in `.setup()`. With no scheme
-/// declared in `tauri.conf.json` that hook never fires today, so this function
-/// has never run in a real launch — it is the consumer waiting for a scheme,
-/// not evidence that deep links work. See the note at
-/// `tauri_plugin_deep_link::init()` above.
+/// ⚠ Its only caller is the `on_open_url` hook in `.setup()`. As of issue #41 a scheme IS
+/// declared (`plugins.deep-link.desktop.schemes = ["vrcxk"]` in `tauri.conf.json`), so on
+/// Windows/Linux and macOS this hook is now reachable — before that it had never run in a
+/// real launch. The wiring itself is verified on real hardware: see
+/// `docs/probes/mac-deeplink/FINDINGS.md` §5.
+///
+/// ⚠ When the host is not up yet the URL is **queued, not dropped** — see the `None` arm
+/// below and [`replay_pending_deep_links`]. A cold start is exactly that case.
 #[cfg(desktop)]
 fn forward_deep_link(app: &tauri::AppHandle, urls: Vec<String>) {
     let delivery = {
@@ -178,7 +185,25 @@ fn forward_deep_link(app: &tauri::AppHandle, urls: Vec<String>) {
                     "write-failed"
                 }
             },
-            None => "no-host",
+            None => {
+                // ⚠ This is the ORDINARY case on a cold start, not an edge case: the URL is
+                // what launched us, so the OS delivers it in milliseconds while the sidecar
+                // (bun + Cordis + include tree) still needs seconds. Dropping it here is
+                // what made "double-click a link" open the app and do nothing, with no
+                // signal anywhere. Remember it instead; `replay_pending_deep_links` hands
+                // it over when the host is up (issue #41 §7.1 item 4).
+                let pending = app.state::<DeepLinkPending>();
+                let dropped = pending.push(urls.clone());
+                if dropped > 0 {
+                    eprintln!(
+                        "[shell] deep link queued: {} waiting, {dropped} older activation(s) \
+                         dropped by the {}-entry cap",
+                        pending.len(),
+                        deeplink::PENDING_CAP
+                    );
+                }
+                "queued"
+            }
         }
     };
     if let Err(err) = app.emit(
@@ -186,6 +211,80 @@ fn forward_deep_link(app: &tauri::AppHandle, urls: Vec<String>) {
         json!({ "urls": urls, "delivery": delivery }),
     ) {
         eprintln!("[shell] emit deep-link-opened: {err}");
+    }
+}
+
+/// Deep links that arrived while no host was attached (issue #41 §7.1 item 4 = option A).
+///
+/// A thin managed wrapper so the queue can live in Tauri state; the bounded FIFO itself is
+/// in [`deeplink`], where it is unit-tested without a running app.
+#[cfg(desktop)]
+#[derive(Default)]
+struct DeepLinkPending(std::sync::Mutex<deeplink::PendingDeepLinks>);
+
+#[cfg(desktop)]
+impl DeepLinkPending {
+    /// Remember one activation. Returns how many older batches the cap dropped.
+    fn push(&self, urls: Vec<String>) -> u64 {
+        self.0.lock().expect("deep link queue").push(urls)
+    }
+
+    /// Take every queued activation (oldest first) plus the running drop count.
+    fn take(&self) -> (Vec<Vec<String>>, u64) {
+        let mut queue = self.0.lock().expect("deep link queue");
+        let batches = queue.drain();
+        (batches, queue.dropped())
+    }
+
+    fn len(&self) -> usize {
+        self.0.lock().expect("deep link queue").len()
+    }
+}
+
+/// Hand over every URL remembered while no host was attached, then surface the window.
+///
+/// Called from the supervisor's ready callback. **Focusing the window is part of the
+/// decision, not a nicety**: the user just clicked a link, so the app must come to the
+/// front instead of doing something invisible behind other windows.
+///
+/// ⚠ If the peer has vanished again between ready and here, the batches go **back into the
+/// queue** rather than being dropped — that is the whole point of having one.
+#[cfg(desktop)]
+fn replay_pending_deep_links(app: &tauri::AppHandle) {
+    let (batches, dropped) = app.state::<DeepLinkPending>().take();
+    if batches.is_empty() {
+        return;
+    }
+    let Some(peer) = app.state::<HostState>().peer() else {
+        let pending = app.state::<DeepLinkPending>();
+        for batch in batches {
+            pending.push(batch);
+        }
+        eprintln!("[shell] deep link replay deferred: the host peer is gone again");
+        return;
+    };
+
+    let mut delivered = 0usize;
+    for urls in &batches {
+        match peer.notify("deepLink.opened", vec![json!({ "urls": urls })]) {
+            Ok(()) => delivered += 1,
+            Err(err) => eprintln!("[shell] deep link replay failed: {err}"),
+        }
+    }
+    let all_urls: Vec<String> = batches.into_iter().flatten().collect();
+    eprintln!(
+        "[shell] deep link replay: {delivered} activation(s) delivered after the host became \
+         ready ({dropped} dropped earlier by the {}-entry cap)",
+        deeplink::PENDING_CAP
+    );
+    if let Err(err) = app.emit(
+        "deep-link-opened",
+        json!({ "urls": all_urls, "delivery": "replayed" }),
+    ) {
+        eprintln!("[shell] emit deep-link-opened (replay): {err}");
+    }
+    if let Err(err) = tray::show_main_window(app) {
+        eprintln!("[shell] deep link replay could not focus the window: {err}");
     }
 }
 
@@ -238,6 +337,13 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(HostState::default())
         .manage(AppLifecycle::default());
+
+    // Deep links that arrived while no host was attached (issue #41 §7.1 item 4 = option A).
+    // Managed on desktop only, because the whole deep-link surface is.
+    #[cfg(desktop)]
+    {
+        builder = builder.manage(DeepLinkPending::default());
+    }
 
     // Desktop-only plugins. Declared under a `cfg(any(windows, macos, linux))`
     // target section in Cargo.toml AND gated here: the catalog's platform matrix
@@ -424,6 +530,14 @@ pub fn run() {
                         if let Err(err) = ready_handle.emit("host-ready", &ready) {
                             eprintln!("[shell] emit host-ready: {err}");
                         }
+                        // The peer is attached by now (`adopt_inflight` runs before this
+                        // callback), so anything the OS handed us while the host was still
+                        // coming up can be handed over instead of lost. See
+                        // `replay_pending_deep_links`.
+                        #[cfg(desktop)]
+                        {
+                            replay_pending_deep_links(&ready_handle);
+                        }
                     },
                     &mut move |snapshot| {
                         let fingerprint = host_lifecycle::snapshot_fingerprint(snapshot);
@@ -602,6 +716,57 @@ mod packaging_tests {
             !hook.contains("build:host"),
             "the effective Android beforeBuildCommand must not run build:host: its product \
              is not bundled there (externalBin is empty), so the work is wasted. Got {hook:?}"
+        );
+    }
+
+    /// The deep-link scheme is **declared**, and this build's runtime gate reads the same
+    /// value — so the two can never disagree.
+    ///
+    /// ⚠ Why this is a test and not a comment. Issue #41's whole point is that the
+    /// capability was exposed while *nothing was declared*: the side effect (a registry /
+    /// `Info.plist` claim) existed but no URL could ever arrive. The failure is silent in
+    /// both directions, so it needs a gate:
+    ///
+    ///   - config without the key ⇒ the OS never delivers a URL (what the shell looked
+    ///     like before), and the runtime allowlist would refuse every name;
+    ///   - a name declared here that nobody meant ⇒ the installer claims it machine-wide.
+    ///
+    /// The owner's decision (issue #41 §7.1 item 1) is the single name `vrcxk`;
+    /// `docs/hands-prior-art.md` §2.1/§2.3 records why `vrcx` and `vrchat` cannot be used.
+    #[test]
+    fn the_deep_link_scheme_is_declared_and_is_exactly_vrcxk() {
+        let base = conf("tauri.conf.json");
+        let desktop = at(&base, &["plugins", "deep-link", "desktop"]);
+        let schemes = desktop
+            .as_ref()
+            .and_then(|value| at(value, &["schemes"]))
+            .and_then(|value| {
+                value.as_array().map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_ascii_lowercase)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            schemes,
+            vec!["vrcxk".to_string()],
+            "plugins.deep-link.desktop.schemes must declare exactly [\"vrcxk\"] (issue #41 \
+             §7.1 item 1). Declaring none means the OS never delivers a URL; declaring extra \
+             names means the installer claims them machine-wide. Got {desktop:?}"
+        );
+
+        // The runtime gate parses this very subtree, so pin the shape it must accept —
+        // a single object, which is `DesktopDeepLinks::One` upstream.
+        let parsed = crate::shell_sys::declared_schemes(
+            base.get("plugins").and_then(|p| p.get("deep-link")),
+        );
+        assert_eq!(
+            parsed,
+            vec!["vrcxk".to_string()],
+            "the runtime allowlist must read the declared name from the config; a mismatch \
+             here makes every registration refuse with 'not declared'"
         );
     }
 }
