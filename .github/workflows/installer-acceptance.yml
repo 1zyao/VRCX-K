@@ -1,0 +1,91 @@
+# issue #41 的「安装 → 卸载」真机验收（NSIS 侧）。
+#
+# ⚠ 为什么不并进 build.yml 的 desktop 矩阵：这一步要**跑一次真正的安装与卸载**（装到
+# %LOCALAPPDATA%、写/删 HKCU\Software\Classes\<scheme>、生成再执行卸载器），比"编译 + 跑测试"
+# 重得多（release 构建 + NSIS 打包约 10 分钟）。放进每个 PR 会让日常迭代无谓变慢，而它的价值
+# 是**拿到一次真实证据**并防住"钩子被删掉"这类回归 —— 所以按需触发（手动 / 每周 / 只在改动
+# 打包与钩子相关文件时）。
+#
+# 为什么不本地跑：开发机上新编译的未签名安装器被**按可执行文件**拦截（同一上下文里 cmd 能做的
+# 写文件与写注册表，安装器全都做不到），详见 docs/probes/mac-deeplink/FINDINGS.md §7.1。
+#
+# 判据在 scripts/installer-acceptance.ps1 里逐条写明（含"自有键卸载后被删"与"别人的键逐字节未变"）。
+name: installer-acceptance
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每周一 03:17 UTC —— 上游打包链（Tauri/NSIS/WiX）变化时，即使没人动我们的文件也能发现。
+    - cron: "17 3 * * 1"
+  pull_request:
+    branches: [rewrite]
+    paths:
+      - "src-tauri/tauri.conf.json"
+      - "src-tauri/windows/**"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/src/**"
+      - "host/**"
+      - "src/**"
+      - "package.json"
+      - "bun.lock"
+      - "scripts/installer-acceptance.ps1"
+      - ".github/workflows/installer-acceptance.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nsis:
+    name: NSIS 装→卸 (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Cache bun package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies (frozen)
+        run: bun install --frozen-lockfile
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 与 build.yml 的 desktop job 同一条路径：build.rs 会在缺失时自愈构建 sidecar，
+      # 前端由 tauri 的 beforeBuildCommand 构建。
+      # ⚠ 这里不传 --locked：`bun run <script> … -- …` 里那个 `--` 会被 bun 吃掉、
+      # 未必真到 cargo，而锁文件一致性已由 desktop 矩阵的 `cargo check --locked` 把住 ——
+      # 不要为了看起来更严而写一个自己都说不清是否生效的参数。
+      - name: Build the NSIS bundle
+        run: bun run tauri build --bundles nsis
+
+      # 断言全在脚本里；失败即非零退出，CI 变红。
+      - name: Install → assert → uninstall → assert
+        shell: pwsh
+        run: ./scripts/installer-acceptance.ps1
+
+      # 失败时把注册表快照与安装器一起留下来，别让人再去猜。
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-acceptance-diagnostics
+          path: |
+            .temp/installer-acceptance/*.reg
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: ignore
+          retention-days: 14
