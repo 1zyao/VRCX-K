@@ -644,17 +644,53 @@ export type ShellHandsHelloBridge = {
  * `tray.action` and `shortcut.pressed` both arrive on the exposed API and must
  * fan out to every local subscriber without one throwing handler breaking the
  * RPC channel. One implementation, so the two cannot drift apart.
+ *
+ * # ⚠ `retainUntilSubscribed` — a notification must not vanish into the startup window
+ *
+ * The host's expose table exists **before** the services that consume these notifications
+ * subscribe to them (`index.ts` attaches them after `shell.ready`), so a notification that
+ * arrives in between is emitted into an empty handler set and lost. That is not theoretical:
+ * it was **measured on macOS** for the URL that LAUNCHES the app (issue #41 decision ④) —
+ * `deepLink.opened` arrived with the transport already up, no subscriber yet, and the
+ * activation disappeared with nothing in any log.
+ *
+ * With this option the fanout keeps the **latest** value until the first subscriber arrives,
+ * then hands it over. One slot, deliberately: this is a startup-window buffer, and the newest
+ * activation is the one a user is still waiting for.
+ *
+ * ⚠ Why only the deep-link notification opts in: a URL remains a valid intent seconds later,
+ * whereas a tray click or a hotkey press is a momentary input — replaying one after startup
+ * could fire an action the user has long moved past. Dropping a transient input is the
+ * defensible behaviour; dropping a link is not.
  */
-function fanout<T>(label: string) {
+function fanout<T>(label: string, options: { retainUntilSubscribed?: boolean } = {}) {
   const handlers = new Set<(value: T) => void>()
+  let retained: T | undefined
+  let hasRetained = false
   return {
     on(handler: (value: T) => void): () => void {
       handlers.add(handler)
+      if (options.retainUntilSubscribed && hasRetained && handlers.size === 1) {
+        const pending = retained as T
+        retained = undefined
+        hasRetained = false
+        try {
+          handler(pending)
+        } catch (error) {
+          console.error(`[host] ${label} handler error`, error)
+        }
+      }
       return () => {
         handlers.delete(handler)
       }
     },
     emit(value: T): void {
+      if (options.retainUntilSubscribed && handlers.size === 0) {
+        retained = value
+        hasRetained = true
+        console.error(`[host] ${label} arrived before any subscriber — retained for the first one`)
+        return
+      }
       for (const handler of [...handlers]) {
         try {
           handler(value)
@@ -780,7 +816,10 @@ export function connectShellStdio(
 ): ShellStdioBridge {
   const trayActions = fanout<TrayActionEvent>("tray.action")
   const shortcutPresses = fanout<ShortcutPressEvent>("shortcut.pressed")
-  const deepLinks = fanout<DeepLinkEvent>("deepLink.opened")
+  // ⚠ The ONLY fanout that retains: the URL that launches the app arrives before
+  // `ctx.deepLink` subscribes (measured on macOS — see `fanout`'s doc comment), and a lost
+  // activation is invisible.
+  const deepLinks = fanout<DeepLinkEvent>("deepLink.opened", { retainUntilSubscribed: true })
   // Separate from the others because it is ONCE per shell process, not an event
   // stream: a late subscriber would otherwise miss it forever. `currentHello`
   // holds the last one so `onHello` can answer immediately — the same reason
